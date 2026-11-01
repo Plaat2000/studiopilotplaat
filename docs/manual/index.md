@@ -1,0 +1,267 @@
+# LivePilot Manual
+
+An agentic production system for Ableton Live 12.
+474 tools. 57 domains. Device atlas. Sample intelligence. Auto-composition. Spectral perception. Technique memory. Creative intelligence.
+
+---
+
+## What LivePilot Is
+
+LivePilot is not a tool collection with an AI wrapper. It is a **production system** — three perception layers feed into 474 tools, which are orchestrated by a dozen creative engines that understand song identity, learn your taste, diagnose session problems, and generate real musical options.
+
+The difference: a tool collection executes "set volume to -6dB." LivePilot understands that turning down the drums might kill the groove that defines the track, suggests three genuinely different ways to create space instead, lets you preview each one, and remembers which approach you preferred.
+
+---
+
+## Architecture
+
+```
+AI Client  ──MCP──►  FastMCP Server  ──TCP/9878──►  Remote Script (inside Ableton)
+                        (validates)                    (executes on main thread)
+                            │
+                            ├── Device Atlas (5264 devices, 120 enriched, 7 indexes)
+                            ├── User Corpus (~/.livepilot/atlas-overlays/)   [v1.23.4+]
+                            │      ├── user/         your detected plugins
+                            │      ├── m4l-devices/  your .amxd library
+                            │      ├── packs/        factory + your packs
+                            │      └── elektron/     hardware overlays
+                            ├── M4L Analyzer ──UDP/OSC──► LivePilot_Analyzer.amxd
+                            └── Technique Memory (~/.livepilot/memory/)
+```
+
+The **atlas** resolves device names and browser URIs — the AI never hallucinates a preset. 641 devices are indexed by pack (Core Library + explicit-pack assignments) so "what's in Drone Lab?" is an instant lookup. Reverse-index `device_techniques_index.json` cross-references 146 techniques across 58 devices (the `atlas_techniques_for_device` tool).
+The **user corpus** (v1.23.4+) extends the atlas with whatever's installed on YOUR machine — third-party plugins, custom Max devices, your `.adg` racks. Loaded by every reasoning tool with a 50/50 result-budget split alongside the factory atlas, so "sound like Burial" can route to *your* CHOWTapeModel + Splice PHOTEK pack instead of just Ableton's stock saturator. See [User Corpus Guide](../USER_CORPUS_GUIDE.md).
+The **analyzer** feeds back spectral data from the master bus so the AI hears its own changes — **9 frequency bands** (sub_low / sub / low / low_mid / mid / high_mid / high / presence / air); the sub_low band (20-60 Hz) separates kick fundamental from DC rumble. From v1.20.3 the analyzer is auto-loaded via `ensure_analyzer_on_master` when a decision or verification actually needs audio evidence.
+The **memory** persists production decisions across sessions as searchable, replayable data structures.
+
+LivePilot contains 474 tools. Direct Ableton controls execute through the Live Object Model on Ableton's main thread; planning, search, analysis, memory, filesystem, and network tools run in their appropriate layers. Live-session mutations (clips, devices, mixer, arrangement) normally route through Ableton's undo stack. Side effects outside the Live project — Splice downloads, memory/ledger writes, installer actions, atlas scans, and filesystem writes — persist beyond undo.
+
+To avoid spending context on hundreds of schemas before the first musical
+decision, the default `producer` profile advertises 26 core tools plus
+`search_tools` and `call_tool`. Hidden tools remain searchable and directly
+callable. Set `LIVEPILOT_TOOL_PROFILE` to `composition`, `mixing`, `sampling`,
+or `full` when a client benefits from a wider pinned catalog.
+
+---
+
+## The Four Layers
+
+### Layer 1: Deterministic Tools
+
+The foundation. Direct control over every aspect of Ableton Live through the Live Object Model: transport, tracks, clips, notes, devices, scenes, mixing, arrangement, browser, automation, scales, grooves, take-lanes, follow actions, MIDI tool generators. Also includes music theory (Krumhansl-Schmuckler key detection, neo-Riemannian harmony, species counterpoint), generative algorithms (Euclidean rhythm, tintinnabuli, phase shift, additive process), and MIDI I/O.
+
+These tools do exactly what you ask. No interpretation, no judgment. They are the building blocks.
+
+### Layer 2: Perception
+
+The M4L Analyzer on the master track gives LivePilot ears: 9-band FFT spectrum (v1.17+), true RMS/peak metering, Krumhansl-Schmuckler key detection, pitch tracking, FluCoMa mel-spectrum + chroma + onset detection + spectral shape. Plus deep LOM access for hidden parameters, automation state, Simpler internals, and warp markers. Offline perception adds loudness analysis (integrated LUFS, LRA), spectral analysis, and reference comparison. A second, capture-based path (v1.28+) runs the same evaluation-stack feature extraction offline against rendered WAV/AIFF files — `listen_capture` for a full report, `listen_ab` for a before/after delta — producing canonical snapshots `evaluate_move` can score directly, independent of the M4L bridge.
+
+Perception closes the feedback loop. Without it, the AI is blind to the result of its own changes. With it, the AI can verify that a mix move actually reduced masking, that a filter sweep landed at the right frequency, that the overall loudness is broadcast-ready.
+
+### Layer 3: Creative Intelligence
+
+Sits on top of the tools and perception, adding musical judgment. This is what makes LivePilot agentic:
+
+**Understanding the song:**
+- **SongBrain** builds a real-time model of identity, sacred elements, section purposes, and energy arc
+- **Composition Engine** detects motifs, infers emotional arcs, plans structural moves
+- **Hook Hunter** finds the most salient musical idea and tracks whether it's being developed or neglected
+
+**Understanding the producer:**
+- **Taste Graph / Agent OS** learns move family preferences, device affinities, novelty tolerance, and dimension avoidances across sessions
+- **Session Continuity** tracks creative threads, turn resolutions, and the session story
+- **Technique Memory** stores and recalls production decisions by mood, genre, and texture
+
+**Making musical decisions:**
+- **Semantic Moves** express high-level intent ("add contrast," "tighten the low end") as executable tool sequences with risk levels and protection thresholds
+- **Wonder Mode** diagnoses stuck sessions, generates genuinely distinct rescue options, and lets you preview before committing
+- **Preview Studio** renders variants using Ableton's undo system — hear each option, compare, then choose
+- **Creative Constraints** activate style gates and render reference-inspired variants
+
+**Evaluating results:**
+- **Mix Engine** runs critic-driven analysis — masking, headroom, stereo, dynamics — and plans corrective moves
+- **Sound Design Engine** analyzes patches for static timbre, missing modulation, and weak transients
+- **Synthesis Brain** extracts timbre fingerprints + proposes synth branches
+- **Transition / Reference / Translation Engines** score transitions, distill principles from reference tracks, translate across domains
+- **Evaluation Loop** enforces measure-before, act, measure-after discipline on every creative move
+
+### Layer 4: Personal Library Awareness `[v1.23.4+]`
+
+The first three layers operate on Ableton's shipped library. Layer 4 makes the brain aware of *your specific machine* — every third-party plugin, every Max for Live device, every custom rack you've saved.
+
+**Why this layer exists.** Most music AI tools have a fixed knowledge cutoff. LivePilot's first three layers give it generalized musical judgment, but until v1.23.4 they could only reach for Ableton-shipped gear. If you spent $500 on Valhalla plugins, $200 on a Cem Olcay MIDI suite, and built a personal library of `.adg` racks, none of that was visible to the brain. Same query → same Ableton-stock recommendation, regardless of what's actually on your hard drive.
+
+**What it does.** The User Corpus runs a 4-phase pipeline (DETECT → CANONICALIZE → RESEARCH → SYNTHESIZE) that turns the contents of your filesystem into AI-queryable knowledge:
+
+| Phase | Tool | What it produces |
+|-------|------|------------------|
+| 1. Detect | `corpus_detect_plugins` | Inventory of installed VST3/AU/AUv3/VST2/AAX/CLAP/LV2 plugins. Path-walks `/Library/Audio/Plug-Ins/{VST3,Components}` + runs `auval -a` for AUv3/Mac Catalyst coverage |
+| 2. Canonicalize | `corpus_canonicalize_plugins` | Dedupes by vendor+name, prefers VST3 over AU, strips vendor suffix variants ("Valhalla DSP, LLC" = "Valhalladsp" = "Valhalla DSP") |
+| 2.5. Cluster | `corpus_cluster_plugins` | Groups by vendor for batched research dispatch — vendors with ≥2 plugins share one WebSearch |
+| 3. Research | `corpus_research_targets` | Emits a structured WebSearch task packet the agent fulfills |
+| 4. Synthesize | `corpus_emit_synthesis_briefs` | Sonnet-subagent dispatch — writes per-plugin `identity.yaml` with sonic_fingerprint / reach_for / avoid / key_techniques / parameter_glossary / genre_affinity / producer_anchors |
+
+**How it integrates with the brain.** The output overlays land at `~/.livepilot/atlas-overlays/<namespace>/` across four namespaces (`user/` for plugins, `m4l-devices/` for Max devices, `packs/` for factory + custom packs, `elektron/` for hardware). Every reasoning tool — `atlas_search`, `atlas_chain_suggest`, `atlas_macro_fingerprint`, `atlas_describe_chain` — consults the overlay alongside the factory atlas with a 50/50 result-budget split. Each result is tagged `source: factory_atlas | user_overlay:<namespace>`, so the agent always knows whether a recommendation is Ableton stock or yours.
+
+**The versatility argument in one example.** A new user asks "make me a J Dilla beat":
+
+| Without User Corpus | With User Corpus |
+|---|---|
+| Operator FM marimba (default preset) | Koala Sampler (your SP-404 emulator) |
+| Live's stock Drum Rack samples | Splice PHOTEK Vol.1 pack you bought |
+| Saturator (Tape mode) for warmth | CHOWTapeModel (your peer-reviewed tape model) |
+| Operator-based bass (default) | Moog Model D (your subby analog bass) |
+
+Same query, different brain. The closer the brain matches *your* library, the more useful every recommendation becomes.
+
+**Quick start.** From any MCP client:
+
+```
+corpus_setup_wizard           # one-shot — runs the full pipeline
+# OR fine-grained:
+corpus_detect_plugins use_auval=true
+corpus_canonicalize_plugins
+corpus_cluster_plugins
+corpus_research_targets
+corpus_emit_synthesis_briefs
+```
+
+See the full [User Corpus Guide](../USER_CORPUS_GUIDE.md) for end-to-end walkthrough, [Plugin Knowledge Engine doc](../PLUGIN_KNOWLEDGE_ENGINE.md) for engine internals, and [Extension API](../EXTENSION_API.md) for the overlay file format.
+
+---
+
+## Domain Map
+
+The table below is auto-generated from the live tool registry — do not
+hand-edit the region between the `DOMAIN_MAP` markers. Regenerate with
+`python3 scripts/sync_metadata.py --fix` (or directly via
+`python3 scripts/generate_tool_catalog.py --domain-map`); `--check` fails CI
+if this block drifts from the registry.
+
+<!-- DOMAIN_MAP:AUTO-GENERATED START -->
+
+All 474 tools across 57 domains, in source-truth per-domain counts:
+
+### Core Ableton Control (Layer 1 — 247 tools)
+
+| Domain | # | Scope |
+|--------|:-:|-------|
+| Devices | 42 | Load by name/URI, insert native (12.3+), params, racks, chains, drum pads, plugins, presets, wavetable mod matrix, replace_sample (12.4+), `add_drum_rack_pad`, `verify_device_alive` (v1.16+) |
+| Arrangement | 23 | Timeline editing, arrangement notes, native clips (12.1.10+), cue points, recording, capture, `set_arrangement_automation_via_session_record` (v1.17+) |
+| Tracks | 21 | Create MIDI/audio/return, delete, duplicate, arm, mute, solo, routing, sends, monitoring |
+| Transport | 21 | Playback, tempo, time sig, loop, metronome, undo/redo, diagnostics, capture MIDI |
+| Memory | 18 | Save, recall, replay, session memory, list/favorite/delete, update |
+| Clips | 16 | Create, delete, duplicate, fire, stop, loop, launch mode, warp mode, pitch, color |
+| Scenes | 12 | Create, delete, duplicate, fire, name, color, per-scene tempo, follow actions |
+| Mixing | 11 | Volume, pan, sends, routing, meters, return tracks, mix snapshot |
+| Automation | 9 | Clip envelopes, 16 curve types, 15 recipes, spectral suggestions |
+| Composition | 9 | Section analysis, motif detection, emotional arc, form planning |
+| Follow Actions | 8 | Clip + scene follow actions, presets, type listing |
+| Notes | 8 | Add/get/remove/modify MIDI, transpose, duplicate, per-note probability |
+| Scales | 8 | Clip scales, song scales, scale modes, list available scales |
+| Grooves | 7 | Groove templates, per-clip groove, groove amount, groove params |
+| Theory | 7 | Harmony analysis, Roman numerals, scales, countermelody, transposition |
+| Take Lanes | 6 | Create, name, list, per-lane clips |
+| Generative | 5 | Euclidean rhythm, tintinnabuli, phase shift, additive process |
+| Browser | 4 | Search library, browse tree, load items |
+| Harmony | 4 | Tonnetz navigation, voice leading, neo-Riemannian classification |
+| MIDI I/O | 4 | Export/import .mid, offline analysis, piano roll extraction |
+| MidiTool | 4 | Device install, generator registration, per-clip target mapping |
+
+### Perception (Layer 2 — 51 tools)
+
+| Domain | # | Scope |
+|--------|:-:|-------|
+| Analyzer | 38 | 9-band spectrum (v1.17+), RMS, key detection, Simpler ops, warp markers, capture, FluCoMa mel/chroma/onset `[M4L]` |
+| Listening | 5 | Offline perceptual analysis of master-bus captures — `listen_capture` full report, `listen_ab` before/after comparison with evaluate_move-ready snapshots (v1.28+) |
+| Perception | 4 | Offline loudness, spectral analysis, reference comparison, metadata |
+| Diagnostics | 3 | Device/session health verification, test-note fire-and-forget |
+| Evaluation | 1 | Before/after evaluation with structured scoring |
+
+### Creative Intelligence (Layer 3 — 162 tools)
+
+| Domain | # | Scope |
+|--------|:-:|-------|
+| Sample Engine | 23 | Multi-source search (Splice gRPC + browser + filesystem), Splice catalog hunt, downloads, previews, pack info, collections, presets, describe-a-sound (LIVE), variations (LIVE), http-diagnose (v1.17+) |
+| Atlas | 22 | Search 5264 devices, suggest by intent, chain building, comparison, library scan, `atlas_pack_info`, `atlas_describe_chain` (free-text), `atlas_techniques_for_device` (reverse-lookup), `atlas_macro_fingerprint` (preset similarity), Pack-Atlas cross-pack tools (`atlas_transplant`, `atlas_extract_chain`, `atlas_cross_pack_chain`, `atlas_pack_aware_compose`, `atlas_demo_story`), hybrid-surface Layer B (`atlas_explore`, `atlas_audition`, `atlas_substitute`) — all v1.17+ unless noted; plus `extension_atlas_search` / `extension_atlas_get` / `extension_atlas_list` for user-local overlays (v1.23.0+) |
+| Agent OS | 9 | Session kernel, action ledger, capability state, routing, goal vectors, taste, turn budget |
+| Composer | 9 | Prompt → multi-layer composition plan, sample augmentation, plan preview, branches, develop-mode apply, hybrid Ableton-Knowledge consultation |
+| Hook Hunter | 9 | Hook detection, salience scoring, neglect detection, phrase impact |
+| Runtime | 7 | Session kernel building, world model, capability, safety, resume intent, Live 12.4 probe-first tools (`probe_link_audio`, `probe_stem_workflow`) |
+| Session Continuity | 7 | Creative threads, turn resolution, session story, anti-preferences |
+| Mix Engine | 6 | Critic-driven mix analysis, issue detection, move planning |
+| Musical Intelligence | 6 | Phrase arc, impact scoring, comparison, rendering, grid analysis, snapshot |
+| Creative Constraints | 5 | Constraint activation, reference-inspired variants |
+| Experiment | 5 | Create, run, compare, commit, discard A/B experiment branches |
+| Preview Studio | 5 | Variant creation, preview rendering, comparison, commit, discard |
+| Semantic Moves | 4 | Move listing, preview, application, next-best-move proposal |
+| Sound Design | 4 | Patch analysis, modulation planning, timbre scoring |
+| Device Forge | 3 | Generate M4L devices from gen~ templates, install to browser |
+| Grader | 3 | Rubric-based session evaluation — list rubrics, run one, run all |
+| Performance Engine | 3 | Safety-constrained suggestions, safe moves, scene handoff |
+| Reference Engine | 3 | Reference profiling, principle distillation, gap analysis |
+| Research | 3 | Technique research, style tactics |
+| Song Brain | 3 | Identity inference, sacred elements, drift monitoring |
+| Stuckness Detector | 3 | Momentum analysis, rescue classification, rescue workflows |
+| Synthesis Brain | 3 | Synth patch analysis, branch proposals, timbre fingerprint extraction |
+| Transition Engine | 3 | Transition classification, scoring, archetype planning |
+| Wonder Mode | 3 | Diagnosis-driven variants, taste-aware ranking, session discard |
+| Creative Director | 2 | Brief-compliance checking for a proposed tool call, hybrid-brief compilation from multiple concept packets |
+| Motif | 2 | Motif graph, motif transformation |
+| Planner | 2 | Gesture planning, arrangement planning |
+| Project Brain | 2 | Project-level analysis, section purpose inference |
+| Translation Engine | 2 | Cross-domain translation, issue detection |
+| Audit | 1 | Single-call §5 layer-precision audit (timbre + sequence + stereo + masking) for one track |
+
+### Personal Library Awareness (Layer 4 — 14 tools)
+
+| Domain | # | Scope |
+|--------|:-:|-------|
+| User Corpus | 14 | Plugin Knowledge Engine 4-phase pipeline. `corpus_setup_wizard`, `corpus_init`, `corpus_status`, `corpus_list_scanners`, `corpus_add_source`, `corpus_remove_source`, `corpus_scan` (file-level), `corpus_detect_plugins` (auval-aware), `corpus_canonicalize_plugins` (VST3-preferred dedup), `corpus_cluster_plugins` (vendor-batched research), `corpus_trim_plugin_identity` (deprioritization), `corpus_discover_manuals`, `corpus_research_targets`, `corpus_emit_synthesis_briefs` |
+
+<!-- DOMAIN_MAP:AUTO-GENERATED END -->
+
+---
+
+## Chapters
+
+### Understanding the System
+
+| Chapter | What's inside |
+|---------|---------------|
+| [The Intelligence Layer](intelligence.md) | How the engines connect — conductor, kernel, moves, preview, evaluation |
+| [Device Atlas](device-atlas.md) | 5264 devices indexed — search, suggest, chain building, comparison, pack browsing |
+| [User Corpus Guide](../USER_CORPUS_GUIDE.md) `[v1.23.4+]` | Build a personal atlas from your plugins, racks, Max devices, samples — same MCP tools as factory atlas |
+| [Plugin Knowledge Engine](../PLUGIN_KNOWLEDGE_ENGINE.md) `[v1.23.4+]` | 4-phase detect → canonicalize → research → synthesize pipeline, AUv3 detection via auval, VST3-preferred dedup |
+| [Extension API](../EXTENSION_API.md) | Drop YAML overlays at `~/.livepilot/atlas-overlays/<namespace>/` — survives npm updates |
+| [Samples & Slicing](samples.md) | 3-source search, Splice describe-a-sound, variations, fitness critics |
+| [Automation](automation.md) | 16 curve types, 15 recipes, spectral suggestions, two-phase arrangement-record workaround |
+| [Composition & Arrangement](composition.md) | Composer, section analysis, arrangement planning with sample roles |
+
+### Production Guides
+
+| Chapter | What's inside |
+|---------|---------------|
+| [Workflows](workflows.md) | Step-by-step: beats, session setup, sound design, arrangement, mixing |
+| [MIDI Guide](midi-guide.md) | Drum patterns, scales, chords, humanization techniques |
+| [Sound Design](sound-design.md) | Instruments, effects, parameter recipes, device chains |
+| [Mixing](mixing.md) | Gain staging, EQ, compression, sends, stereo width |
+
+### Reference
+
+| Chapter | What's inside |
+|---------|---------------|
+| [Tool Catalog](tool-catalog.md) | Every tool organized by domain (auto-generated from source) |
+| [Tool Reference](tool-reference.md) | In-depth parameter docs, ranges, and usage notes for the most-used tools |
+| [Troubleshooting](troubleshooting.md) | Connection issues, common errors, diagnostics |
+| [Splice Endpoint Capture](splice-endpoint-capture.md) | mitmproxy runbook for capturing additional Splice GraphQL operations |
+
+### Contributing
+
+| Chapter | What's inside |
+|---------|---------------|
+| [Dev Install](dev-install.md) | Run LivePilot from a local checkout — venv setup, local MCP config, iterate-without-publish workflow, test suite, `sync_metadata` drift check |
+
+---
+
+Next: [The Intelligence Layer](intelligence.md)

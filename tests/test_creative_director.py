@@ -1,0 +1,1005 @@
+"""Tests for the livepilot-creative-director skill + concept + affordance packets.
+
+These tests are documentation-level, not runtime integration tests.
+They verify:
+
+  1. The creative-director SKILL.md and its 4 references exist and parse
+  2. Every concept packet (42 expected: 28 artists + 14 genres) validates
+     against the packet schema in livepilot-core/references/concepts/_schema.md
+  3. Every affordance packet (20 expected) validates against the schema
+     in livepilot-core/references/affordances/_schema.md
+  4. Cross-references resolve: concept packets' canonical_genres point at
+     real genre YAMLs; canonical_artists point at real artist YAMLs
+  5. Concept packets' move_family_bias uses only the 6 canonical families
+  6. The creative-director SKILL.md description contains the key triggers
+     that make the skill fire on creative intent
+
+Run with:
+    python -m pytest tests/test_creative_director.py -v
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+import yaml
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+SKILLS_ROOT = REPO_ROOT / "livepilot" / "skills"
+DIRECTOR_ROOT = SKILLS_ROOT / "livepilot-creative-director"
+CORE_REFS = SKILLS_ROOT / "livepilot-core" / "references"
+CONCEPTS_ROOT = CORE_REFS / "concepts"
+AFFORDANCES_ROOT = CORE_REFS / "affordances"
+
+# The seven canonical move.family values — six from
+# mcp_server/semantic_moves/*.py plus `sample` from
+# mcp_server/sample_engine/moves.py. Verified against
+# list_semantic_moves() runtime on v1.18.0 ship: 33 moves, 7 domains.
+CANONICAL_FAMILIES = {
+    "mix",
+    "arrangement",
+    "transition",
+    "sound_design",
+    "performance",
+    "device_creation",
+    "sample",
+}
+
+# The four canonical dimensions from the-four-move-rule.md
+CANONICAL_DIMENSIONS = {"structural", "rhythmic", "timbral", "spatial"}
+
+
+# ---------------------------------------------------------------------------
+# Skill structure
+# ---------------------------------------------------------------------------
+
+
+def test_director_skill_exists():
+    skill = DIRECTOR_ROOT / "SKILL.md"
+    assert skill.exists(), f"Creative Director SKILL.md missing: {skill}"
+
+
+def test_director_skill_frontmatter():
+    skill = DIRECTOR_ROOT / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
+    end = text.find("\n---\n", 4)
+    assert end > 0, "SKILL.md frontmatter must close"
+    fm = yaml.safe_load(text[4:end])
+    assert fm["name"] == "livepilot-creative-director"
+    assert len(fm["description"]) <= 1024, "Description over 1024 char limit"
+    # Description must contain creative-intent triggers so the skill fires
+    desc_lower = fm["description"].lower()
+    for keyword in ["creative", "like x", "develop", "more interesting"]:
+        assert keyword in desc_lower, f"Description missing keyword: {keyword}"
+
+
+def test_director_reference_files_exist():
+    refs = DIRECTOR_ROOT / "references"
+    expected = {
+        "creative-brief-template.md",
+        "move-family-diversity-rule.md",
+        "anti-repetition-rules.md",
+        "the-four-move-rule.md",
+    }
+    actual = {p.name for p in refs.glob("*.md")}
+    missing = expected - actual
+    assert not missing, f"Missing reference files: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Concept packet schema
+# ---------------------------------------------------------------------------
+
+
+def _load_concept_packets():
+    packets = {}
+    for subdir in ("artists", "genres"):
+        for p in sorted((CONCEPTS_ROOT / subdir).glob("*.yaml")):
+            packets[p.stem] = yaml.safe_load(p.read_text(encoding="utf-8"))
+    return packets
+
+
+CONCEPT_REQUIRED_FIELDS = {
+    "id",
+    "name",
+    "type",
+    "sonic_identity",
+    "reach_for",
+    "avoid",
+    "evaluation_bias",
+    "move_family_bias",
+    "dimensions_in_scope",
+    "novelty_budget_default",
+}
+
+
+def test_concept_packets_count():
+    artists = list((CONCEPTS_ROOT / "artists").glob("*.yaml"))
+    genres = list((CONCEPTS_ROOT / "genres").glob("*.yaml"))
+    assert len(artists) == 28, f"Expected 28 artist packets, found {len(artists)}"
+    # v1.18.2: added 13 new genre YAMLs (14 → 27) to resolve the strict
+    # artist→genre cross-ref xfail. Floor is 27 now; ceiling is open to
+    # future additions.
+    assert len(genres) >= 27, f"Expected at least 27 genre packets, found {len(genres)}"
+
+
+def test_concept_packets_parse_and_have_required_fields():
+    packets = _load_concept_packets()
+    assert packets, "No concept packets loaded"
+    for slug, d in packets.items():
+        missing = CONCEPT_REQUIRED_FIELDS - set(d.keys())
+        assert not missing, f"{slug}: missing fields {missing}"
+
+
+def test_concept_packets_types_valid():
+    packets = _load_concept_packets()
+    for slug, d in packets.items():
+        assert d["type"] in {"artist", "genre", "hybrid"}, (
+            f"{slug}: invalid type {d['type']}"
+        )
+
+
+def test_artist_packets_have_canonical_genres():
+    for p in sorted((CONCEPTS_ROOT / "artists").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert d.get("canonical_genres"), (
+            f"{p.stem}: artist packet must have canonical_genres populated"
+        )
+
+
+def test_genre_packets_have_canonical_artists():
+    for p in sorted((CONCEPTS_ROOT / "genres").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        # Canonical_artists may be empty for very new genres — allow but warn
+        # For the shipped 14, each should name at least one canonical artist
+        # EXCEPTIONS: trap, dubstep in some cases — but we currently have them
+        if p.stem in {"trap"}:
+            # Trap has canonical_artists: [] by design (genre more than artist-defined)
+            continue
+        assert d.get("canonical_artists"), (
+            f"{p.stem}: genre packet must have canonical_artists populated"
+        )
+
+
+def test_move_family_bias_uses_canonical_families():
+    packets = _load_concept_packets()
+    for slug, d in packets.items():
+        bias = d["move_family_bias"]
+        favor = set(bias.get("favor", []))
+        depri = set(bias.get("deprioritize", []))
+        invalid_favor = favor - CANONICAL_FAMILIES
+        invalid_depri = depri - CANONICAL_FAMILIES
+        assert not invalid_favor, (
+            f"{slug}: favor has non-canonical families {invalid_favor}"
+        )
+        assert not invalid_depri, (
+            f"{slug}: deprioritize has non-canonical families {invalid_depri}"
+        )
+        overlap = favor & depri
+        assert not overlap, f"{slug}: favor and deprioritize overlap: {overlap}"
+
+
+def test_dimensions_in_scope_uses_canonical_dimensions():
+    packets = _load_concept_packets()
+    for slug, d in packets.items():
+        in_scope = set(d["dimensions_in_scope"])
+        deprioritized = set(d.get("dimensions_deprioritized", []))
+        invalid_in = in_scope - CANONICAL_DIMENSIONS
+        invalid_depri = deprioritized - CANONICAL_DIMENSIONS
+        assert not invalid_in, (
+            f"{slug}: dimensions_in_scope has non-canonical values {invalid_in}"
+        )
+        assert not invalid_depri, (
+            f"{slug}: dimensions_deprioritized has non-canonical values "
+            f"{invalid_depri}"
+        )
+
+
+def test_novelty_budget_in_valid_range():
+    packets = _load_concept_packets()
+    for slug, d in packets.items():
+        nb = d["novelty_budget_default"]
+        assert isinstance(nb, (int, float)), (
+            f"{slug}: novelty_budget_default must be numeric"
+        )
+        assert 0.0 <= nb <= 1.0, f"{slug}: novelty_budget {nb} outside [0.0, 1.0]"
+
+
+def test_artist_to_genre_refs_resolve_or_alias():
+    """Artist packets' canonical_genres should resolve to either a genre
+    YAML id or an alias. Genres we haven't YAML-ified yet (downtempo,
+    boom_bap, lo_fi, etc.) are tolerated as narrative-only references —
+    see TODO in test_missing_genre_yamls_as_todo below."""
+    genre_lookup = set()
+    for p in (CONCEPTS_ROOT / "genres").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        genre_lookup.add(d["id"])
+        genre_lookup.add(p.stem)
+        for alias in d.get("aliases", []) or []:
+            # Normalize alias to the slug form used in artist refs
+            genre_lookup.add(alias.replace(" ", "_").replace("-", "_"))
+            genre_lookup.add(alias.replace(" ", "-"))
+
+    unresolved = []
+    for p in (CONCEPTS_ROOT / "artists").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        for genre_ref in d.get("canonical_genres", []):
+            if genre_ref not in genre_lookup:
+                unresolved.append((p.stem, genre_ref))
+
+    # Record the count so we can track convergence over time — this assertion
+    # succeeds for any bounded value, but any regression above the current
+    # threshold flags as a test failure.
+    CURRENT_UNRESOLVED_THRESHOLD = 40  # 2026-04-23 baseline
+    assert len(unresolved) <= CURRENT_UNRESOLVED_THRESHOLD, (
+        f"Unresolved artist→genre refs ({len(unresolved)}) exceeded threshold "
+        f"{CURRENT_UNRESOLVED_THRESHOLD}. Reduce the threshold or add YAMLs: "
+        f"{unresolved[:8]}"
+    )
+
+
+def test_genre_to_artist_refs_resolve():
+    """Genres' canonical_artists MUST resolve — the artist YAML set is
+    complete (28 packets), so any unresolved ref is a typo."""
+    artist_slugs = {p.stem for p in (CONCEPTS_ROOT / "artists").glob("*.yaml")}
+
+    unresolved = []
+    for p in (CONCEPTS_ROOT / "genres").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        for artist_ref in d.get("canonical_artists", []) or []:
+            if artist_ref not in artist_slugs:
+                unresolved.append((p.stem, artist_ref))
+
+    assert not unresolved, f"Unresolved artist cross-refs: {unresolved}"
+
+
+def test_all_artist_genre_refs_resolve_strictly():
+    """v1.18.2: formerly xfailing — 13 new genre YAMLs created (drone,
+    downtempo, lo_fi, boom_bap, footwork, techno, detroit_techno,
+    synthwave, deep_house, disco, soul, dub, hyperpop) + 15 too-generic
+    or too-narrow refs removed from artist packets (electronic ×5,
+    electronica, bass_music, cinematic, acid_techno, french_house,
+    nu_disco, soulful_house, vaporwave, juke, jungle).
+
+    Strict resolution: every canonical_genres entry in every artist
+    packet must match a genre YAML's `id` field exactly. Looser alias
+    matching is NOT allowed here (see test_artist_to_genre_refs_resolve_or_alias
+    for the tolerant version)."""
+    genre_lookup = set()
+    for p in (CONCEPTS_ROOT / "genres").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        genre_lookup.add(d["id"])
+
+    unresolved = []
+    for p in (CONCEPTS_ROOT / "artists").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        for genre_ref in d.get("canonical_genres", []):
+            if genre_ref not in genre_lookup:
+                unresolved.append((p.stem, genre_ref))
+
+    assert not unresolved, f"Unresolved (strict): {unresolved}"
+
+
+# ---------------------------------------------------------------------------
+# Affordance packet schema
+# ---------------------------------------------------------------------------
+
+
+AFFORDANCE_REQUIRED_FIELDS = {
+    "id",
+    "name",
+    "type",
+    "category",
+    "atlas_search_query",
+    "musical_roles",
+    "strong_for",
+    "risky_for",
+    "pairings",
+    "remeasure",
+    "dimensional_impact",
+    "appears_in_packets",
+}
+
+
+def test_affordance_packets_count():
+    affordances = list((AFFORDANCES_ROOT / "devices").glob("*.yaml"))
+    assert len(affordances) >= 20, (
+        f"Expected at least 20 affordance packets, found {len(affordances)}"
+    )
+
+
+def test_affordance_packets_parse_and_have_required_fields():
+    for p in sorted((AFFORDANCES_ROOT / "devices").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        missing = AFFORDANCE_REQUIRED_FIELDS - set(d.keys())
+        assert not missing, f"{p.stem}: missing fields {missing}"
+
+
+def test_affordance_types_valid():
+    valid_types = {"effect", "instrument", "utility", "rack"}
+    for p in sorted((AFFORDANCES_ROOT / "devices").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert d["type"] in valid_types, (
+            f"{p.stem}: invalid type {d['type']} (expected one of {valid_types})"
+        )
+
+
+def test_affordance_no_stale_atlas_uri():
+    """PR 3 quality fix — the field was renamed from atlas_uri to
+    atlas_search_query. Prevent regression."""
+    for p in sorted((AFFORDANCES_ROOT / "devices").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert "atlas_uri" not in d, (
+            f"{p.stem}: stale atlas_uri field — rename to atlas_search_query"
+        )
+        # atlas_search_query must be a plain search term, not a "query:..." URI
+        query = d["atlas_search_query"]
+        assert not query.startswith("query:"), (
+            f"{p.stem}: atlas_search_query must be a plain term, not a URI hint"
+        )
+
+
+def test_affordance_dimensional_impact_fields():
+    valid_levels = {"none", "low", "low-moderate", "moderate", "high"}
+    for p in sorted((AFFORDANCES_ROOT / "devices").glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        impact = d["dimensional_impact"]
+        for dim in CANONICAL_DIMENSIONS:
+            assert dim in impact, f"{p.stem}: missing dimensional_impact.{dim}"
+            level = impact[dim]
+            assert level in valid_levels, (
+                f"{p.stem}: dimensional_impact.{dim} = {level!r} "
+                f"not in {valid_levels}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# v1.18.1 patch-target regression guards
+# ---------------------------------------------------------------------------
+
+
+def test_ping_pong_delay_is_documented_as_echo_mode():
+    """v1.18.1 #4: Ping Pong Delay is NOT a standalone device in Live 12 —
+    search_browser(audio_effects, "Ping Pong Delay") returns empty. The
+    affordance MUST document this and redirect to Echo with Channel Mode=1.
+    Regression guard: no future edit can silently re-assert standalone status."""
+    p = AFFORDANCES_ROOT / "devices" / "ping-pong-delay.yaml"
+    d = yaml.safe_load(p.read_text(encoding="utf-8"))
+
+    # atlas_search_query must be "Echo" (the actually-loadable device) — a
+    # query for "Ping Pong Delay" returns empty on Live 12.
+    assert d["atlas_search_query"] == "Echo", (
+        f"ping-pong-delay.atlas_search_query must be 'Echo', "
+        f"got {d['atlas_search_query']!r}. Ping Pong Delay is not a "
+        f"standalone device; the search target is Echo."
+    )
+
+    # notes must explain the mode-alias relationship
+    notes = d.get("notes", "").lower()
+    assert "echo" in notes, "notes must reference Echo as the real device"
+    assert "channel mode" in notes, (
+        "notes must explain the 'Channel Mode' parameter (value 1 = Ping Pong)"
+    )
+    assert "not a standalone" in notes or "mode of echo" in notes, (
+        "notes must explicitly state this is not a standalone Live 12 device"
+    )
+
+
+def test_auto_filter_ranges_are_normalized_for_modern_class():
+    """v1.18.1 #5: Modern AutoFilter2 class uses 0-1 normalized for Frequency
+    and Resonance (confirmed live: raw 0.45 → value_string '448 Hz'). The
+    legacy 20-135 range from pre-2010 Auto Filter doesn't apply. Regression
+    guard: no future edit can reintroduce legacy Hz values."""
+    p = AFFORDANCES_ROOT / "devices" / "auto-filter.yaml"
+    d = yaml.safe_load(p.read_text(encoding="utf-8"))
+
+    for band_name in ("subtle_ranges", "moderate_ranges", "aggressive_ranges"):
+        band = d.get(band_name, {})
+        freq_range = band.get("frequency")
+        if freq_range is None:
+            continue  # frequency not specified in this band — acceptable
+        lo, hi = freq_range
+        assert 0 <= lo <= 1, (
+            f"auto-filter.{band_name}.frequency[0] = {lo} — must be 0-1 "
+            f"normalized (modern AutoFilter2), not legacy Hz value"
+        )
+        assert 0 <= hi <= 1, (
+            f"auto-filter.{band_name}.frequency[1] = {hi} — must be 0-1 "
+            f"normalized (modern AutoFilter2), not legacy Hz value"
+        )
+
+        # Resonance is also 0-1 on modern, not 0-1.25 legacy
+        res_range = band.get("resonance")
+        if res_range is not None:
+            r_lo, r_hi = res_range
+            assert 0 <= r_hi <= 1.0, (
+                f"auto-filter.{band_name}.resonance[1] = {r_hi} — must be "
+                f"0-1 on AutoFilter2 (legacy was 0-1.25)"
+            )
+
+
+def test_low_novelty_escape_hatch_documented():
+    """v1.18.1 #12: 3-plan diversity rule must have a documented escape
+    hatch for low-novelty_budget requests ('keep the vibe, just cleaner').
+    Current bug: the rule demands 3 distinct families even when the ask is
+    a cleanup that naturally lives entirely in the mix family."""
+    diversity_rule = (
+        DIRECTOR_ROOT / "references" / "move-family-diversity-rule.md"
+    ).read_text(encoding="utf-8").lower()
+    # Must mention low-novelty threshold explicitly
+    assert "novelty_budget" in diversity_rule, (
+        "move-family-diversity-rule.md must reference novelty_budget"
+    )
+    # Must have a clause about narrow mix-only acceptance
+    lowish = ("0.35" in diversity_rule or "0.3" in diversity_rule
+              or "< 0.35" in diversity_rule or "low novelty" in diversity_rule)
+    assert lowish, (
+        "move-family-diversity-rule.md must document that low novelty_budget "
+        "(<0.35) allows 1-2 mix-family plans as honest coverage — "
+        "without this clause the rule incorrectly demands 3 families on "
+        "cleanup asks like 'keep the vibe, just cleaner'"
+    )
+
+
+def test_create_experiment_auto_proposal_no_m0_bug():
+    """v1.18.1 #1 HIGH SEV: create_experiment auto-proposal was taking
+    the FIRST CHARACTER of each move_id (m[0]) instead of the whole
+    string. Result: experiments built with move_ids like 't', 'w', 'm'
+    that fail at run_experiment with 'Move t not found'.
+
+    The bug was a Python unpacking trap: `[m[0] for m, _ in scored]`
+    where `m` is already the move_id string — `m[0]` indexes into it.
+
+    Regression guard via source-level pattern scan, because the tool
+    itself requires an MCP Context to call directly."""
+    path = REPO_ROOT / "mcp_server" / "experiment" / "tools.py"
+    text = path.read_text(encoding="utf-8")
+    # The exact bug pattern
+    assert "m[0] for m, _" not in text, (
+        "Regression: auto-proposal selector reintroduced the m[0] bug. "
+        "Should be `[m for m, _ in scored[:limit]]` (strip the [0]). "
+        "See CHANGELOG v1.18.0 Known Issues #1 for the live repro."
+    )
+    # The function MUST produce move_ids longer than 1 char on realistic input
+    # — guard against a variant of the same bug (e.g. m[:1] or slice(0,1)).
+    # This is best-effort pattern scan, not exhaustive.
+    for bad_pattern in ["m[:1]", "[0:1]", "slice(0, 1)"]:
+        assert bad_pattern not in text, (
+            f"Regression: auto-proposal has suspicious pattern {bad_pattern!r}"
+        )
+
+
+def test_create_experiment_auto_proposal_functional():
+    """v1.18.1 #1 functional check: the keyword-overlap scoring logic
+    produces real multi-character move_ids. Tests the pure scoring logic
+    directly (not the MCP tool wrapper) by re-implementing the fix as a
+    local mirror and confirming it returns valid registry move_ids."""
+    from mcp_server.semantic_moves import registry
+
+    all_moves = list(registry._REGISTRY.values())
+    assert all_moves, "registry must be non-empty for this test to be useful"
+    # Pick a representative move_id and confirm it's multi-char
+    sample_move = all_moves[0]
+    assert len(sample_move.move_id) > 1, (
+        f"sample move_id {sample_move.move_id!r} should be multi-char"
+    )
+
+    # Re-implement the fixed logic locally (mirror of tools.py:250-267)
+    request_lower = "deepen the dub aesthetic on this".lower()
+    request_words = set(request_lower.split())
+    scored = []
+    for move in all_moves:
+        score = 0.0
+        move_words = set(move.move_id.replace("_", " ").split())
+        intent_words = set(move.intent.lower().split())
+        overlap = request_words & (move_words | intent_words)
+        score += len(overlap) * 0.3
+        for dim in move.targets:
+            if dim in request_lower:
+                score += 0.2
+        if score > 0.1:
+            scored.append((move.move_id, score))
+    scored.sort(key=lambda x: -x[1])
+    move_ids_correct = [m for m, _ in scored[:3]]
+    move_ids_buggy = [m[0] for m, _ in scored[:3]]
+
+    # Both shapes may be empty if nothing scored — that's acceptable here.
+    # But if anything DID score, the correct shape returns multi-char
+    # move_ids while the buggy shape returns single chars.
+    if scored:
+        assert all(len(mid) > 1 for mid in move_ids_correct), (
+            f"Fixed path must return multi-char move_ids. "
+            f"Got: {move_ids_correct}"
+        )
+        # Sanity: the buggy shape WOULD have returned single chars,
+        # confirming our repro is valid
+        assert all(len(mid) == 1 for mid in move_ids_buggy), (
+            f"Buggy shape repro failed — test setup is wrong. "
+            f"Got: {move_ids_buggy}"
+        )
+
+
+# v1.24: test_composer_dub_techno_prompt_avoids_drop_scaffold deleted —
+# it tested SECTION_TEMPLATES form behavior which was removed per the
+# vocabulary-not-form principle (Task 12). The LLM provides section form
+# in v1.24+, not the framework registry.
+
+
+# v1.24: test_propose_composer_branches_honors_explicit_count deleted — tested
+# the old form-template-driven compose pipeline (plan_sections with
+# SECTION_TEMPLATES). SECTION_TEMPLATES removed per vocabulary-not-form
+# principle (Task 12). Task 14 will add tests for the new LLM-creative flow.
+
+
+def test_director_phase6_records_ledger_marker():
+    """v1.18.1 #3 MED-HIGH SEV: director's raw-tool-call execution path
+    bypasses the action ledger, making get_last_move return {} and
+    breaking anti-repetition on subsequent creative turns.
+
+    Minimum fix: Phase 6 must explicitly document that raw-tool execution
+    requires a manual ledger marker via add_session_memory OR memory_learn.
+    Full architectural fix (route all execution through semantic_move) is
+    deferred to v1.19."""
+    skill = (DIRECTOR_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "### Phase 6" in skill, "director must have a Phase 6 section"
+    phase_6 = skill.split("### Phase 6")[1].split("### Phase 7")[0]
+    # Must reference manual ledger writing
+    has_session_memory = "add_session_memory" in phase_6 or "session_memory" in phase_6
+    has_ledger_guidance = "ledger" in phase_6.lower()
+    assert has_session_memory and has_ledger_guidance, (
+        "Phase 6 must document add_session_memory as the ledger-marker "
+        "for raw-tool execution paths. Currently missing — get_last_move "
+        "returns empty on creative turns that bypass semantic_move."
+    )
+
+
+def test_anti_repetition_has_state_inference_fallback():
+    """v1.18.1 #3: When the action ledger is empty because the director
+    used raw tool calls (not semantic_move commits), anti-repetition
+    must fall back to session-state inference — scan currently-loaded
+    devices and track-assignment deltas to infer recent family activity.
+    Without this fallback, the director is blind to its own recent
+    actions across turns."""
+    rules = (DIRECTOR_ROOT / "references" / "anti-repetition-rules.md").read_text(encoding="utf-8").lower()
+    # Must reference the fallback mechanism explicitly
+    fallback_keywords = ("state inference", "session state", "ledger is empty",
+                        "ledger empty", "state-based inference")
+    assert any(kw in rules for kw in fallback_keywords), (
+        "anti-repetition-rules.md must document the state-inference "
+        "fallback for when get_last_move / memory_list is empty"
+    )
+
+
+def test_wonder_cold_start_has_distinct_variants():
+    """v1.18.2 #10: enter_wonder_mode on an empty/sparse session (where
+    no semantic moves match the request) previously returned 3 IDENTICAL
+    analytical_only variants all with intent 'Analytical suggestion for:
+    <request>'. Live-verified during v1.18.0 Test 4 with prompt 'I'm
+    stuck' on a 4-track empty session.
+
+    Cold-start fix: when executable_count == 0, seed from distinct
+    starting-point suggestions covering different families (at minimum
+    2 of {device_creation, sound_design, mix}). Each seed has a
+    specific, actionable 'what_changed' and 'why_it_matters' string —
+    no generic boilerplate repetition."""
+    from mcp_server.wonder_mode.engine import generate_wonder_variants
+
+    # Simulated empty-session context — no diagnosis, no song brain,
+    # no session_info. Matches what enter_wonder_mode produces on a
+    # cold-start 'I'm stuck' prompt.
+    result = generate_wonder_variants(
+        request_text="I'm stuck",
+        session_info={},
+    )
+    variants = result["variants"]
+    assert len(variants) >= 2, (
+        f"Wonder must return at least 2 variants even on cold-start. "
+        f"Got {len(variants)}"
+    )
+
+    # CORE assertion: intent fields must be distinct across variants
+    intents = [v.get("intent", "") for v in variants]
+    distinct_intents = set(intents)
+    assert len(distinct_intents) >= 2, (
+        f"Cold-start variants must have at least 2 distinct 'intent' "
+        f"strings (pre-fix they were all identical). Got: {intents}"
+    )
+
+    # Variants should not all be the generic fallback text
+    generic_intent = "Analytical suggestion for: I'm stuck"
+    non_generic = [i for i in intents if i != generic_intent]
+    assert len(non_generic) >= 2, (
+        f"At least 2 of the returned variants must have non-generic "
+        f"cold-start intent text. Got intents: {intents}"
+    )
+
+    # what_changed fields should also be distinct — not all 'No specific
+    # move matched' boilerplate
+    changes = [v.get("what_changed", "") for v in variants]
+    distinct_changes = set(changes)
+    assert len(distinct_changes) >= 2, (
+        f"Cold-start variants must describe distinct what_changed "
+        f"actions. Got: {changes}"
+    )
+
+
+def test_experiment_tie_break_prefers_higher_novelty():
+    """v1.18.2 #11: experiment ranking at score ties produced no clear
+    winner — three branches at 0.6 all got equal rank. Live-verified in
+    v1.18.0 Test 8: add_space + add_warmth + widen_stereo all scored 0.6.
+
+    Fix: secondary sort keys when scores tie. Order of preference:
+      1. -score (primary — higher wins)
+      2. -novelty_rank (higher novelty wins ties — creative asks reward variation)
+      3. risk_rank (lower risk wins secondary ties — safety default)
+      4. step_count (simpler plan wins tertiary ties)
+      5. branch_id (deterministic final tiebreak for reproducibility)"""
+    from mcp_server.experiment.models import ExperimentSet, ExperimentBranch
+    from mcp_server.branches import BranchSeed
+
+    # Three branches all scoring exactly 0.6 — the v1.18.0 Test 8 repro
+    def _branch(branch_id, novelty_label, risk_label, step_count):
+        seed = BranchSeed(
+            seed_id=f"seed_{branch_id}",
+            source="semantic_move",
+            move_id=branch_id,
+            hypothesis="",
+            protected_qualities=[],
+            affected_scope={},
+            distinctness_reason="",
+            risk_label=risk_label,
+            novelty_label=novelty_label,
+            analytical_only=False,
+            producer_payload={},
+        )
+        b = ExperimentBranch(
+            branch_id=f"br_{branch_id}",
+            name=f"Branch: {branch_id}",
+            move_id=branch_id,
+            status="evaluated",
+            score=0.6,
+            compiled_plan={"step_count": step_count, "steps": []},
+            seed=seed,
+        )
+        return b
+
+    # Three branches at identical score 0.6 but different novelty labels
+    exp = ExperimentSet(
+        experiment_id="exp_tiebreak",
+        request_text="deepen the dub aesthetic",
+        branches=[
+            _branch("add_space", novelty_label="safe", risk_label="low", step_count=2),
+            _branch("add_warmth", novelty_label="strong", risk_label="medium", step_count=3),
+            _branch("widen_stereo", novelty_label="unexpected", risk_label="high", step_count=1),
+        ],
+    )
+
+    ranked = exp.ranked_branches()
+    assert len(ranked) == 3
+    # Higher novelty wins first ties: unexpected > strong > safe
+    assert ranked[0].move_id == "widen_stereo", (
+        f"unexpected-novelty should rank first at equal scores. "
+        f"Got ranking: {[b.move_id for b in ranked]}"
+    )
+    assert ranked[1].move_id == "add_warmth", (
+        f"strong-novelty should rank second. "
+        f"Got ranking: {[b.move_id for b in ranked]}"
+    )
+    assert ranked[2].move_id == "add_space", (
+        f"safe-novelty should rank last on equal-score ties. "
+        f"Got ranking: {[b.move_id for b in ranked]}"
+    )
+
+
+def test_experiment_tie_break_is_deterministic():
+    """v1.18.2 #11: the final tie-breaker must be deterministic so
+    repeated calls to compare_experiments return stable rankings.
+    Without a final deterministic key, Python's stable sort depends
+    on input order — making test results sensitive to branch creation
+    order."""
+    from mcp_server.experiment.models import ExperimentSet, ExperimentBranch
+    from mcp_server.branches import BranchSeed
+
+    def _branch(bid, novelty="safe", risk="low", steps=2):
+        seed = BranchSeed(
+            seed_id=f"seed_{bid}",
+            source="semantic_move",
+            move_id=bid,
+            hypothesis="",
+            protected_qualities=[],
+            affected_scope={},
+            distinctness_reason="",
+            risk_label=risk,
+            novelty_label=novelty,
+            analytical_only=False,
+            producer_payload={},
+        )
+        return ExperimentBranch(
+            branch_id=f"br_{bid}",
+            name=bid, move_id=bid, status="evaluated",
+            score=0.5,
+            compiled_plan={"step_count": steps, "steps": []},
+            seed=seed,
+        )
+
+    # Two identical branches except for branch_id
+    exp1 = ExperimentSet(
+        experiment_id="e1", request_text="x",
+        branches=[_branch("aaaa"), _branch("bbbb")],
+    )
+    exp2 = ExperimentSet(
+        experiment_id="e2", request_text="x",
+        branches=[_branch("bbbb"), _branch("aaaa")],  # reversed creation order
+    )
+
+    r1_ids = [b.move_id for b in exp1.ranked_branches()]
+    r2_ids = [b.move_id for b in exp2.ranked_branches()]
+    assert r1_ids == r2_ids, (
+        f"Ranking must be deterministic regardless of creation order. "
+        f"exp1: {r1_ids}, exp2: {r2_ids}"
+    )
+
+
+def test_compliance_check_detects_anti_pattern_violation():
+    """v1.18.3 #7: Director's anti_patterns list was advisory — no runtime
+    check prevented tool calls that violated the brief's avoid contract.
+    Fix: pure check_brief_compliance function that takes brief + intended
+    tool call, returns violations via keyword-token matching. Test repro:
+    Basic Channel packet avoid list + an EQ Hi Gain boost should flag
+    'bright top-end' as violated."""
+    from mcp_server.creative_director.compliance import check_brief_compliance
+
+    brief = {
+        "identity": "Basic Channel-style dub-techno",
+        "anti_patterns": [
+            "bright transient-heavy hats",
+            "dry signals / short tails",
+            "bright top-end",
+        ],
+        "locked_dimensions": [],
+        "reference_anchors": [{"name": "Basic Channel", "source": "user"}],
+    }
+
+    # User tries to boost EQ Hi Gain — violates 'bright top-end'
+    result = check_brief_compliance(
+        brief=brief,
+        tool_name="set_device_parameter",
+        tool_args={
+            "track_index": 0,
+            "device_index": 0,
+            "parameter_name": "Hi Gain",
+            "value": 8,
+        },
+    )
+    assert result["ok"] is False, (
+        f"Hi Gain boost under BC packet should trip 'bright top-end' "
+        f"anti_pattern. Got: {result}"
+    )
+    violations = result["violations"]
+    assert any(v["rule"] == "anti_pattern" for v in violations), (
+        f"Expected anti_pattern violation, got: {violations}"
+    )
+
+
+def test_compliance_check_detects_locked_dimension_violation():
+    """v1.18.3 #8: Director's locked_dimensions was advisory — raw tool
+    calls could violate user's 'don't touch the arrangement' lock. Fix:
+    compliance check maps tools to dimensions (structural/rhythmic/
+    timbral/spatial) and flags when a locked dimension is touched."""
+    from mcp_server.creative_director.compliance import check_brief_compliance
+
+    brief = {
+        "identity": "Tighten the drums, don't touch arrangement",
+        "anti_patterns": [],
+        "locked_dimensions": ["structural"],
+    }
+
+    # User tries to create a new scene — touches structural dimension
+    result = check_brief_compliance(
+        brief=brief,
+        tool_name="create_scene",
+        tool_args={"index": -1},
+    )
+    assert result["ok"] is False, (
+        f"create_scene under structural-locked brief should flag violation. "
+        f"Got: {result}"
+    )
+    violations = result["violations"]
+    assert any(v["rule"] == "locked_dimension" for v in violations), (
+        f"Expected locked_dimension violation, got: {violations}"
+    )
+
+
+def test_compliance_check_passes_compliant_call():
+    """v1.18.3: the compliance function must NOT false-positive. A tool
+    call that doesn't touch any anti_pattern or locked dimension should
+    return ok=True with empty violations."""
+    from mcp_server.creative_director.compliance import check_brief_compliance
+
+    brief = {
+        "identity": "Basic Channel dub-techno",
+        "anti_patterns": ["bright top-end", "full-grid quantization"],
+        "locked_dimensions": ["structural"],
+    }
+
+    # Loading a Drift instrument — doesn't violate anti_patterns or locks
+    result = check_brief_compliance(
+        brief=brief,
+        tool_name="load_browser_item",
+        tool_args={"track_index": 0, "uri": "query:Synths#Drift"},
+    )
+    assert result["ok"] is True, (
+        f"Compliant tool call should pass. Got: {result}"
+    )
+    assert result["violations"] == [], (
+        f"No violations expected. Got: {result['violations']}"
+    )
+
+
+def test_compliance_check_empty_brief_permissive():
+    """v1.18.3: an empty or nearly-empty brief (no anti_patterns, no
+    locks) must pass all tool calls. Otherwise the checker would be a
+    hard block for any creative work done without a full brief."""
+    from mcp_server.creative_director.compliance import check_brief_compliance
+
+    result = check_brief_compliance(
+        brief={"identity": "whatever"},  # no anti_patterns, no locks
+        tool_name="set_device_parameter",
+        tool_args={"track_index": 0, "device_index": 0, "parameter_name": "Drive", "value": 0.8},
+    )
+    assert result["ok"] is True
+
+
+def test_batch_set_parameters_schema_documented():
+    """v1.18.1 bonus: the batch_set_parameters schema requires
+    {'Name': {'value': v}}, not {'Name': v}. Live verification bit me on
+    this. Regression guard: the core skill or creative-brief-template
+    must document the correct shape."""
+    # Check multiple likely locations for the doc
+    candidates = [
+        SKILLS_ROOT / "livepilot-core" / "SKILL.md",
+        DIRECTOR_ROOT / "SKILL.md",
+        DIRECTOR_ROOT / "references" / "creative-brief-template.md",
+        CORE_REFS / "ableton-workflow-patterns.md",
+    ]
+    found = False
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        text = candidate.read_text(encoding="utf-8")
+        if "batch_set_parameters" in text and '"value"' in text:
+            found = True
+            break
+    assert found, (
+        "batch_set_parameters schema must be documented somewhere in the "
+        "core skill docs — at least one location should show the "
+        "{'Name': {'value': v}} form"
+    )
+
+
+def test_affordance_appears_in_packets_artists_resolve():
+    """Every artist referenced in affordance appears_in_packets must exist.
+    Artist YAMLs are complete (28), so any unresolved ref is a typo."""
+    artist_slugs = {p.stem for p in (CONCEPTS_ROOT / "artists").glob("*.yaml")}
+
+    unresolved = []
+    for p in (AFFORDANCES_ROOT / "devices").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        appears = d.get("appears_in_packets", {})
+        for artist in appears.get("artists", []) or []:
+            if artist not in artist_slugs:
+                unresolved.append((p.stem, artist))
+
+    assert not unresolved, f"Unresolved appears_in_packets.artists: {unresolved}"
+
+
+def test_affordance_appears_in_packets_genres_tolerated():
+    """Genre refs in affordances may point at narrative-only genres (same
+    issue as artist→genre refs). Apply the same threshold."""
+    genre_slugs = {p.stem for p in (CONCEPTS_ROOT / "genres").glob("*.yaml")}
+
+    unresolved = []
+    for p in (AFFORDANCES_ROOT / "devices").glob("*.yaml"):
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+        appears = d.get("appears_in_packets", {})
+        for genre in appears.get("genres", []) or []:
+            if genre not in genre_slugs:
+                unresolved.append((p.stem, genre))
+
+    CURRENT_UNRESOLVED_THRESHOLD = 30  # 2026-04-23 baseline
+    assert len(unresolved) <= CURRENT_UNRESOLVED_THRESHOLD, (
+        f"Unresolved affordance→genre refs ({len(unresolved)}) exceeded "
+        f"threshold {CURRENT_UNRESOLVED_THRESHOLD}: {unresolved[:8]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schema files exist
+# ---------------------------------------------------------------------------
+
+
+def test_concept_schema_exists():
+    schema = CONCEPTS_ROOT / "_schema.md"
+    assert schema.exists(), f"Concept schema missing: {schema}"
+
+
+def test_affordance_schema_exists():
+    schema = AFFORDANCES_ROOT / "_schema.md"
+    assert schema.exists(), f"Affordance schema missing: {schema}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-skill integration
+# ---------------------------------------------------------------------------
+
+
+def test_director_references_concept_packets():
+    """The director's SKILL.md should point at the structured packets
+    (PR 2 integration), not only the narrative .md files."""
+    skill = (DIRECTOR_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "concepts/artists" in skill, (
+        "Director SKILL.md must reference concepts/artists/ YAML packets"
+    )
+    assert "concepts/genres" in skill, (
+        "Director SKILL.md must reference concepts/genres/ YAML packets"
+    )
+
+
+def test_director_references_affordances():
+    """PR 3 integration — the director's SKILL.md should reference the
+    affordance YAMLs in Phase 6."""
+    skill = (DIRECTOR_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "affordances/" in skill or "Affordance lookup" in skill, (
+        "Director SKILL.md must reference affordance packets in Phase 6"
+    )
+
+
+def test_evaluation_skill_has_artistic_dimensions():
+    """PR 4 integration — livepilot-evaluation should document the
+    Family B artistic dimensions."""
+    eval_skill = (SKILLS_ROOT / "livepilot-evaluation" / "SKILL.md").read_text(encoding="utf-8")
+    for dim in [
+        "style_fit",
+        "distinctiveness",
+        "motif_coherence",
+        "section_contrast",
+        "restraint",
+    ]:
+        assert dim in eval_skill, (
+            f"livepilot-evaluation/SKILL.md missing artistic dimension: {dim}"
+        )
+
+
+def test_evaluation_skill_has_verdict_taxonomy():
+    """PR 4 integration — the 5 verdicts must be documented."""
+    eval_skill = (SKILLS_ROOT / "livepilot-evaluation" / "SKILL.md").read_text(encoding="utf-8")
+    for verdict in [
+        "safe_win",
+        "bold_win",
+        "interesting_failure",
+        "identity_break",
+        "generic_fallback",
+    ]:
+        assert verdict in eval_skill, (
+            f"livepilot-evaluation/SKILL.md missing verdict: {verdict}"
+        )
+
+
+def test_memory_guide_has_promotion_rubric():
+    """PR 5 integration — memory-guide must have the verdict-driven
+    promotion rubric."""
+    guide = (CORE_REFS / "memory-guide.md").read_text(encoding="utf-8")
+    assert "Reflection Promotion Rubric" in guide or "Promotion matrix" in guide, (
+        "memory-guide.md must include the verdict-driven promotion rubric"
+    )
+    for verdict in ["safe_win", "bold_win", "identity_break", "generic_fallback"]:
+        assert verdict in guide, (
+            f"memory-guide.md promotion rubric missing verdict: {verdict}"
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

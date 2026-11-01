@@ -1,0 +1,298 @@
+# Getting Started
+
+This guide takes you from zero to making sound in about five minutes.
+
+> **Contributing to LivePilot?** Use [dev-install.md](dev-install.md) instead — it sets up a local checkout so edits to `mcp_server/` or `remote_script/` take effect without republishing to npm.
+
+## What you need
+
+- **Ableton Live 12** (any edition — Intro, Standard, or Suite)
+- **Node.js 18+** ([download](https://nodejs.org/))
+- **Python 3.12+** (required by scipy>=1.18; the system Python on macOS is too old — `brew install python@3.12`; [download](https://www.python.org/) for Windows)
+- **An MCP-compatible AI client** — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Claude Desktop](https://claude.ai/download), [Cursor](https://cursor.sh), VS Code with Copilot, or any other MCP client
+
+## Step 1: Install the Remote Script
+
+> **Fastest path:** `npx livepilot --setup` runs the unified wizard — it checks Python, installs the Remote Script, bootstraps the venv, configures MCP, and installs the M4L Analyzer to your User Library in one command. If you run it, you can skip the manual Analyzer drag in the Optional section below. The steps that follow do the same work piece by piece.
+
+The Remote Script is a small Python program that runs inside Ableton and listens for commands from LivePilot. Run this once:
+
+```bash
+npx livepilot --install
+```
+
+This auto-detects your Ableton installation and copies the script to the right folder. Works on macOS and Windows.
+
+**What if it can't find Ableton?** The installer checks common paths. If your Ableton is installed somewhere unusual, you can manually copy the `remote_script/LivePilot/` folder to:
+- **macOS:** `~/Music/Ableton/User Library/Remote Scripts/`
+- **Windows:** `\Users\{you}\Documents\Ableton\User Library\Remote Scripts\`
+
+## Step 2: Enable LivePilot in Ableton
+
+1. **Restart Ableton Live** (required after installing the Remote Script)
+2. Go to **Preferences > Link, Tempo & MIDI**
+3. Under **Control Surface**, click the dropdown and select **LivePilot**
+4. You should see `LivePilot: Listening on port 9878` in the status bar at the bottom
+
+If you don't see LivePilot in the dropdown, the Remote Script wasn't copied to the right place. Double-check the path from Step 1.
+
+## Step 3: Connect your AI client
+
+### Claude Code
+
+```bash
+claude mcp add LivePilot -- npx livepilot
+```
+
+### Codex App
+
+```bash
+npx livepilot --install-codex-plugin
+```
+
+This installs the bundled LivePilot plugin into `~/plugins/livepilot` and
+registers it in `~/.agents/plugins/marketplace.json`.
+
+For a manual plugin-dir setup, the committed MCP config lives at
+`livepilot/.mcp.json` (not a root `.mcp.json`) and uses the npx form
+(`{"command": "npx", "args": ["livepilot"]}`); `--install-codex-plugin`
+rewrites it to an absolute path automatically.
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "LivePilot": {
+      "command": "npx",
+      "args": ["-y", "livepilot"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving.
+
+### Cursor / VS Code / Other MCP clients
+
+Add to your MCP config file (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "LivePilot": {
+      "command": "npx",
+      "args": ["-y", "livepilot"]
+    }
+  }
+}
+```
+
+## Step 4: Verify the connection
+
+```bash
+npx livepilot --status
+```
+
+This pings Ableton over TCP. If you see `Connected`, you're good. If it says `Connection refused`, make sure:
+1. Ableton Live is running
+2. LivePilot is selected as Control Surface in Preferences
+3. No firewall is blocking localhost port 9878
+
+## Step 5 (optional): Personalize the device atlas
+
+LivePilot ships with a baseline device atlas — a few thousand stock Ableton devices indexed with URIs and enrichment profiles. That's enough for core tools to work, but the baseline doesn't know about **your** installed packs, User Library presets, or plugins. To index your full library, ask the AI to scan it:
+
+**You:** "Run `scan_full_library` with `max_per_category=30000`"
+
+Or, if you prefer an explicit tool invocation from an MCP-capable client:
+
+```
+scan_full_library(max_per_category=30000)
+```
+
+A first-time scan needs no `force` flag — there's no prior user atlas to override. Add `force=true` only to re-scan over an existing `~/.livepilot/atlas/device_atlas.json`.
+
+The scan walks every browser category (Instruments, Audio Effects, Drums, Samples, Sounds, Plug-Ins, Max for Live, User Library) and records every loadable item. Takes 30-90 seconds depending on library size. The result is saved to **`~/.livepilot/atlas/device_atlas.json`** — your personal atlas, separate from the bundled baseline.
+
+- **npm updates don't touch it.** `npx livepilot --install` / version upgrades leave your personal atlas alone.
+- **Per-user, not per-project.** One scan covers every project on this machine.
+- **Rescan when you install new packs.** The atlas doesn't update automatically — run `scan_full_library(force=true)` again after any pack install or major User Library change.
+- **Skip this step if you're just exploring.** The bundled baseline is enough for `atlas_search`, `atlas_suggest`, and most `find_and_load_device` calls against stock Ableton devices. You only need the personal scan once you want LivePilot to know about **your** specific library.
+
+## Your first session
+
+With Ableton open and LivePilot connected, try this conversation:
+
+**You:** "What's in my session right now?"
+
+The AI will call `get_session_info` and tell you the tempo, how many tracks you have, which scenes exist, and whether anything is playing. This is always a good starting point — it grounds the AI in your actual session state.
+
+**You:** "Set the tempo to 120 and create a MIDI track called DRUMS"
+
+Now you have a track. But it's empty — no instrument loaded, no clips, no notes.
+
+**You:** "Search for a drum kit and load it onto the DRUMS track"
+
+The AI will search Ableton's browser, find a kit (like "606 Core Kit" or "808 Core Kit"), and load it. Now the track has an instrument.
+
+**You:** "Create an 8-beat clip and program a basic house kick pattern — four on the floor"
+
+The AI creates a clip, programs kick notes (pitch 36) on every beat, and you should be able to hit play and hear it.
+
+**You:** "Fire that clip"
+
+Sound. You just made your first beat with LivePilot.
+
+## Understanding the basics
+
+### Everything is indexed from 0
+
+The first track is `track_index: 0`. The first clip slot is `clip_index: 0`. The first scene is `scene_index: 0`. This matches how Ableton numbers things internally.
+
+For return tracks, use negative indices: `-1` for Return A, `-2` for Return B, and so on. For the master track, use `-1000`. This works with device tools (load effects, tweak parameters) and mixing tools (volume, pan, routing).
+
+### Time is measured in beats
+
+All time values are in beats (quarter notes). At 4/4 time:
+- 1.0 = one beat (quarter note)
+- 4.0 = one bar
+- 0.5 = one eighth note
+- 0.25 = one sixteenth note
+
+A "4-beat clip" is one bar. A "32-beat clip" is 8 bars.
+
+### Volume is 0.0 to 1.0
+
+It's not decibels. The scale is:
+- `0.0` = silence (-inf dB)
+- `0.50` = roughly -12 dB
+- `0.70` = roughly -6 dB
+- `0.85` = 0 dB (unity gain — what Ableton defaults to)
+- `1.0` = +6 dB (louder than default — be careful)
+
+### MIDI pitch is 0 to 127
+
+Middle C is 60. Standard drum mapping (General MIDI):
+- 36 = Kick
+- 38 = Snare
+- 42 = Closed Hi-Hat
+- 46 = Open Hi-Hat
+- 49 = Crash Cymbal
+
+### Undo is your safety net inside the Live set
+
+Most clip, device, mixer, and Arrangement edits participate in Ableton's undo
+history, and the AI has access to `undo` and `redo`. Downloads, saved memories,
+library scans, installer changes, and other filesystem actions do not. LivePilot
+previews or asks before a consequential action when undo is not an honest safety
+net.
+
+### Always verify after changes
+
+Good practice: after creating or modifying something, the AI should read back the state to confirm it worked. This is built into LivePilot's design — the AI is taught to verify after every write operation.
+
+## Plugin install
+
+### Codex App
+
+```bash
+npx livepilot --install-codex-plugin
+```
+
+This gives Codex the bundled LivePilot plugin surfaces from the repo without
+manually copying files into `~/plugins`.
+
+### Claude Code
+
+If you're using Claude Code, install the plugin for an enhanced experience:
+
+```bash
+claude plugin marketplace add github:dreamrec/LivePilot
+claude plugin install livepilot@dreamrec-LivePilot
+```
+
+This adds:
+
+### Slash commands
+- `/session` — Full session overview with diagnostics
+- `/beat` — Guided beat creation workflow
+- `/mix` — Mixing assistant
+- `/sounddesign` — Sound design workflow
+- `/memory` — Browse, search, and manage saved techniques
+- `/arrange` — Guided arrangement and song structure
+- `/perform` — Live performance mode with safety constraints
+- `/evaluate` — Before/after evaluation of recent changes
+
+### The producer agent
+
+A multi-step assistant that builds scaffold sessions from high-level descriptions:
+
+> "Start me a 126 BPM minimal techno session with a driving kick, shuffling hi-hats, and a deep bass line in A minor"
+
+The agent handles track creation, instrument loading, pattern programming, arrangement, and basic mixing. The output is a playable baseline — a starting point, not a finished track. You listen, decide what works, and iterate. LivePilot is a high-trust session operator, not a full autonomous producer — your taste stays in the loop.
+
+### Quick tips for faster production
+
+- **Use the Device Atlas** — `atlas_suggest(intent="warm bass for techno")` is faster and more reliable than browser search.
+- **Use automation recipes** — `apply_automation_recipe(recipe="filter_sweep_up")` adds movement in one call.
+- **On Live 12.3+** — `insert_device` loads devices 10x faster than browser search. The system auto-detects your version.
+- **For samples** — `search_samples(query="...")` searches Splice, browser, and filesystem simultaneously.
+
+### The core skill
+
+The `livepilot-core` skill teaches the AI how to use LivePilot properly: always check session state first, verify after writes, never load empty Drum Racks, check volumes, and more. It's the difference between an AI that fumbles through the API and one that works like an experienced producer's assistant.
+
+## Keeping things updated
+
+### When you update LivePilot
+
+After pulling a new version:
+1. Run `npx livepilot --install` again to update the Remote Script
+2. Restart Ableton to load the new handlers
+3. Restart your AI client to pick up new MCP tools
+
+The MCP server (Python process) and Ableton's Remote Script are separate. New tools need the MCP server restarted. New handler logic needs Ableton restarted. When in doubt, restart both.
+
+### Checking your version
+
+```bash
+npx livepilot --version
+```
+
+### Running diagnostics
+
+```bash
+npx livepilot --doctor
+```
+
+This checks Python version, dependencies, Ableton connection, and Remote Script installation.
+
+## Optional: M4L Analyzer
+
+The LivePilot Analyzer is an optional Max for Live device that enables real-time audio analysis tools not available through Ableton's standard API.
+
+### Installation
+
+1. Copy `m4l_device/LivePilot_Analyzer.amxd` to your User Library (drag it into Ableton's browser under **User Library**)
+2. Drag the device onto your **master track**
+3. The device communicates with the MCP server over UDP (ports 9880/9881) — no additional configuration needed
+
+### What it enables
+
+With the Analyzer installed, you get 38 additional tools including:
+
+- **Spectrum analysis** — real-time frequency data from the master output
+- **Key detection** — automatic key/scale detection using the Krumhansl-Schmuckler algorithm
+- **Simpler operations** — replace samples, get slices, crop, reverse, and warp
+- **Warp markers** — read, add, move, and remove warp markers on audio clips
+- **Hidden parameters** — access device parameters not exposed by the standard ControlSurface API
+- **Display values** — read human-readable parameter values (e.g., "−6.0 dB" instead of 0.70)
+
+The Analyzer is optional. Most tools work without it. The 38 spectral/analyzer tools strictly require the Analyzer on the master track; the device/sample tools that call the bridge have graceful fallbacks.
+
+---
+
+Next: [Tool Reference](tool-reference.md) | Back to [Manual](index.md)

@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 3.12 is the MCP-server floor: scipy>=1.18 dropped 3.11 (numpy is
+        # currently capped <2.5 for numba/librosa — see requirements.txt).
+        # NOTE: the Remote Script runs inside Ableton's embedded Python (3.11 on
+        # Live 12.3); it must stay 3.11-syntax-compatible even though CI now
+        # exercises only 3.12. Add a 3.11 remote_script-only job if that drifts.
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: |
+          pip install numpy setuptools wheel
+          pip install -r requirements.txt pytest pytest-asyncio
+      - run: pytest tests/ -v
+
+  metadata-drift:
+    # Enforces that every file listed in CLAUDE.md as version/count-bearing is
+    # actually in sync. Prior releases (1.10.2, 1.10.4, 1.10.6) each shipped
+    # with some form of metadata drift because this check was manual only.
+    # No untrusted inputs: sync_metadata.py is a repo-local script.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        # The domain-map check regenerates docs/manual/index.md's table from
+        # the LIVE tool registry (mcp.list_tools()), which imports
+        # mcp_server.server — fastmcp and friends must be importable here.
+        run: |
+          pip install numpy setuptools wheel
+          pip install -r requirements.txt
+      - name: sync_metadata --check
+        run: python scripts/sync_metadata.py --check
+
+  amxd-freeze-drift:
+    # Guard against the repeating "bridge ping reports old version" bug: if
+    # the frozen .amxd embeds an older version string than the repo, refuse
+    # to merge. Two prior releases were lost to this class of drift.
+    # No untrusted inputs: VERSION is derived from the repo's own code.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: .amxd ping version matches repo version
+        run: |
+          VERSION=$(python -c "import sys; sys.path.insert(0,'.'); from mcp_server import __version__; print(__version__)")
+          echo "Repo version: $VERSION"
+          # v1.23.3: grep the source-of-truth `var VERSION = "X.Y.Z"` literal
+          # which is always emitted by Max during freeze, instead of the legacy
+          # JSON form `"version": "X.Y.Z"`. The legacy form was the runtime
+          # ping response value back when bridge.js hardcoded version strings;
+          # since the v1.20-era refactor to `"version": VERSION`, the JSON
+          # literal only appeared via post-export binary-patch. The
+          # `var VERSION` form is in bridge.js source and survives every
+          # Max freeze — no patching needed.
+          if ! strings m4l_device/LivePilot_Analyzer.amxd | grep -qE "var VERSION[[:space:]]*=[[:space:]]*\"$VERSION\""; then
+            echo "::error::LivePilot_Analyzer.amxd does NOT embed 'var VERSION = \"$VERSION\"'."
+            echo "::error::Bridge.js source and .amxd freeze are out of sync."
+            echo "::error::Fix: bump 'var VERSION' in m4l_device/livepilot_bridge.js,"
+            echo "::error::sync to '~/Documents/Max 9/Max for Live Devices/LivePilot_Analyzer Project/code/livepilot_bridge.js',"
+            echo "::error::open m4l_device/LivePilot_Analyzer.maxpat in Max, Cmd-S to re-export."
+            exit 1
+          fi
+          echo ".amxd embeds 'var VERSION = \"$VERSION\"' — source/freeze in sync."
+      - name: .amxd embeds every bridge command from livepilot_bridge.js
+        # The version-string check alone can be satisfied by the documented
+        # 6-byte binary patch after real JS logic changes. Frozen .amxd files
+        # embed the JS source as plain text, so diff the full set of
+        # `case "<command>":` names from source against the binary's strings.
+        # No untrusted inputs — both files are repo-local.
+        run: |
+          python3 - <<'PYEOF'
+          import re, subprocess, sys
+          src = open("m4l_device/livepilot_bridge.js", encoding="utf-8").read()
+          cmds = sorted(set(re.findall(r'case\s*"([^"]+)"\s*:', src)))
+          if not cmds:
+              print("::error::No case \"...\" commands parsed from livepilot_bridge.js")
+              sys.exit(1)
+          blob = subprocess.check_output(["strings", "m4l_device/LivePilot_Analyzer.amxd"], text=True)
+          missing = [c for c in cmds if f'case "{c}"' not in blob]
+          if missing:
+              print(f"::error::.amxd freeze is stale — {len(missing)} bridge command(s) in "
+                    f"livepilot_bridge.js are missing from the frozen binary: {missing}")
+              print("::error::A real Max re-freeze is required (binary version patch is not enough).")
+              sys.exit(1)
+          print(f"All {len(cmds)} bridge commands present in the frozen .amxd.")
+          PYEOF
+      - name: Full freeze-chain verification
+        # Superset of the two checks above. The `case "<command>":` diff cannot see a batch that
+        # adds no NEW command — the v1.28 token auth wraps the existing dispatcher, so a binary
+        # containing none of its code still passes that check. This script additionally diffs
+        # top-level JS identifiers against the binary, and asserts the freeze is still FAT.
+        # No untrusted inputs — repo-local files only. Install targets are absent on CI and skip.
+        run: bash scripts/sync_amxd_targets.sh
+
+  remote-script-py311:
+    # The Remote Script runs inside Ableton's embedded Python (3.11 on Live
+    # 12.3/12.4) while the MCP-server floor is 3.12. Nothing else enforces
+    # that remote_script/ stays 3.11-compatible — this job does.
+    # No untrusted inputs: compiles repo-local code only.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: remote_script compiles under Python 3.11
+        run: python -m compileall -q remote_script/LivePilot
+      - name: vermin — no >3.11 stdlib/API usage in remote_script
+        run: |
+          pip install --quiet vermin
+          vermin --target=3.11- --violations --no-tips remote_script/LivePilot
+
+  mcpb-build:
+    # build_mcpb.sh produces the release asset that silently shipped missing
+    # for four consecutive releases (v1.17–v1.20.2). Build it on every push
+    # so a broken script/manifest is caught at PR time, not release time.
+    # No untrusted inputs, no publishing, no secrets.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build MCPB bundle
+        run: bash scripts/build_mcpb.sh
+      - name: Assert bundle exists and is non-trivial
+        run: |
+          BUNDLE=$(ls dist/livepilot-*.mcpb 2>/dev/null | head -1)
+          if [ -z "$BUNDLE" ]; then
+            echo "::error::build_mcpb.sh produced no dist/livepilot-*.mcpb"
+            exit 1
+          fi
+          SIZE=$(wc -c < "$BUNDLE")
+          echo "Built $BUNDLE ($SIZE bytes)"
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::MCPB bundle is suspiciously small (<1MB) — staging likely broke"
+            exit 1
+          fi
+
+  js-entrypoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Verify JS entrypoint parses and --help works
+        run: |
+          node -c bin/livepilot.js
+          node bin/livepilot.js --help
+      - name: Verify npm pack includes expected files
+        run: |
+          npm pack --dry-run 2>&1 | tee /dev/stderr | grep -q "livepilot_bridge.js"
+          npm pack --dry-run 2>&1 | grep -q "LivePilot_Analyzer.amxd"
+          npm pack --dry-run 2>&1 | grep -q "remote_script/LivePilot/__init__.py"
+          npm pack --dry-run 2>&1 | grep -q "livepilot/skills/livepilot-core/SKILL.md"
+          npm pack --dry-run 2>&1 | grep -q "livepilot/.Codex-plugin/plugin.json"
+      - name: Verify npm pack excludes dirty/local files
+        # Prevents shipping local-only artifacts like .mcp.json.disabled (with
+        # absolute workstation paths), pre-freeze backups, swap files, or
+        # .DS_Store. No untrusted inputs — static grep against pack output.
+        run: |
+          npm pack --dry-run 2>&1 | tee pack.log
+          if grep -E '\.(disabled|backup|bak|swp|orig)$|\.pre-|\.DS_Store' pack.log; then
+            echo "::error::npm pack contains dirty/local artifacts. Exclude them via the \"files\" allowlist in package.json or .npmignore."
+            exit 1
+          fi
+          if grep -E 'plugins-synths\.md|synths-m4l\.md|utility-and-workflow\.md|samples-and-irs\.md|presets-by-vibe\.md|m4l-vendor|m4l-depth-pass|m4l-library-deep|m4l-master-reference|m4l-technique-map' pack.log; then
+            echo "::error::npm pack contains personal/user atlas files. Keep these gitignored files out of the npm payload."
+            exit 1
+          fi

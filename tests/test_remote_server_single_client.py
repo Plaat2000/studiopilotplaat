@@ -1,0 +1,349 @@
+"""Socket-level tests for the Remote Script single-client guard."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import socket
+import sys
+import time
+import types
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REMOTE_ROOT = ROOT / "remote_script" / "LivePilot"
+
+
+def _load_server_module():
+    for name in [
+        "remote_script.LivePilot.server",
+        "remote_script.LivePilot.router",
+        "remote_script.LivePilot.utils",
+        "remote_script.LivePilot",
+        "remote_script",
+    ]:
+        sys.modules.pop(name, None)
+
+    remote_pkg = types.ModuleType("remote_script")
+    remote_pkg.__path__ = [str(ROOT / "remote_script")]
+    sys.modules["remote_script"] = remote_pkg
+
+    live_pkg = types.ModuleType("remote_script.LivePilot")
+    live_pkg.__path__ = [str(REMOTE_ROOT)]
+    sys.modules["remote_script.LivePilot"] = live_pkg
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    _load("remote_script.LivePilot.utils", REMOTE_ROOT / "utils.py")
+    _load("remote_script.LivePilot.router", REMOTE_ROOT / "router.py")
+    return _load("remote_script.LivePilot.server", REMOTE_ROOT / "server.py")
+
+
+def _wait_until(predicate, timeout=2.0):
+    # OSError catch handles Windows WSAEINVAL (WinError 10022) raised by
+    # getsockname() on a socket whose bind() hasn't completed yet — a
+    # transient state we want to treat as "not ready yet, keep polling"
+    # rather than letting it surface as a test failure.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if predicate():
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
+class _FakeControlSurface:
+    def __init__(self):
+        self.logs = []
+
+    def log_message(self, message):
+        self.logs.append(message)
+
+    def schedule_message(self, _delay, func):
+        func()
+
+    def song(self):
+        return object()
+
+
+def test_second_client_replaces_stale_connection():
+    """A new connection kicks the stale one and becomes active.
+
+    LivePilot is single-client by design, but rejecting concurrent
+    connections (the previous behavior) had a footgun: when the MCP
+    server restarted uncleanly, the Remote Script's recv() loop didn't
+    notice the disconnect for up to a second. During that window, the
+    legitimate reconnect attempt got rejected with STATE_ERROR — often
+    requiring an Ableton restart to recover.
+
+    The kick-stale-and-accept policy treats a new connection as proof
+    that the old one is dead, which is the right call given the
+    single-client architecture.
+    """
+    server_mod = _load_server_module()
+    cs = _FakeControlSurface()
+    server = server_mod.LivePilotServer(cs, port=0)
+
+    first = None
+    second = None
+    try:
+        server.start()
+        assert _wait_until(
+            lambda: server._server_socket is not None
+            and server._server_socket.getsockname()[1] != 0
+        )
+        host, port = server._server_socket.getsockname()[:2]
+        if host == "" or host == "0.0.0.0" or host == "::":
+            host = "127.0.0.1"
+
+        first = socket.create_connection((host, port), timeout=2.0)
+        assert _wait_until(lambda: server._client_connected)
+        first_socket_at_connect = server._current_client
+
+        # Open a second connection — this should kick the first.
+        second = socket.create_connection((host, port), timeout=2.0)
+
+        # The first socket should now be the kicked one — confirm by
+        # observing that the server's _current_client reference flipped
+        # to the new socket (different object identity).
+        assert _wait_until(
+            lambda: server._current_client is not None
+            and server._current_client is not first_socket_at_connect
+        ), "expected _current_client to be replaced by the new connection"
+
+        # The first socket's recv() should now return EOF (b'') because
+        # the server closed it from the accept loop.
+        first.settimeout(2.0)
+        try:
+            data = first.recv(4096)
+        except OSError:
+            data = b""
+        assert data == b"", "first client should observe EOF after being replaced"
+
+        # And the new connection should NOT receive a STATE_ERROR (no
+        # rejection JSON appears on the wire).
+        second.settimeout(0.5)
+        try:
+            leftover = second.recv(4096)
+        except (socket.timeout, OSError):
+            leftover = b""
+        assert leftover == b"", (
+            "second client should not receive a STATE_ERROR rejection — "
+            f"got {leftover!r}"
+        )
+    finally:
+        if first is not None:
+            try: first.close()
+            except OSError: pass
+        if second is not None:
+            try: second.close()
+            except OSError: pass
+        server.stop()
+
+
+def test_write_command_classifier_catches_newer_mutating_handlers():
+    """New mutating handlers should get write timeout/settle behavior.
+
+    This guards the Remote Script against stale WRITE_COMMANDS drift as new
+    handlers are added in later domains.
+    """
+    server_mod = _load_server_module()
+
+    for command in (
+        "insert_device",
+        "insert_rack_chain",
+        "set_song_scale",
+        "set_clip_pitch",
+        "set_groove_params",
+        "assign_clip_groove",
+        "create_native_arrangement_clip",
+        "replace_sample_native",
+        "arrangement_automation_via_session_record_start",
+        "arrangement_automation_via_session_record_complete",
+        "cleanup_test_note",
+    ):
+        assert server_mod.is_write_command(command), command
+
+    for command in (
+        "get_session_info",
+        "get_simpler_file_path",
+        "list_available_scales",
+        "scan_browser_deep",
+        "ping",
+        "reload_handlers",
+    ):
+        assert not server_mod.is_write_command(command), command
+
+
+def test_undo_redo_batch_classify_as_write():
+    """undo / redo / batch_set_parameters genuinely mutate Live and MUST be
+    write-classified so they receive the write timeout + 100ms settle delay.
+
+    Regression guard for P2-48: these three handlers match no READ prefix and
+    survive only via the explicit WRITE_COMMANDS set (undo/redo) or the
+    ``batch_`` write prefix (batch_set_parameters). A future trim of
+    WRITE_COMMANDS must not silently drop them to read-tier, which would
+    reintroduce the read-after-write race the settle delay prevents.
+    """
+    server_mod = _load_server_module()
+    for command in ("undo", "redo", "batch_set_parameters"):
+        assert server_mod.is_write_command(command), command
+
+
+def test_oversize_line_without_newline_emits_invalid_param():
+    """A request line larger than MAX_BUF with no newline must emit a
+    structured INVALID_PARAM and resynchronize the stream — not a bare
+    disconnect the client can't distinguish from a crash (P2-47).
+    """
+    server_mod = _load_server_module()
+    server = server_mod.LivePilotServer(_FakeControlSurface(), port=0)
+    server._running = True
+
+    class _OversizeClient:
+        """Feeds one >4MB newline-less chunk, then EOF to end the loop."""
+
+        def __init__(self):
+            self.payloads = []
+            self._chunks = [b"x" * (4 * 1024 * 1024 + 16), b""]
+
+        def settimeout(self, _timeout):
+            return None
+
+        def recv(self, _bufsize):
+            return self._chunks.pop(0)
+
+        def sendall(self, payload):
+            self.payloads.append(payload.decode("utf-8"))
+
+    client = _OversizeClient()
+    server._handle_client(client)
+
+    assert client.payloads, "oversize line should produce a structured error"
+    response = json.loads(client.payloads[0].strip())
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_PARAM"
+    assert "newline" in response["error"]["message"]
+
+
+def test_schedule_message_disconnect_sends_state_error():
+    server_mod = _load_server_module()
+
+    class _DisconnectingControlSurface:
+        def schedule_message(self, _delay, _func):
+            raise AssertionError("disconnecting")
+
+        def log_message(self, _message):
+            return None
+
+    class _FakeClient:
+        def __init__(self):
+            self.payloads = []
+
+        def sendall(self, payload):
+            self.payloads.append(payload.decode("utf-8"))
+
+    server = server_mod.LivePilotServer(_DisconnectingControlSurface(), port=0)
+    client = _FakeClient()
+
+    server._process_line(client, json.dumps({"id": "abc", "type": "ping"}))
+
+    assert client.payloads, "disconnect path should send a response to the client"
+    response = json.loads(client.payloads[0].strip())
+    assert response["ok"] is False
+    assert response["error"]["code"] == "STATE_ERROR"
+def test_timed_out_command_is_not_dispatched():
+    """A command cancelled (timed out) before dequeue must NOT execute.
+
+    Reproduces the phantom-write bug: the TCP thread times out and tells the
+    client TIMEOUT, but the still-queued command later runs on Ableton's main
+    thread and mutates Live anyway. With the cancellation flag, the deferred
+    main-thread pass must skip router.dispatch entirely.
+    """
+    import queue as _queue
+    import threading as _threading
+
+    server_mod = _load_server_module()
+
+    dispatched = []
+    server_mod.router.dispatch = lambda song, command: dispatched.append(command)
+
+    class _DeferringControlSurface:
+        def __init__(self):
+            self.pending = []
+
+        def schedule_message(self, _delay, func):
+            # Defer instead of running inline, so we can interleave a timeout
+            # between enqueue and main-thread execution.
+            self.pending.append(func)
+
+        def log_message(self, _message):
+            return None
+
+        def song(self):
+            return object()
+
+    cs = _DeferringControlSurface()
+    server = server_mod.LivePilotServer(cs, port=0)
+
+    command = {"id": "z1", "type": "set_track_volume"}
+    response_queue = _queue.Queue()
+    state = server_mod._CmdState()
+    # Simulate the post-timeout state: the command is queued and already marked
+    # abandoned by the TCP thread.
+    state.cancelled = True
+    server._command_queue.put((command, response_queue, state))
+
+    # Main thread pass runs after the timeout.
+    server._process_next_command()
+
+    assert dispatched == [], "cancelled command must not be dispatched"
+    assert response_queue.empty(), "no response should be produced for an abandoned command"
+
+
+def test_live_command_still_dispatches():
+    """A normal (non-cancelled) command must still execute and respond."""
+    import queue as _queue
+    import threading as _threading
+
+    server_mod = _load_server_module()
+
+    dispatched = []
+
+    def _fake_dispatch(song, command):
+        dispatched.append(command)
+        return {"id": command.get("id"), "ok": True}
+
+    server_mod.router.dispatch = _fake_dispatch
+
+    class _InlineControlSurface:
+        def schedule_message(self, _delay, func):
+            func()
+
+        def log_message(self, _message):
+            return None
+
+        def song(self):
+            return object()
+
+    server = server_mod.LivePilotServer(_InlineControlSurface(), port=0)
+
+    command = {"id": "z2", "type": "set_track_volume"}
+    response_queue = _queue.Queue()
+    state = server_mod._CmdState()  # not cancelled
+    server._command_queue.put((command, response_queue, state))
+
+    server._process_next_command()
+
+    assert dispatched == [command], "live command should be dispatched"
+    resp = response_queue.get(timeout=2.0)
+    assert resp["ok"] is True

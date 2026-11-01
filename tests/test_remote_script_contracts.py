@@ -1,0 +1,1045 @@
+"""Contract tests for remote_script modules without importing Ableton-only __init__."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REMOTE_ROOT = ROOT / "remote_script" / "LivePilot"
+
+
+def _load_remote_modules():
+    for name in [
+        "remote_script.LivePilot.diagnostics",
+        "remote_script.LivePilot.arrangement",
+        "remote_script.LivePilot.router",
+        "remote_script.LivePilot.utils",
+        "remote_script.LivePilot",
+        "remote_script",
+    ]:
+        sys.modules.pop(name, None)
+
+    remote_pkg = types.ModuleType("remote_script")
+    remote_pkg.__path__ = [str(ROOT / "remote_script")]
+    sys.modules["remote_script"] = remote_pkg
+
+    live_pkg = types.ModuleType("remote_script.LivePilot")
+    live_pkg.__path__ = [str(REMOTE_ROOT)]
+    sys.modules["remote_script.LivePilot"] = live_pkg
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    _load("remote_script.LivePilot.utils", REMOTE_ROOT / "utils.py")
+    router = _load("remote_script.LivePilot.router", REMOTE_ROOT / "router.py")
+    arrangement = _load("remote_script.LivePilot.arrangement", REMOTE_ROOT / "arrangement.py")
+    diagnostics = _load("remote_script.LivePilot.diagnostics", REMOTE_ROOT / "diagnostics.py")
+    return router, arrangement, diagnostics
+
+
+def _load_remote_clips():
+    """Load remote_script.LivePilot.clips with its dependencies isolated."""
+    for name in [
+        "remote_script.LivePilot.clips",
+        "remote_script.LivePilot.router",
+        "remote_script.LivePilot.utils",
+        "remote_script.LivePilot",
+        "remote_script",
+    ]:
+        sys.modules.pop(name, None)
+
+    remote_pkg = types.ModuleType("remote_script")
+    remote_pkg.__path__ = [str(ROOT / "remote_script")]
+    sys.modules["remote_script"] = remote_pkg
+
+    live_pkg = types.ModuleType("remote_script.LivePilot")
+    live_pkg.__path__ = [str(REMOTE_ROOT)]
+    sys.modules["remote_script.LivePilot"] = live_pkg
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    _load("remote_script.LivePilot.utils", REMOTE_ROOT / "utils.py")
+    router = _load("remote_script.LivePilot.router", REMOTE_ROOT / "router.py")
+    clips = _load("remote_script.LivePilot.clips", REMOTE_ROOT / "clips.py")
+    return router, clips
+
+
+def _load_remote_mixing():
+    for name in [
+        "remote_script.LivePilot.mixing",
+        "remote_script.LivePilot.router",
+        "remote_script.LivePilot.utils",
+        "remote_script.LivePilot",
+        "remote_script",
+    ]:
+        sys.modules.pop(name, None)
+
+    remote_pkg = types.ModuleType("remote_script")
+    remote_pkg.__path__ = [str(ROOT / "remote_script")]
+    sys.modules["remote_script"] = remote_pkg
+
+    live_pkg = types.ModuleType("remote_script.LivePilot")
+    live_pkg.__path__ = [str(REMOTE_ROOT)]
+    sys.modules["remote_script.LivePilot"] = live_pkg
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    _load("remote_script.LivePilot.utils", REMOTE_ROOT / "utils.py")
+    _load("remote_script.LivePilot.router", REMOTE_ROOT / "router.py")
+    return _load("remote_script.LivePilot.mixing", REMOTE_ROOT / "mixing.py")
+
+
+def test_router_missing_required_param_maps_to_invalid_param():
+    router, _arrangement, _diagnostics = _load_remote_modules()
+
+    @router.register("needs_name")
+    def _needs_name(song, params):
+        return {"name": params["name"]}
+
+    response = router.dispatch(None, {"id": "abc", "type": "needs_name", "params": {}})
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_PARAM"
+    assert "Missing required parameter" in response["error"]["message"]
+
+
+def test_router_rejects_non_dict_params():
+    router, _arrangement, _diagnostics = _load_remote_modules()
+
+    @router.register("noop")
+    def _noop(song, params):
+        return {"ok": True}
+
+    response = router.dispatch(None, {"id": "abc", "type": "noop", "params": ["bad"]})
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_PARAM"
+    assert "params" in response["error"]["message"]
+
+
+def test_arrangement_automation_unsupported_returns_outer_error():
+    router, _arrangement, _diagnostics = _load_remote_modules()
+
+    class _Param:
+        def __init__(self, name: str):
+            self.name = name
+            self.min = 0.0
+            self.max = 1.0
+
+    class _Mixer:
+        def __init__(self):
+            self.volume = _Param("Volume")
+            self.panning = _Param("Pan")
+            self.sends = []
+
+    class _Clip:
+        def automation_envelope(self, parameter):
+            return None
+
+        def create_automation_envelope(self, parameter):
+            return None
+
+    class _Track:
+        def __init__(self):
+            self.arrangement_clips = [_Clip()]
+            self.mixer_device = _Mixer()
+            self.devices = []
+
+    class _Song:
+        def __init__(self):
+            self.tracks = [_Track()]
+
+    response = router.dispatch(
+        _Song(),
+        {
+            "id": "abc",
+            "type": "set_arrangement_automation",
+            "params": {
+                "track_index": 0,
+                "clip_index": 0,
+                "parameter_type": "volume",
+                "points": [{"time": 0.0, "value": 0.5}],
+            },
+        },
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "STATE_ERROR"
+    assert "Cannot create automation envelope" in response["error"]["message"]
+
+
+def test_session_diagnostics_flags_plugin_health_categories():
+    _router, _arrangement, diagnostics = _load_remote_modules()
+
+    class _Param:
+        pass
+
+    class _Device:
+        def __init__(self, name: str, class_name: str, parameter_count: int):
+            self.name = name
+            self.class_name = class_name
+            self.parameters = [_Param() for _ in range(parameter_count)]
+
+    class _Slot:
+        has_clip = True
+
+    class _Track:
+        def __init__(self):
+            self.arm = False
+            self.solo = False
+            self.mute = False
+            self.name = "Lead"
+            self.clip_slots = [_Slot()]
+            self.has_midi_input = False
+            self.devices = [
+                _Device("CHOWTapeModel", "PluginDevice", 1),
+                _Device("iDensity (Instr)", "PluginDevice", 25),
+            ]
+
+    class _Scene:
+        name = "A"
+
+    class _Song:
+        tracks = [_Track()]
+        scenes = [_Scene()]
+        return_tracks = []
+
+    result = diagnostics.get_session_diagnostics(_Song(), {})
+    issue_types = {issue["type"] for issue in result["issues"]}
+
+    assert "opaque_or_failed_plugins" in issue_types
+    assert "sample_dependent_devices" in issue_types
+
+
+def test_session_diagnostics_skips_missing_track_properties():
+    _router, _arrangement, diagnostics = _load_remote_modules()
+
+    class _Slot:
+        has_clip = True
+
+    class _Track:
+        name = "Main"
+        clip_slots = [_Slot()]
+        devices = []
+        has_midi_input = False
+
+        @property
+        def arm(self):
+            raise RuntimeError("missing arm")
+
+        @property
+        def solo(self):
+            raise RuntimeError("missing solo")
+
+        @property
+        def mute(self):
+            raise RuntimeError("missing mute")
+
+    class _Scene:
+        name = "A"
+
+    class _Song:
+        tracks = [_Track()]
+        scenes = [_Scene()]
+        return_tracks = []
+
+    result = diagnostics.get_session_diagnostics(_Song(), {})
+    assert isinstance(result, dict)
+    assert "healthy" in result
+
+
+def test_get_track_meters_zeroes_muted_tracks():
+    mixing = _load_remote_mixing()
+
+    class _Track:
+        def __init__(self, name: str, mute: bool, level: float):
+            self.name = name
+            self.mute = mute
+            self.has_audio_output = True
+            self.output_meter_level = level
+            self.output_meter_left = level
+            self.output_meter_right = level
+
+    class _Song:
+        tracks = [_Track("Open", False, 0.42), _Track("Muted", True, 0.77)]
+
+    result = mixing.get_track_meters(_Song(), {"include_stereo": True})
+
+    assert result["tracks"][0]["level"] == 0.42
+    assert result["tracks"][1]["level"] == 0.0
+    assert result["tracks"][1]["left"] == 0.0
+    assert result["tracks"][1]["right"] == 0.0
+
+
+# ─── BUG-A1 / A4 / A5 — Batch 2 regressions ─────────────────────────────────
+
+def _make_audio_clip(pitch_coarse=0, pitch_fine=0.0, gain=1.0):
+    """Minimal audio-clip stub that exposes the attributes get_clip_info touches."""
+    class _Clip:
+        pass
+    c = _Clip()
+    c.name = "audio"
+    c.color_index = 0
+    c.length = 4.0
+    c.is_playing = False
+    c.is_recording = False
+    c.is_midi_clip = False
+    c.is_audio_clip = True
+    c.looping = True
+    c.loop_start = 0.0
+    c.loop_end = 4.0
+    c.start_marker = 0.0
+    c.end_marker = 4.0
+    c.launch_mode = 0
+    c.launch_quantization = 0
+    c.warping = True
+    c.warp_mode = 4
+    c.pitch_coarse = pitch_coarse
+    c.pitch_fine = pitch_fine
+    c.gain = gain
+    return c
+
+
+def _song_with_clip(clip):
+    """Build a minimal Song-like object holding one track with one clip slot."""
+    class _Slot:
+        pass
+
+    class _Track:
+        pass
+
+    class _Song:
+        pass
+
+    slot = _Slot()
+    slot.clip = clip
+    track = _Track()
+    track.clip_slots = [slot]
+    song = _Song()
+    song.tracks = [track]
+    song.master_track = None
+    song.return_tracks = []
+    return song
+
+
+def test_bug_a4_get_clip_info_exposes_audio_pitch_and_gain():
+    """BUG-A4: get_clip_info on an audio clip must include pitch_coarse /
+    pitch_fine / gain so callers can detect sample-vs-session key drift."""
+    _router, clips = _load_remote_clips()
+    clip = _make_audio_clip(pitch_coarse=-1, pitch_fine=12.5, gain=0.85)
+    song = _song_with_clip(clip)
+
+    info = clips.get_clip_info(song, {"track_index": 0, "clip_index": 0})
+
+    assert info["is_audio_clip"] is True
+    assert info["pitch_coarse"] == -1
+    assert info["pitch_fine"] == 12.5
+    assert info["gain"] == 0.85
+
+
+def test_bug_a4_midi_clips_do_not_report_pitch_fields():
+    """Pitch fields are audio-only in Live — midi clips must not leak
+    fake values into the response."""
+    _router, clips = _load_remote_clips()
+
+    class _MidiClip:
+        name = "midi"
+        color_index = 0
+        length = 4.0
+        is_playing = False
+        is_recording = False
+        is_midi_clip = True
+        is_audio_clip = False
+        looping = True
+        loop_start = 0.0
+        loop_end = 4.0
+        start_marker = 0.0
+        end_marker = 4.0
+        launch_mode = 0
+        launch_quantization = 0
+
+    song = _song_with_clip(_MidiClip())
+    info = clips.get_clip_info(song, {"track_index": 0, "clip_index": 0})
+
+    assert info["is_midi_clip"] is True
+    assert "pitch_coarse" not in info
+    assert "pitch_fine" not in info
+    assert "gain" not in info
+
+
+def test_bug_a5_set_clip_pitch_writes_coarse_and_fine():
+    """BUG-A5: set_clip_pitch must mutate pitch_coarse / pitch_fine / gain."""
+    _router, clips = _load_remote_clips()
+    clip = _make_audio_clip()
+    song = _song_with_clip(clip)
+
+    result = clips.set_clip_pitch(song, {
+        "track_index": 0, "clip_index": 0,
+        "coarse": -1, "fine": -7.5, "gain": 0.5,
+    })
+
+    assert clip.pitch_coarse == -1
+    assert clip.pitch_fine == -7.5
+    assert clip.gain == 0.5
+    # Response should round-trip the new values
+    assert result["pitch_coarse"] == -1
+    assert result["pitch_fine"] == -7.5
+    assert result["gain"] == 0.5
+
+
+def test_bug_a5_set_clip_pitch_rejects_midi_clips():
+    """MIDI clips don't have sample pitch — caller mistake should error."""
+    import pytest
+    _router, clips = _load_remote_clips()
+
+    class _MidiClip:
+        is_midi_clip = True
+        is_audio_clip = False
+
+    slot = type("_Slot", (), {"clip": _MidiClip()})()
+    track = type("_Track", (), {"clip_slots": [slot]})()
+    song = type("_Song", (), {
+        "tracks": [track], "master_track": None, "return_tracks": [],
+    })()
+
+    with pytest.raises(ValueError, match="audio clips"):
+        clips.set_clip_pitch(song, {
+            "track_index": 0, "clip_index": 0, "coarse": 1,
+        })
+
+
+def test_bug_a5_set_clip_pitch_requires_at_least_one_param():
+    import pytest
+    _router, clips = _load_remote_clips()
+    song = _song_with_clip(_make_audio_clip())
+
+    with pytest.raises(ValueError, match="at least one"):
+        clips.set_clip_pitch(song, {"track_index": 0, "clip_index": 0})
+
+
+def test_bug_a5_set_clip_pitch_rejects_out_of_range_coarse():
+    import pytest
+    _router, clips = _load_remote_clips()
+    song = _song_with_clip(_make_audio_clip())
+
+    with pytest.raises(ValueError, match="semitones"):
+        clips.set_clip_pitch(song, {
+            "track_index": 0, "clip_index": 0, "coarse": 500,
+        })
+
+
+def _compressor_routing_song(compressor):
+    class _Track:
+        def __init__(self, devices):
+            self.devices = devices
+
+    class _Song:
+        tracks = [_Track([compressor])]
+        return_tracks = []
+        master_track = None
+
+    return _Song()
+
+
+def test_bug_a3_reopen_legacy_compressor_uses_flat_surface():
+    """Legacy Compressor (I) exposes the flat available_sidechain_input_*
+    attrs and the handler should keep matching by display_name — this is
+    the original Batch 19 behavior that must not regress."""
+    mixing = _load_remote_mixing()
+
+    class _RT:
+        def __init__(self, name):
+            self.display_name = name
+
+    class _RC:
+        def __init__(self, name):
+            self.display_name = name
+
+    rt_kick, rt_ext = _RT("1-KICK"), _RT("Ext. In")
+    rc_pre, rc_post = _RC("Pre FX"), _RC("Post FX")
+
+    class _Compressor:
+        class_name = "Compressor"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            self.available_sidechain_input_routing_types = [rt_kick, rt_ext]
+            self.available_sidechain_input_routing_channels = [rc_pre, rc_post]
+            self.sidechain_input_routing_type = rt_ext
+            self.sidechain_input_routing_channel = rc_post
+
+    comp = _Compressor()
+    result = mixing.set_compressor_sidechain(
+        _compressor_routing_song(comp),
+        {
+            "track_index": 0, "device_index": 0,
+            "source_type": "1-KICK", "source_channel": "Pre FX",
+        },
+    )
+    assert result["ok"] is True
+    assert comp.sidechain_enabled is True
+    assert comp.sidechain_input_routing_type is rt_kick
+    assert comp.sidechain_input_routing_channel is rc_pre
+    assert result["sidechain"]["type"] == "1-KICK"
+    assert result["sidechain"]["channel"] == "Pre FX"
+
+
+def test_sidechain_bare_name_match_is_case_insensitive():
+    """The tolerant bare-name fallback (suffix match on "-<name>") must
+    casefold both sides. A caller passing a bare lowercase track name
+    ("kick") must still match an index-prefixed, differently-cased display
+    name ("1-KICK") — this used to be a strict `str.endswith` and silently
+    failed to match unless the caller's casing happened to agree with
+    Live's routing-menu casing exactly."""
+    mixing = _load_remote_mixing()
+
+    class _RT:
+        def __init__(self, name):
+            self.display_name = name
+
+    class _RC:
+        def __init__(self, name):
+            self.display_name = name
+
+    rt_kick, rt_ext = _RT("1-KICK"), _RT("Ext. In")
+    rc_pre, rc_post = _RC("Pre FX"), _RC("Post FX")
+
+    class _Compressor:
+        class_name = "Compressor"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            self.available_sidechain_input_routing_types = [rt_kick, rt_ext]
+            self.available_sidechain_input_routing_channels = [rc_pre, rc_post]
+            self.sidechain_input_routing_type = rt_ext
+            self.sidechain_input_routing_channel = rc_post
+
+    comp = _Compressor()
+    # Bare, lowercase name — no index prefix, wrong case relative to "KICK".
+    result = mixing.set_compressor_sidechain(
+        _compressor_routing_song(comp),
+        {"track_index": 0, "device_index": 0, "source_type": "kick"},
+    )
+    assert result["ok"] is True
+    assert comp.sidechain_input_routing_type is rt_kick
+    assert result["sidechain"]["type"] == "1-KICK"
+
+
+def test_bug_a3_reopen_compressor2_missing_surface_raises_with_diagnostic():
+    """Compressor2 without any known LOM sidechain surface — the error
+    must embed a dir() audit so the next run reveals what IS exposed.
+    Regression guard for the 2026-04-21 Live 12.3.6 regression where
+    available_sidechain_input_routing_types disappeared on Compressor2."""
+    import pytest
+
+    mixing = _load_remote_mixing()
+
+    class _Compressor2:
+        class_name = "Compressor2"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            # Carry a distinct routing-related attr so we can confirm
+            # the diagnostic actually walks dir() and surfaces it.
+            self.some_routing_marker = "probe-breadcrumb"
+
+    comp = _Compressor2()
+    with pytest.raises(ValueError) as exc:
+        mixing.set_compressor_sidechain(
+            _compressor_routing_song(comp),
+            {"track_index": 0, "device_index": 0, "source_type": "1-KICK"},
+        )
+    msg = str(exc.value)
+    assert "doesn't expose a sidechain routing surface" in msg
+    assert "Compressor2" in msg
+    assert "Inspected attrs:" in msg
+    assert "some_routing_marker" in msg  # diagnostic walked dir()
+
+
+def test_bug_a3_reopen_compressor2_nested_sidechain_input_surface():
+    """Compressor2 hypothesis: routing moved to a nested sidechain_input
+    DeviceIO child. The probe should find it and route writes through."""
+    mixing = _load_remote_mixing()
+
+    class _RT:
+        def __init__(self, name):
+            self.display_name = name
+
+    class _RC:
+        def __init__(self, name):
+            self.display_name = name
+
+    rt_drums = _RT("1-DRUMS")
+    rc_post = _RC("Post FX")
+
+    class _DeviceIO:
+        def __init__(self):
+            self.available_routing_types = [rt_drums]
+            self.available_routing_channels = [rc_post]
+            self.routing_type = rt_drums
+            self.routing_channel = rc_post
+
+    class _Compressor2:
+        class_name = "Compressor2"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            self.sidechain_input = _DeviceIO()
+
+    comp = _Compressor2()
+    result = mixing.set_compressor_sidechain(
+        _compressor_routing_song(comp),
+        {
+            "track_index": 0, "device_index": 0,
+            "source_type": "1-DRUMS", "source_channel": "Post FX",
+        },
+    )
+    assert result["ok"] is True
+    assert comp.sidechain_input.routing_type is rt_drums
+    assert comp.sidechain_input.routing_channel is rc_post
+    assert result["sidechain"]["type"] == "1-DRUMS"
+    assert result["sidechain"]["channel"] == "Post FX"
+
+
+def test_bug_a3_reopen_compressor2_context_dependent_channels():
+    """Compressor2's `available_input_routing_channels` is context-dependent
+    — the list reflects channels for the currently-selected
+    `input_routing_type`. On a fresh Compressor with "No Input" selected,
+    the channel list is EMPTY; after setting type to "3-Audio", it becomes
+    ["Pre FX", "Post FX"]. Live-verified on Ableton Live 12.4.0.
+
+    The handler MUST re-read channels after writing type, not use a stale
+    probe-time snapshot. Regression guard for the 2026-04-21 combined-call
+    failure where source_type landed but source_channel matching got an
+    empty list because the probe had snapshotted channels pre-write.
+    """
+    mixing = _load_remote_mixing()
+
+    class _RT:
+        def __init__(self, name):
+            self.display_name = name
+
+    class _RC:
+        def __init__(self, name):
+            self.display_name = name
+
+    rt_no, rt_kick = _RT("No Input"), _RT("1-KICK")
+    rc_pre, rc_post = _RC("Pre FX"), _RC("Post FX")
+
+    class _Compressor2:
+        class_name = "Compressor2"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            self._current_type = rt_no
+            self._current_chan = rc_post
+
+        @property
+        def available_input_routing_types(self):
+            return [rt_no, rt_kick]
+
+        @property
+        def available_input_routing_channels(self):
+            # Empty until a real input is selected — mirrors LOM behavior.
+            if self._current_type is rt_no:
+                return []
+            return [rc_pre, rc_post]
+
+        @property
+        def input_routing_type(self):
+            return self._current_type
+
+        @input_routing_type.setter
+        def input_routing_type(self, v):
+            self._current_type = v
+
+        @property
+        def input_routing_channel(self):
+            return self._current_chan
+
+        @input_routing_channel.setter
+        def input_routing_channel(self, v):
+            self._current_chan = v
+
+    comp = _Compressor2()
+    result = mixing.set_compressor_sidechain(
+        _compressor_routing_song(comp),
+        {
+            "track_index": 0, "device_index": 0,
+            "source_type": "1-KICK", "source_channel": "Pre FX",
+        },
+    )
+    assert result["ok"] is True
+    assert comp._current_type is rt_kick
+    assert comp._current_chan is rc_pre
+    assert result["sidechain"]["type"] == "1-KICK"
+    assert result["sidechain"]["channel"] == "Pre FX"
+
+
+def test_bug_a3_reopen_mismatched_source_type_lists_available():
+    """When source_type doesn't match, the error must list the options
+    from the discovered surface (not a hardcoded assumption)."""
+    import pytest
+
+    mixing = _load_remote_mixing()
+
+    class _RT:
+        def __init__(self, name):
+            self.display_name = name
+
+    class _Compressor:
+        class_name = "Compressor"
+        name = "Compressor"
+        parameters = []
+
+        def __init__(self):
+            self.sidechain_enabled = False
+            self.available_sidechain_input_routing_types = [_RT("Ext. In")]
+            self.available_sidechain_input_routing_channels = []
+            self.sidechain_input_routing_type = None
+            self.sidechain_input_routing_channel = None
+
+    with pytest.raises(ValueError) as exc:
+        mixing.set_compressor_sidechain(
+            _compressor_routing_song(_Compressor()),
+            {"track_index": 0, "device_index": 0, "source_type": "1-KICK"},
+        )
+    msg = str(exc.value)
+    assert "Sidechain input type '1-KICK' not found" in msg
+    assert "Ext. In" in msg
+    # surface tag helps future debugging tell us which shape matched
+    assert "flat device.sidechain_input_routing_*" in msg
+
+
+def test_bug_a1_ping_embeds_remote_script_version_and_commands():
+    """BUG-A1: ping response must include remote_script_version and the
+    handler set so the MCP server can detect stale installs."""
+    router, clips = _load_remote_clips()
+
+    # inject a known version onto the LivePilot pkg — mimics __init__.py
+    live_pkg = sys.modules["remote_script.LivePilot"]
+    live_pkg.__version__ = "1.10.6"
+
+    response = router.dispatch(None, {"id": "p", "type": "ping", "params": {}})
+    assert response["ok"] is True
+    result = response["result"]
+    assert result["pong"] is True
+    assert result["remote_script_version"] == "1.10.6"
+    # commands list should include the newly-added set_clip_pitch handler
+    assert "set_clip_pitch" in result["commands"]
+    assert "get_clip_info" in result["commands"]
+
+
+def _load_remote_devices():
+    """Load remote_script.LivePilot.devices with Live stubbed.
+
+    devices.py does `import Live` at module top (for the browser helper),
+    so we inject a bare ModuleType before loading. version_detect is
+    imported lazily inside handlers — get_device_parameters never touches
+    it, so we don't need to stub that path.
+    """
+    for name in [
+        "remote_script.LivePilot.devices",
+        "remote_script.LivePilot.router",
+        "remote_script.LivePilot.utils",
+        "remote_script.LivePilot",
+        "remote_script",
+    ]:
+        sys.modules.pop(name, None)
+
+    sys.modules.setdefault("Live", types.ModuleType("Live"))
+
+    remote_pkg = types.ModuleType("remote_script")
+    remote_pkg.__path__ = [str(ROOT / "remote_script")]
+    sys.modules["remote_script"] = remote_pkg
+
+    live_pkg = types.ModuleType("remote_script.LivePilot")
+    live_pkg.__path__ = [str(REMOTE_ROOT)]
+    sys.modules["remote_script.LivePilot"] = live_pkg
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    _load("remote_script.LivePilot.utils", REMOTE_ROOT / "utils.py")
+    router = _load("remote_script.LivePilot.router", REMOTE_ROOT / "router.py")
+    devices = _load("remote_script.LivePilot.devices", REMOTE_ROOT / "devices.py")
+    return router, devices
+
+
+def test_get_device_parameters_tolerates_broken_display_value():
+    """A parameter whose str_for_value or display_value raises RuntimeError
+    (Live reports 'Invalid display value' on Operator, Compressor2,
+    AutoFilter2 when a value is NaN/unset) must not abort the whole
+    serialization. The broken parameter serializes with None strings;
+    siblings are returned intact.
+    """
+    router, _devices = _load_remote_devices()
+
+    class _GoodParam:
+        name = "Threshold"
+        value = 0.5
+        min = 0.0
+        max = 1.0
+        is_quantized = False
+        display_value = "-6.0 dB"
+
+        def str_for_value(self, v):
+            return "-6.0 dB"
+
+    class _BadParam:
+        name = "Ratio"
+        value = float("nan")
+        min = 0.0
+        max = 1.0
+        is_quantized = False
+
+        def str_for_value(self, v):
+            raise RuntimeError("Invalid display value")
+
+        @property
+        def display_value(self):
+            raise RuntimeError("Invalid display value")
+
+    class _Device:
+        parameters = [_GoodParam(), _BadParam()]
+
+    class _Track:
+        devices = [_Device()]
+
+    class _Song:
+        tracks = [_Track()]
+        return_tracks = []
+
+    response = router.dispatch(
+        _Song(),
+        {
+            "id": "t1",
+            "type": "get_device_parameters",
+            "params": {"track_index": 0, "device_index": 0},
+        },
+    )
+
+    assert response["ok"] is True, f"Expected success, got: {response}"
+    params = response["result"]["parameters"]
+    assert len(params) == 2
+
+    good, bad = params
+    assert good["name"] == "Threshold"
+    assert good["value_string"] == "-6.0 dB"
+    assert good["display_value"] == "-6.0 dB"
+
+    assert bad["name"] == "Ratio"
+    assert bad["value_string"] is None
+    assert bad["display_value"] is None
+
+
+class _UndoSong:
+    """Minimal song fake exposing begin/end_undo_step for write handlers."""
+
+    def __init__(self, track):
+        self.tracks = [track]
+        self.return_tracks = []
+        self.undo_steps = 0
+
+    def begin_undo_step(self):
+        self.undo_steps += 1
+
+    def end_undo_step(self):
+        self.undo_steps -= 1
+
+
+def test_set_device_parameter_succeeds_when_readback_raises():
+    """A single set whose str_for_value readback raises AFTER the write has
+    landed must still report success — a display-string failure must never
+    convert an applied write into a reported error (P2-49).
+    """
+    router, _devices = _load_remote_devices()
+
+    class _Param:
+        name = "Tune"
+        min = 0.0
+        max = 1.0
+        value = 0.0
+
+        def str_for_value(self, v):
+            raise RuntimeError("Invalid display value")
+
+        @property
+        def display_value(self):
+            raise RuntimeError("Invalid display value")
+
+    param = _Param()
+
+    class _Device:
+        parameters = [param]
+
+    class _Track:
+        devices = [_Device()]
+
+    response = router.dispatch(
+        _UndoSong(_Track()),
+        {
+            "id": "s1",
+            "type": "set_device_parameter",
+            "params": {
+                "track_index": 0,
+                "device_index": 0,
+                "parameter_index": 0,
+                "value": 0.42,
+            },
+        },
+    )
+
+    assert response["ok"] is True, f"Expected success, got: {response}"
+    result = response["result"]
+    assert abs(result["value"] - 0.42) < 1e-9, "write must have landed"
+    assert result["value_string"] is None
+    assert result["display_value"] is None
+    assert abs(param.value - 0.42) < 1e-9
+
+
+def test_batch_set_parameters_returns_per_item_results_on_partial_failure():
+    """A batch with one bad entry must apply the good writes, report per-item
+    {ok}/{ok: False, error}, and never collapse to a blanket exception (P2-50).
+    """
+    router, _devices = _load_remote_devices()
+
+    class _Param:
+        def __init__(self, name):
+            self.name = name
+            self.min = 0.0
+            self.max = 1.0
+            self.value = 0.0
+
+        def str_for_value(self, v):
+            return "%.2f" % v
+
+        @property
+        def display_value(self):
+            return "%.2f" % self.value
+
+    p_good = _Param("Cutoff")
+
+    class _Device:
+        parameters = [p_good]
+
+    class _Track:
+        devices = [_Device()]
+
+    response = router.dispatch(
+        _UndoSong(_Track()),
+        {
+            "id": "b1",
+            "type": "batch_set_parameters",
+            "params": {
+                "track_index": 0,
+                "device_index": 0,
+                "parameters": [
+                    {"name_or_index": "Cutoff", "value": 0.6},
+                    {"name_or_index": "DoesNotExist", "value": 0.3},
+                ],
+            },
+        },
+    )
+
+    # Transport-level success — the call did not raise mid-loop.
+    assert response["ok"] is True, f"Expected dispatch success, got: {response}"
+    result = response["result"]
+    # Application-level partial success: one good, one bad.
+    assert result["ok"] is False
+    assert result["applied"] == 1
+    assert result["failed"] == 1
+
+    entries = result["parameters"]
+    assert len(entries) == 2
+    assert entries[0]["ok"] is True
+    assert entries[0]["name"] == "Cutoff"
+    assert abs(p_good.value - 0.6) < 1e-9, "earlier write must have landed"
+    assert entries[1]["ok"] is False
+    assert "error" in entries[1]
+    assert entries[1]["name_or_index"] == "DoesNotExist"
+
+
+def test_batch_set_parameters_all_success_reports_ok_true():
+    """When every entry succeeds the batch reports ok=True with applied==N."""
+    router, _devices = _load_remote_devices()
+
+    class _Param:
+        def __init__(self, name):
+            self.name = name
+            self.min = 0.0
+            self.max = 1.0
+            self.value = 0.0
+
+        def str_for_value(self, v):
+            return "%.2f" % v
+
+        @property
+        def display_value(self):
+            return "%.2f" % self.value
+
+    p_a = _Param("A")
+    p_b = _Param("B")
+
+    class _Device:
+        parameters = [p_a, p_b]
+
+    class _Track:
+        devices = [_Device()]
+
+    response = router.dispatch(
+        _UndoSong(_Track()),
+        {
+            "id": "b2",
+            "type": "batch_set_parameters",
+            "params": {
+                "track_index": 0,
+                "device_index": 0,
+                "parameters": [
+                    {"name_or_index": "A", "value": 0.1},
+                    {"name_or_index": 1, "value": 0.9},
+                ],
+            },
+        },
+    )
+
+    assert response["ok"] is True
+    result = response["result"]
+    assert result["ok"] is True
+    assert result["applied"] == 2
+    assert result["failed"] == 0
+    assert all(e["ok"] for e in result["parameters"])

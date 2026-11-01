@@ -1,0 +1,532 @@
+"""Creative Constraints MCP tools — 5 tools for constrained creativity
+and reference distillation.
+
+  apply_creative_constraint_set — activate creative constraints
+  distill_reference_principles — learn principles from a reference
+  map_reference_principles_to_song — translate reference into current song
+  generate_constrained_variants — generate triptych variants under constraints
+  generate_reference_inspired_variants — variants from reference principles
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from fastmcp import Context
+
+from ..server import mcp
+from . import engine
+from .models import CONSTRAINT_MODES
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Module-level cache for active constraints and distillations
+_active_constraints: Optional[engine.ConstraintSet] = None
+_cached_distillation: Optional[engine.ReferenceDistillation] = None
+
+
+@mcp.tool()
+def apply_creative_constraint_set(
+    ctx: Context,
+    constraints: list[str] | None = None,
+) -> dict:
+    """Apply creative constraints to focus suggestions.
+
+    Constraints modify planning and ranking, not just validation.
+    When stuck, try adding constraints instead of more unconstrained advice.
+
+    Available constraints:
+    - use_loaded_devices_only — only use what's already loaded
+    - no_new_tracks — work within existing tracks
+    - subtraction_only — only remove/reduce, no additions
+    - arrangement_only — only structural changes
+    - mood_shift_without_new_fx — shift mood with existing tools
+    - make_it_stranger_but_keep_the_hook — push novelty safely
+    - club_translation_safe — keep changes club/DJ-friendly
+    - performance_safe_creative — only live-safe changes
+
+    constraints: list of constraint names to activate
+    """
+    global _active_constraints
+
+    if not constraints:
+        return {
+            "error": "No constraints provided",
+            "available": CONSTRAINT_MODES,
+        }
+
+    cs = engine.build_constraint_set(constraints)
+    _active_constraints = cs
+
+    invalid = [c for c in constraints if c not in CONSTRAINT_MODES]
+    result = {
+        "active_constraints": cs.constraints,
+        "description": cs.description,
+        "reason": cs.reason,
+    }
+    if invalid:
+        result["invalid_constraints"] = invalid
+        result["available"] = CONSTRAINT_MODES
+
+    return result
+
+
+@mcp.tool()
+def distill_reference_principles(
+    ctx: Context,
+    reference_description: str = "",
+    style_name: str = "",
+) -> dict:
+    """Learn musical principles from a reference — not surface traits.
+
+    Extracts: emotional posture, density motion, arrangement patience,
+    texture treatment, width strategy, and payoff architecture.
+
+    Never outputs a plan that copies surface traits directly.
+    Always translates through the current song's identity.
+
+    reference_description: text description of the reference
+    style_name: optional style/genre name for style-based references
+    """
+    global _cached_distillation
+
+    if not reference_description.strip() and not style_name.strip():
+        return {"error": "Provide reference_description or style_name"}
+
+    # BUG-B17 fix: collect profile fragments from all sources and MERGE.
+    # The old flow stopped at the first non-empty source, so if
+    # get_style_tactics returned a half-filled profile the text-keyword
+    # fallback never ran and the description's rich content was lost.
+    # Now we always run the text fallback too and fill missing fields.
+    reference_profile: dict = {}
+
+    if style_name:
+        try:
+            from ..tools._research_engine import get_style_tactics
+            tactics = get_style_tactics(style_name)
+            if tactics:
+                reference_profile = {
+                    "emotional_stance": tactics.get("emotional_stance", ""),
+                    "density_arc": tactics.get("density_arc", []),
+                    "section_pacing": tactics.get("section_pacing", []),
+                    "width_depth": tactics.get("width_depth", {}),
+                    "spectral_contour": tactics.get("spectral_contour", {}),
+                    "groove_posture": tactics.get("groove_posture", {}),
+                    "harmonic_character": tactics.get("harmonic_character", ""),
+                }
+        except Exception as exc:
+            logger.debug("distill_reference_principles failed: %s", exc)
+
+    # Try the built-in style profile builder. build_style_reference_profile
+    # takes a LIST OF TACTIC DICTS (StyleTactic.to_dict()), not a raw string —
+    # get_style_tactics resolves a NAMED style (artist/genre) to that data.
+    # Passing the bare style_name string made the builder iterate the string's
+    # characters, raise AttributeError on `char.get(...)`, and silently fall
+    # through to the text-keyword path below — so this whole branch was dead.
+    if not reference_profile and style_name:
+        try:
+            from ..reference_engine.profile_builder import build_style_reference_profile
+            from ..tools._research_engine import get_style_tactics
+            tactics = get_style_tactics(style_name)
+            tactic_dicts = [t.to_dict() for t in tactics]
+            if tactic_dicts:
+                profile = build_style_reference_profile(tactic_dicts)
+                reference_profile = profile.to_dict() if profile else {}
+        except Exception as exc:
+            logger.debug("distill_reference_principles style-profile failed: %s", exc)
+
+    # Text-keyword fallback ALWAYS merges in. Style tactics + profile
+    # builder typically leave some fields empty; the description's
+    # keywords fill those gaps. This is the B17 fix that makes the
+    # Dabrye reproducer produce non-empty principles.
+    if reference_description.strip():
+        text_profile = _profile_from_description(reference_description)
+        for key, value in text_profile.items():
+            existing = reference_profile.get(key)
+            is_empty = (
+                existing is None
+                or existing == ""
+                or existing == []
+                or existing == {}
+            )
+            if is_empty and value:
+                reference_profile[key] = value
+
+    distillation = engine.distill_reference_principles(
+        reference_profile=reference_profile,
+        reference_description=reference_description or style_name,
+    )
+    _cached_distillation = distillation
+
+    return distillation.to_dict()
+
+
+@mcp.tool()
+def map_reference_principles_to_song(
+    ctx: Context,
+) -> dict:
+    """Map distilled reference principles to the current song.
+
+    Must call distill_reference_principles first. Translates each
+    principle through the song's identity, loaded tools, and hook.
+
+    Returns actionable mappings — how to apply each principle
+    while preserving the song's own character.
+    """
+    if _cached_distillation is None:
+        return {"error": "No reference distilled yet — call distill_reference_principles first"}
+
+    song_brain = _get_song_brain_dict()
+
+    mappings = engine.map_principles_to_song(song_brain, _cached_distillation)
+
+    return {
+        "reference": _cached_distillation.reference_description,
+        "mappings": mappings,
+        "mapping_count": len(mappings),
+        "note": "Principles are adapted to your song — not copied from the reference",
+    }
+
+
+@mcp.tool()
+def generate_constrained_variants(
+    ctx: Context,
+    request_text: str,
+    constraints: list[str] | None = None,
+    kernel_id: str = "",
+) -> dict:
+    """Generate creative variants under active constraints.
+
+    Combines constraint filtering with the Preview Studio's triptych.
+    Each variant respects the constraint set — e.g., "subtraction_only"
+    means no variant adds new elements.
+
+    request_text: what the user wants
+    constraints: list of constraint names to apply (or uses currently active)
+    kernel_id: optional session kernel reference
+    """
+    if not request_text.strip():
+        return {"error": "request_text cannot be empty"}
+
+    # Apply constraints
+    active = _active_constraints
+    if constraints:
+        active = engine.build_constraint_set(constraints)
+
+    if not active or not active.constraints:
+        return {
+            "error": "No constraints active — call apply_creative_constraint_set first or provide constraints",
+            "available": CONSTRAINT_MODES,
+        }
+
+    # Generate variants via preview studio
+    try:
+        from ..preview_studio import engine as ps_engine
+        song_brain = _get_song_brain_dict()
+        taste_graph = {}
+        try:
+            from ..memory.taste_graph import build_taste_graph
+            from ..memory.taste_memory import TasteMemoryStore
+            from ..memory.anti_memory import AntiMemoryStore
+            taste_store = ctx.lifespan_context.setdefault("taste_memory", TasteMemoryStore())
+            anti_store = ctx.lifespan_context.setdefault("anti_memory", AntiMemoryStore())
+            taste_graph = build_taste_graph(taste_store=taste_store, anti_store=anti_store).to_dict()
+        except Exception as exc:
+            logger.debug("generate_constrained_variants failed: %s", exc)
+        ps = ps_engine.create_preview_set(
+            request_text=f"[Constrained: {', '.join(active.constraints)}] {request_text}",
+            kernel_id=kernel_id,
+            strategy="creative_triptych",
+            song_brain=song_brain,
+            taste_graph=taste_graph,
+        )
+
+        # Validate each variant's compiled_plan against constraints.
+        # BUG-B46: two problems in the old code —
+        #   1) iterating `for step in v.compiled_plan` yields dict KEYS
+        #      (compiled_plan is {'move_id': ..., 'steps': [...]}), so
+        #      the validation ran on strings and silently passed.
+        #   2) when a variant was filtered, we only blanked compiled_plan
+        #      and left status='pending' — callers had no way to tell
+        #      which variants became shells.
+        # Now we iterate .get("steps", []) correctly, flip filtered
+        # variants to status='blocked', and count blocked_count in the
+        # response so callers can detect the "all variants filtered" case.
+        blocked_count = 0
+        # Surface which constraints are advisory-only (recognized but NOT
+        # enforced by the filter). These depend on the constraint SET, not the
+        # plan, so compute once. Without this, a caller requesting a purely
+        # advisory constraint gets blocked_count=0 with no signal that
+        # enforcement was advisory-only.
+        constraint_meta = engine.validate_plan_against_constraints({"steps": []}, active)
+        unenforced_constraints = constraint_meta.get("unenforced_constraints", [])
+        constraint_warnings = constraint_meta.get("warnings", [])
+        for v in ps.variants:
+            v.what_preserved = (
+                f"{v.what_preserved} | Constraints: "
+                f"{', '.join(active.constraints)}"
+            )
+            if v.compiled_plan:
+                steps = v.compiled_plan.get("steps", []) if isinstance(
+                    v.compiled_plan, dict
+                ) else []
+                plan = {
+                    "steps": [
+                        {"action": step.get("tool", ""), **step}
+                        for step in steps
+                    ]
+                }
+                validation = engine.validate_plan_against_constraints(
+                    plan, active,
+                )
+                if not validation["valid"]:
+                    v.compiled_plan = None
+                    v.status = "blocked"
+                    v.what_changed = (
+                        f"[FILTERED] {v.what_changed} — violates "
+                        f"{', '.join(active.constraints)}"
+                    )
+                    blocked_count += 1
+            elif v.status == "blocked":
+                # Already blocked upstream (no compilable move)
+                blocked_count += 1
+
+        note = (
+            f"Variants with violating plans have been filtered "
+            f"({blocked_count}/{len(ps.variants)} blocked)"
+        )
+        if blocked_count == len(ps.variants) and ps.variants:
+            note = (
+                f"All {blocked_count} variants violate constraints "
+                f"{active.constraints!r}. Try loosening constraints or a "
+                f"different request."
+            )
+
+        return {
+            "preview_set": ps.to_dict(),
+            "constraints_applied": active.constraints,
+            "unenforced_constraints": unenforced_constraints,
+            "constraint_warnings": constraint_warnings,
+            "blocked_count": blocked_count,
+            "executable_count": len(ps.variants) - blocked_count,
+            "note": note,
+        }
+    except Exception as e:
+        return {"error": f"Failed to generate constrained variants: {e}"}
+
+
+@mcp.tool()
+def generate_reference_inspired_variants(
+    ctx: Context,
+    request_text: str = "",
+    kernel_id: str = "",
+) -> dict:
+    """Generate creative variants inspired by a distilled reference.
+
+    Requires a prior call to distill_reference_principles.
+    Uses the distilled principles (not surface traits) to shape
+    each variant through the current song's identity.
+
+    request_text: optional extra context for what the user wants
+    kernel_id: optional session kernel reference
+    """
+    if _cached_distillation is None:
+        return {"error": "No reference distilled yet — call distill_reference_principles first"}
+
+    # BUG-B54: the reference-engine chain (distill → map → generate_variants)
+    # used to silently degrade when distill_reference_principles returned
+    # empty principles (BUG-B17). Callers got 3 shell variants branded
+    # "reference-inspired" with no reference material driving them.
+    # Refuse to run when principles are empty — the user should fix the
+    # distillation step first.
+    principles_list = list(_cached_distillation.principles or [])
+    if not principles_list:
+        return {
+            "error": (
+                "distill_reference_principles returned no principles — "
+                "reference-inspired variant generation refuses to run on "
+                "empty input (would produce meaningless 'reference-inspired' "
+                "shell variants). Try a more specific reference description "
+                "or pick a reference covered by the built-in style corpus."
+            ),
+            "reference": _cached_distillation.reference_description,
+            "principles_applied": [],
+        }
+
+    # Build request text from reference principles
+    principles_text = ", ".join(
+        p.principle for p in principles_list[:3]
+    )
+    full_request = (
+        f"Inspired by: {_cached_distillation.reference_description}. "
+        f"Key principles: {principles_text}. "
+        f"{request_text}"
+    ).strip()
+
+    # Generate variants via preview studio
+    try:
+        from ..preview_studio import engine as ps_engine
+        song_brain = _get_song_brain_dict()
+
+        ps = ps_engine.create_preview_set(
+            request_text=full_request,
+            kernel_id=kernel_id,
+            strategy="creative_triptych",
+            song_brain=song_brain,
+        )
+
+        # Annotate variants with reference info
+        for v in ps.variants:
+            v.why_it_matters = (
+                f"Reference-inspired: {_cached_distillation.reference_description}. "
+                f"{v.why_it_matters}"
+            )
+
+        return {
+            "preview_set": ps.to_dict(),
+            "reference": _cached_distillation.reference_description,
+            "principles_applied": [
+                p.to_dict() for p in principles_list[:5]
+            ],
+            "note": "Variants are shaped by reference principles, not surface imitation",
+        }
+    except Exception as e:
+        return {"error": f"Failed to generate reference-inspired variants: {e}"}
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+
+def _get_song_brain_dict() -> dict:
+    try:
+        from ..song_brain.tools import _current_brain
+        if _current_brain is not None:
+            return _current_brain.to_dict()
+    except Exception as _e:
+        if __debug__:
+            import sys
+
+            print(f"LivePilot: SongBrain unavailable in creative_constraints: {_e}", file=sys.stderr)
+    return {}
+
+
+def _profile_from_description(description: str) -> dict:
+    """Build a rough reference profile from a free-text description.
+
+    BUG-B17 fix: the old version only mapped 8 emotion keywords and
+    left every other field empty, so distill_reference_principles
+    returned empty principles for any description that didn't include
+    exactly one of those 8 words. We now scan for a rich keyword set
+    across emotional / spectral / width / groove / harmonic / density
+    dimensions so a description like "cold 90s hip-hop with ghostly
+    vocal chops and dusty drums" actually produces principles.
+    """
+    desc_lower = description.lower()
+
+    # Emotional stance
+    emotional_map = {
+        "dark": "tense", "cold": "tense", "ominous": "tense", "eerie": "tense",
+        "bright": "euphoric", "warm": "warm", "sunny": "euphoric",
+        "sad": "melancholic", "longing": "melancholic", "wistful": "melancholic",
+        "nostalgic": "nostalgic", "dust": "nostalgic", "dusty": "nostalgic",
+        "aggressive": "aggressive", "violent": "aggressive", "intense": "aggressive",
+        "dreamy": "dreamy", "dream": "dreamy", "floaty": "dreamy",
+        "chill": "relaxed", "meditative": "relaxed",
+        "minimal": "restrained", "restrained": "restrained",
+        "ghostly": "haunted", "haunted": "haunted", "ghost": "haunted",
+        "euphoric": "euphoric", "ecstatic": "euphoric",
+    }
+    emotional = ""
+    for keyword, stance in emotional_map.items():
+        if keyword in desc_lower:
+            emotional = stance
+            break
+
+    # Spectral contour — from brightness / color keywords
+    spectral_contour: dict = {}
+    if any(k in desc_lower for k in ("dark", "muddy", "lo-fi", "lofi",
+                                      "dusty", "cold", "underwater",
+                                      "warm", "vintage")):
+        spectral_contour = {
+            "band_balance": {"sub": 0.4, "low": 0.5, "mid": 0.35,
+                             "high_mid": 0.2, "high": 0.1},
+            "centroid_hint": "dark / roll-off near 4kHz",
+        }
+    elif any(k in desc_lower for k in ("bright", "crisp", "shiny", "airy",
+                                        "glittery", "sparkly", "cinematic")):
+        spectral_contour = {
+            "band_balance": {"sub": 0.25, "low": 0.3, "mid": 0.4,
+                             "high_mid": 0.55, "high": 0.6},
+            "centroid_hint": "bright / open high shelf",
+        }
+
+    # Width / depth — mono vs wide vs deep
+    width_depth: dict = {}
+    if any(k in desc_lower for k in ("narrow", "mono", "focused", "tight",
+                                      "centered")):
+        width_depth = {"stereo_width": 0.25, "depth_hint": "close, upfront"}
+    elif any(k in desc_lower for k in ("wide", "spacious", "spatial",
+                                        "ambient", "washy", "drifting")):
+        width_depth = {"stereo_width": 0.85, "depth_hint": "deep, spatial"}
+    elif any(k in desc_lower for k in ("intimate", "dry")):
+        width_depth = {"stereo_width": 0.4, "depth_hint": "dry, intimate"}
+
+    # Groove posture — rhythm keywords
+    groove_posture: dict = {}
+    if any(k in desc_lower for k in ("swing", "shuffle", "dilla", "slouchy")):
+        groove_posture = {"feel": "swung", "stiffness": 0.25}
+    elif any(k in desc_lower for k in ("tight", "clean", "quantized",
+                                        "precise", "crispy")):
+        groove_posture = {"feel": "straight", "stiffness": 0.9}
+    elif any(k in desc_lower for k in ("loose", "sloppy", "drunk",
+                                        "organic", "human")):
+        groove_posture = {"feel": "humanized", "stiffness": 0.3}
+    elif any(k in desc_lower for k in ("driving", "motorik", "pulsing",
+                                        "throbbing", "hypnotic")):
+        groove_posture = {"feel": "driving", "stiffness": 0.8}
+
+    # Density motion — when the user hints at pacing
+    density_arc: list[float] = []
+    if any(k in desc_lower for k in ("slow burn", "patient", "gradually",
+                                      "builds", "buildup")):
+        density_arc = [0.2, 0.3, 0.5, 0.7, 0.9]
+    elif any(k in desc_lower for k in ("explodes", "immediate", "front-loaded",
+                                        "hits from the start")):
+        density_arc = [0.9, 0.85, 0.8, 0.5, 0.3]
+    elif any(k in desc_lower for k in ("dual drop", "return", "second wind")):
+        density_arc = [0.4, 0.8, 0.5, 0.3, 0.9]
+
+    # Harmonic character
+    harmonic = ""
+    if any(k in desc_lower for k in ("minor", "dorian", "phrygian",
+                                      "melancholic", "tense")):
+        harmonic = "minor_modal"
+    elif any(k in desc_lower for k in ("major", "ionian", "lydian",
+                                        "euphoric", "triumphant")):
+        harmonic = "major_modal"
+    elif any(k in desc_lower for k in ("dissonant", "dense", "clusters",
+                                        "microtonal")):
+        harmonic = "dissonant_clustered"
+    elif any(k in desc_lower for k in ("ambient", "drone", "pad",
+                                        "atmospheric", "washy")):
+        harmonic = "atmospheric_filtered"
+
+    # Payoff / section pacing
+    section_pacing: list[dict] = []
+    if any(k in desc_lower for k in ("sparse intro", "sparse", "slow start")):
+        section_pacing.append({"label": "sparse_intro", "bars": 16})
+    if any(k in desc_lower for k in ("buildup", "builds", "growing")):
+        section_pacing.append({"label": "gradual_buildup", "bars": 16})
+    if any(k in desc_lower for k in ("drop", "peak", "payoff",
+                                      "strip back", "pulled out")):
+        section_pacing.append({"label": "strip_back_payoff", "bars": 16})
+
+    return {
+        "emotional_stance": emotional,
+        "density_arc": density_arc,
+        "section_pacing": section_pacing,
+        "width_depth": width_depth,
+        "spectral_contour": spectral_contour,
+        "groove_posture": groove_posture,
+        "harmonic_character": harmonic,
+    }

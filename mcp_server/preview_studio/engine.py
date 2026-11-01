@@ -1,0 +1,501 @@
+"""Preview Studio engine — pure computation, zero I/O.
+
+Creates, compares, and ranks preview variants using the creative triptych
+pattern (safe / strong / unexpected).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from typing import Optional
+
+from ..runtime.degradation import DegradationInfo
+from .models import PreviewSet, PreviewVariant, compute_session_fingerprint
+
+
+# ── In-memory store ───────────────────────────────────────────────
+#
+# _preview_sets is mutated from both threadpooled sync tools (e.g.
+# compare_preview_variants) and event-loop async tools (e.g.
+# commit_preview_variant) — two concurrent create_preview_set calls used to
+# be able to race in store_preview_set's check-then-evict loop: both read
+# the same `oldest_key`, both `del` it, and the second raised KeyError. One
+# module-level lock around the get/store/evict critical sections closes
+# that race.
+
+_preview_sets: dict[str, PreviewSet] = {}
+_preview_sets_lock = threading.Lock()
+_MAX_PREVIEW_SETS = 20
+
+
+def get_preview_set(set_id: str) -> Optional[PreviewSet]:
+    with _preview_sets_lock:
+        return _preview_sets.get(set_id)
+
+
+def store_preview_set(ps: PreviewSet) -> None:
+    with _preview_sets_lock:
+        _preview_sets[ps.set_id] = ps
+        # Evict oldest sets if over limit
+        while len(_preview_sets) > _MAX_PREVIEW_SETS:
+            oldest_key = next(iter(_preview_sets), None)
+            if oldest_key is None:
+                break
+            _preview_sets.pop(oldest_key, None)
+
+
+# Statuses that represent work a user (or caller) has already invested in:
+# a compared ranking or a committed pick. A fresh request that hashes to the
+# same set_id must NOT clobber these — it branches to a distinct id instead.
+_PROTECTED_STATUSES = {"committed", "compared"}
+
+
+def _resolve_set_id(base_id: str) -> str:
+    """Return a set_id that won't clobber a protected (committed/compared) set.
+
+    The base_id is a deterministic hash of request_text + kernel_id, so a
+    re-request reuses it by design. That reuse is fine while the existing set
+    is still 'pending'/'discarded' (nothing of value to lose). But if the
+    existing set under base_id has been compared or committed, overwriting it
+    would silently drop its rankings / committed pick. In that case we branch
+    to a distinct, still-deterministic id (base_id + a monotonic suffix) so the
+    protected set survives and the new set gets its own slot.
+    """
+    existing = get_preview_set(base_id)
+    if existing is None or existing.status not in _PROTECTED_STATUSES:
+        return base_id
+    suffix = 2
+    while True:
+        candidate = f"{base_id}_b{suffix}"
+        occupant = get_preview_set(candidate)
+        if occupant is None or occupant.status not in _PROTECTED_STATUSES:
+            return candidate
+        suffix += 1
+
+
+# ── Creation ──────────────────────────────────────────────────────
+
+
+def create_preview_set(
+    request_text: str,
+    kernel_id: str,
+    strategy: str = "creative_triptych",
+    available_moves: Optional[list[dict]] = None,
+    song_brain: Optional[dict] = None,
+    taste_graph: Optional[dict] = None,
+    kernel: Optional[dict] = None,
+) -> PreviewSet:
+    """Create a preview set with variant slots.
+
+    For creative_triptych, generates 3 variants: safe, strong, unexpected.
+    Each variant gets a move_id from available_moves ranked by novelty.
+
+    kernel: the live session kernel (track topology + device chains). Compilers
+        resolve targets from it — without it, variants degrade into no-ops or
+        generic reads. Callers that have a `ctx` should fetch a real kernel
+        via runtime.tools.get_session_kernel(ctx). When omitted the engine
+        synthesizes an empty-but-valid kernel (see ``_build_triptych``) and
+        flags the resulting PreviewSet with ``degradation.is_degraded=True``
+        so callers can tell a synthesized compile from a real one.
+
+        When kernel carries a real ``session_info`` (track topology), the
+        resulting PreviewSet is stamped with a session_fingerprint so a
+        later commit can detect that the session's track/device layout
+        changed since this plan's indices were compiled — no extra Ableton
+        round-trip is made here, we just hash data the caller already
+        fetched.
+    """
+    set_id = _resolve_set_id(_compute_set_id(request_text, kernel_id))
+    now = int(time.time() * 1000)
+
+    moves = available_moves or []
+    song_brain = song_brain or {}
+    taste_graph = taste_graph or {}
+
+    # Degradation bookkeeping — if the caller didn't supply a kernel the
+    # compiler receives a synthesized one (see engine.py line 128 area)
+    # and every variant is scored against that synthetic topology.
+    if kernel:
+        degradation = DegradationInfo()
+    else:
+        degradation = DegradationInfo(
+            is_degraded=True,
+            reasons=["empty_kernel_fallback"],
+            substituted_fields=["compile_kernel"],
+        )
+
+    if strategy == "creative_triptych":
+        variants = _build_triptych(
+            request_text, moves, song_brain, taste_graph, set_id, now, kernel,
+        )
+    elif strategy == "binary":
+        variants = _build_binary(request_text, moves, song_brain, set_id, now)
+    else:
+        variants = _build_triptych(
+            request_text, moves, song_brain, taste_graph, set_id, now, kernel,
+        )
+
+    # Stamp session identity from data the caller already fetched (kernel's
+    # session_info) — never a new round-trip. Absent/synthesized kernels
+    # yield "", which downstream commit checks treat as "no signal".
+    session_fingerprint = compute_session_fingerprint(
+        (kernel or {}).get("session_info")
+    )
+
+    ps = PreviewSet(
+        set_id=set_id,
+        request_text=request_text,
+        strategy=strategy,
+        source_kernel_id=kernel_id,
+        variants=variants,
+        created_at_ms=now,
+        degradation=degradation,
+        session_fingerprint=session_fingerprint,
+    )
+    store_preview_set(ps)
+    return ps
+
+
+def _build_triptych(
+    request_text: str,
+    moves: list[dict],
+    song_brain: dict,
+    taste_graph: dict,
+    set_id: str,
+    now: int,
+    kernel: Optional[dict] = None,
+) -> list[PreviewVariant]:
+    """Build safe / strong / unexpected variants."""
+    identity = song_brain.get("identity_core", "")
+    sacred = [e.get("description", "") for e in song_brain.get("sacred_elements", [])]
+    sacred_text = ", ".join(sacred[:3]) if sacred else "core elements"
+
+    profiles = [
+        {
+            "label": "safe",
+            "novelty": 0.2,
+            "intent": f"Close to current identity, minimal risk. {request_text}",
+            "identity_effect": "preserves",
+            "what_preserved": f"Preserves {sacred_text}",
+            "why_it_matters": "Low risk — good when identity is fragile",
+        },
+        {
+            "label": "strong",
+            "novelty": 0.5,
+            "intent": f"Musically assertive approach. {request_text}",
+            "identity_effect": "evolves",
+            "what_preserved": f"Maintains {sacred_text} while pushing forward",
+            "why_it_matters": "Best balance of impact and safety",
+        },
+        {
+            "label": "unexpected",
+            "novelty": 0.8,
+            "intent": f"Surprising but taste-filtered. {request_text}",
+            "identity_effect": "contrasts",
+            "what_preserved": f"Respects {sacred_text} but reframes context",
+            "why_it_matters": "High novelty — may unlock a new direction",
+        },
+    ]
+
+    # Normalize kernel for the compiler. If the caller supplied a real kernel
+    # use it; otherwise fall back to an empty-but-valid shape so compilers
+    # degrade to no-op steps and emit warnings instead of crashing.
+    compile_kernel = kernel if kernel else {
+        "session_info": {"tempo": 120, "tracks": []},
+        "mode": "improve",
+    }
+
+    variants = []
+    for i, profile in enumerate(profiles):
+        # Pick a move if available
+        move_id = ""
+        compiled_plan = None
+        move = moves[i] if moves and i < len(moves) else None
+        if move is not None:
+            move_id = move.get("move_id", "")
+            # Compile through the semantic compiler — single source of truth
+            from ..wonder_mode.engine import _compile_variant_plan
+            compiled_plan = _compile_variant_plan(move, compile_kernel)
+            # No fallback to plan_template — uncompilable moves stay analytical
+
+        # BUG-B44 / B45: populate user-facing description fields and flag
+        # variants that lack a compiled_plan as not-executable (so callers
+        # don't commit shells).
+        description = _describe_variant(move, compiled_plan, profile)
+        executable = compiled_plan is not None and bool(move_id)
+
+        variant = PreviewVariant(
+            variant_id=f"{set_id}_{profile['label']}",
+            label=profile["label"],
+            intent=profile["intent"],
+            novelty_level=profile["novelty"],
+            identity_effect=profile["identity_effect"],
+            what_preserved=profile["what_preserved"],
+            why_it_matters=profile["why_it_matters"],
+            move_id=move_id,
+            compiled_plan=compiled_plan,
+            taste_fit=_estimate_taste_fit(profile["novelty"], taste_graph),
+            created_at_ms=now,
+            what_changed=description["what_changed"],
+            summary=description["summary"],
+        )
+        # Non-executable variants get status='blocked' so callers know to
+        # skip preview/commit. Stored as status since executable/blocked_reason
+        # aren't modeled yet.
+        if not executable:
+            variant.status = "blocked"
+        variants.append(variant)
+
+    return variants
+
+
+def _describe_variant(
+    move: Optional[dict],
+    compiled_plan: Optional[dict],
+    profile: dict,
+) -> dict:
+    """Build user-facing description fields for a variant (BUG-B45).
+
+    Priority order:
+      1. Move's `intent` or `description` — the authored one-liner
+      2. Compiled plan's step descriptions joined with " → "
+      3. The profile label + novelty level as a last-resort fallback
+
+    Returns {"what_changed": str, "summary": str}.
+    """
+    what_changed = ""
+    summary = ""
+    if move:
+        # Move-level narrative beats plan-level — captures intent, not execution
+        move_intent = str(move.get("intent") or move.get("description") or "")
+        if move_intent:
+            what_changed = move_intent
+            summary = move_intent[:120]
+
+    if not what_changed and compiled_plan:
+        steps = compiled_plan.get("steps") or []
+        step_descriptions = [
+            str(s.get("description") or s.get("summary") or s.get("intent") or "")
+            for s in steps
+        ]
+        step_descriptions = [d for d in step_descriptions if d]
+        if step_descriptions:
+            what_changed = " → ".join(step_descriptions[:4])
+            summary = (
+                step_descriptions[0][:120]
+                if step_descriptions else ""
+            )
+
+    if not what_changed:
+        # Final fallback — describe the profile so the UI has something
+        what_changed = (
+            f"{profile['label'].title()} variant at novelty "
+            f"{profile['novelty']:.1f} (no executable plan available)"
+        )
+        summary = what_changed
+
+    return {"what_changed": what_changed, "summary": summary}
+
+
+def _build_binary(
+    request_text: str,
+    moves: list[dict],
+    song_brain: dict,
+    set_id: str,
+    now: int,
+) -> list[PreviewVariant]:
+    """Build simple A/B comparison."""
+    return [
+        PreviewVariant(
+            variant_id=f"{set_id}_a",
+            label="option_a",
+            intent=f"Primary approach: {request_text}",
+            novelty_level=0.3,
+            identity_effect="preserves",
+            move_id=moves[0].get("move_id", "") if moves else "",
+            created_at_ms=now,
+        ),
+        PreviewVariant(
+            variant_id=f"{set_id}_b",
+            label="option_b",
+            intent=f"Alternative approach: {request_text}",
+            novelty_level=0.6,
+            identity_effect="evolves",
+            move_id=moves[1].get("move_id", "") if len(moves) > 1 else "",
+            created_at_ms=now,
+        ),
+    ]
+
+
+# ── Comparison ────────────────────────────────────────────────────
+
+
+_NON_EXECUTABLE_STATUSES = {"blocked", "failed"}
+
+
+def _is_executable(variant: PreviewVariant) -> bool:
+    """A variant is executable when it has a compiled plan AND its status
+    hasn't been flagged as blocked/failed upstream.
+
+    The compiled plan may be a non-empty list of steps OR a dict with a
+    non-empty ``steps`` key — both shapes exist in the wild.
+    """
+    if variant.status in _NON_EXECUTABLE_STATUSES:
+        return False
+    plan = variant.compiled_plan
+    if plan is None:
+        return False
+    if isinstance(plan, list):
+        return len(plan) > 0
+    if isinstance(plan, dict):
+        return len(plan.get("steps") or []) > 0
+    # Any other truthy shape is treated as executable; falsy as not.
+    return bool(plan)
+
+
+def compare_variants(
+    preview_set: PreviewSet,
+    criteria: Optional[dict] = None,
+) -> dict:
+    """Compare variants within a preview set and rank them.
+
+    Truth-gap fix (PR-A): variants that are blocked/failed OR lack a
+    compiled_plan are partitioned out of the scored ranking. They appear
+    in ``analytical_candidates`` (just their variant_ids) and ALSO stay
+    in ``rankings`` at the bottom for introspection, but they can never
+    populate ``recommended``. When no executable variant exists,
+    ``recommended`` is ``None`` so callers can surface a clear message
+    instead of silently committing a no-op.
+    """
+    criteria = criteria or {}
+    weight_taste = criteria.get("taste_weight", 0.3)
+    weight_novelty = criteria.get("novelty_weight", 0.2)
+    weight_identity = criteria.get("identity_weight", 0.5)
+
+    executable: list[PreviewVariant] = []
+    analytical: list[PreviewVariant] = []
+    for v in preview_set.variants:
+        (executable if _is_executable(v) else analytical).append(v)
+
+    def _score(v: PreviewVariant) -> float:
+        taste_score = v.taste_fit
+        novelty_score = 1.0 - abs(v.novelty_level - 0.5) * 2  # bell curve around 0.5
+        identity_score = _identity_effect_score(v.identity_effect)
+        composite = (
+            taste_score * weight_taste
+            + novelty_score * weight_novelty
+            + identity_score * weight_identity
+        )
+        return round(composite, 3)
+
+    def _row(v: PreviewVariant) -> dict:
+        return {
+            "variant_id": v.variant_id,
+            "label": v.label,
+            "score": v.score,
+            "taste_fit": v.taste_fit,
+            "novelty_level": v.novelty_level,
+            "identity_effect": v.identity_effect,
+            "summary": v.intent,
+            "what_preserved": v.what_preserved,
+            "why_it_matters": v.why_it_matters,
+            "status": v.status,
+        }
+
+    executable_rows: list[dict] = []
+    for v in executable:
+        v.score = _score(v)
+        executable_rows.append(_row(v))
+    executable_rows.sort(key=lambda r: r["score"], reverse=True)
+
+    # Analytical variants still get a score computed so introspection
+    # shows the same shape, but they're appended AFTER the sorted
+    # executables so they can never land at position 0.
+    analytical_rows: list[dict] = []
+    for v in analytical:
+        v.score = _score(v)
+        analytical_rows.append(_row(v))
+
+    rankings = executable_rows + analytical_rows
+
+    recommended: Optional[str]
+    if executable_rows:
+        recommended = executable_rows[0]["variant_id"]
+    else:
+        recommended = None
+
+    comparison = {
+        "rankings": rankings,
+        "recommended": recommended,
+        "analytical_candidates": [v.variant_id for v in analytical],
+        "criteria_used": {
+            "taste_weight": weight_taste,
+            "novelty_weight": weight_novelty,
+            "identity_weight": weight_identity,
+        },
+    }
+
+    preview_set.comparison = comparison
+    preview_set.status = "compared"
+    return comparison
+
+
+def commit_variant(preview_set: PreviewSet, variant_id: str) -> Optional[PreviewVariant]:
+    """Mark a variant as committed and discard others."""
+    chosen = None
+    for v in preview_set.variants:
+        if v.variant_id == variant_id:
+            v.status = "committed"
+            chosen = v
+        else:
+            v.status = "discarded"
+
+    if chosen:
+        preview_set.committed_variant_id = variant_id
+        preview_set.status = "committed"
+
+    return chosen
+
+
+def discard_set(set_id: str) -> bool:
+    """Discard an entire preview set."""
+    with _preview_sets_lock:
+        ps = _preview_sets.pop(set_id, None)
+    if ps:
+        ps.status = "discarded"
+        for v in ps.variants:
+            v.status = "discarded"
+        return True
+    return False
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+
+def _compute_set_id(request_text: str, kernel_id: str) -> str:
+    seed = json.dumps({"request": request_text, "kernel": kernel_id}, sort_keys=True)
+    return "ps_" + hashlib.sha256(seed.encode()).hexdigest()[:10]
+
+
+def _estimate_taste_fit(novelty: float, taste_graph: dict) -> float:
+    """Estimate how well a novelty level fits user taste."""
+    # Routes through the canonical accessor so dimension_weights.transition_boldness
+    # is honored. Previously read the top-level key directly and always got 0.5.
+    from ..memory.taste_accessors import get_dimension_pref
+    boldness = get_dimension_pref(taste_graph, "transition_boldness", default=0.5)
+    # Users who like boldness prefer higher novelty
+    fit = 1.0 - abs(novelty - boldness) * 0.5
+    return round(max(0.0, min(1.0, fit)), 3)
+
+
+def _identity_effect_score(effect: str) -> float:
+    """Score identity effects — preserves is safest."""
+    return {
+        "preserves": 0.9,
+        "evolves": 0.7,
+        "contrasts": 0.4,
+        "resets": 0.2,
+    }.get(effect, 0.5)

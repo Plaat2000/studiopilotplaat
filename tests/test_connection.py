@@ -1,0 +1,417 @@
+"""Mock socket tests for AbletonConnection."""
+
+import json
+import socket
+import threading
+import sys
+import os
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from mcp_server.connection import AbletonConnection, AbletonConnectionError
+import mcp_server.connection as connection_mod
+
+
+class MockAbletonServer:
+    """A minimal TCP server that mimics the LivePilot Remote Script protocol.
+
+    Protocol: JSON-over-newline on TCP.
+    Request:  {"id": "abc", "type": "set_tempo", "params": {"tempo": 140}}
+    Success:  {"id": "abc", "ok": true, "result": {"tempo": 140.0}}
+    Error:    {"id": "abc", "ok": false, "error": {"code": "INVALID_PARAM", "message": "..."}}
+    Ping:     {"id": "abc", "type": "ping"} -> {"id": "abc", "ok": true, "result": {"pong": true}}
+    """
+
+    def __init__(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(5)
+        self.port = self._sock.getsockname()[1]
+        self._running = True
+        self._custom_responses = {}
+        self._error_responses = {}
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def set_response(self, command_type, result):
+        """Register a custom result for a given command_type."""
+        self._custom_responses[command_type] = result
+
+    def set_error(self, command_type, code, message):
+        """Register an error response for a given command_type."""
+        self._error_responses[command_type] = {"code": code, "message": message}
+
+    def _accept_loop(self):
+        # Perf batch (v1.27.3): a 1.0s poll meant teardown (closing the
+        # socket doesn't interrupt an in-flight accept() on macOS) waited
+        # up to a full tick per test — ~7s across the suite. A shorter
+        # poll keeps shutdown latency low without busy-looping.
+        self._sock.settimeout(0.05)
+        while self._running:
+            try:
+                client, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+
+    def _handle_client(self, client):
+        buf = b""
+        client.settimeout(5.0)
+        try:
+            while self._running:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        request = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    response = self._build_response(request)
+                    client.sendall((json.dumps(response) + "\n").encode("utf-8"))
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            client.close()
+
+    def _build_response(self, request):
+        req_type = request.get("type", "")
+        request_id = request.get("id", "unknown")
+
+        if req_type == "ping":
+            return {
+                "id": request_id,
+                "ok": True,
+                "result": {"pong": True},
+            }
+
+        if req_type in self._error_responses:
+            return {
+                "id": request_id,
+                "ok": False,
+                "error": self._error_responses[req_type],
+            }
+
+        if req_type in self._custom_responses:
+            return {
+                "id": request_id,
+                "ok": True,
+                "result": self._custom_responses[req_type],
+            }
+
+        return {
+            "id": request_id,
+            "ok": True,
+            "result": {},
+        }
+
+    def stop(self):
+        self._running = False
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=3)
+
+
+@pytest.fixture
+def mock_server():
+    server = MockAbletonServer()
+    yield server
+    server.stop()
+
+
+def test_connect_and_ping(mock_server):
+    conn = AbletonConnection(host="127.0.0.1", port=mock_server.port)
+    conn.connect()
+    try:
+        assert conn.ping() is True
+    finally:
+        conn.disconnect()
+
+
+def test_send_command(mock_server):
+    mock_server.set_response("get_session_info", {
+        "tempo": 120.0,
+        "is_playing": False,
+        "track_count": 4,
+    })
+    conn = AbletonConnection(host="127.0.0.1", port=mock_server.port)
+    conn.connect()
+    try:
+        result = conn.send_command("get_session_info")
+        assert result["tempo"] == 120.0
+        assert result["is_playing"] is False
+        assert result["track_count"] == 4
+    finally:
+        conn.disconnect()
+
+
+def test_error_response(mock_server):
+    mock_server.set_error("bad_command", "INVALID_PARAM", "Tempo must be between 20 and 999")
+    conn = AbletonConnection(host="127.0.0.1", port=mock_server.port)
+    conn.connect()
+    try:
+        with pytest.raises(Exception, match="INVALID_PARAM.*Tempo must be between 20 and 999"):
+            conn.send_command("bad_command")
+    finally:
+        conn.disconnect()
+
+
+def test_connection_refused():
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    with pytest.raises(AbletonConnectionError):
+        conn.connect()
+
+
+def test_disconnect_clears_recv_buf():
+    """Verify disconnect() discards partial receive buffer so retries
+    don't corrupt the next response with leftover bytes."""
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    # Simulate partial data left in buffer
+    conn._recv_buf = b'{"partial": tru'
+    conn.disconnect()
+    assert conn._recv_buf == b"", "disconnect must clear _recv_buf"
+
+
+def test_retry_after_timeout_gets_clean_response(mock_server):
+    """After a timeout + reconnect, the next command should not see
+    leftover bytes from the failed attempt."""
+    conn = AbletonConnection(host="127.0.0.1", port=mock_server.port)
+    conn.connect()
+    try:
+        # Inject garbage into the recv buffer to simulate partial read
+        conn._recv_buf = b'{"broken": '
+        # disconnect should clear it
+        conn.disconnect()
+        assert conn._recv_buf == b""
+        # Reconnect and verify clean response
+        conn.connect()
+        result = conn.send_command("ping")
+        assert result.get("pong") is True
+    finally:
+        conn.disconnect()
+
+
+def test_timeout_mentions_other_connected_client(monkeypatch, mock_server):
+    conn = AbletonConnection(host="127.0.0.1", port=mock_server.port)
+    conn.connect()
+
+    class _TimeoutSocket:
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            raise socket.timeout()
+
+        def close(self):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+    monkeypatch.setattr(connection_mod, "_identify_other_tcp_client", lambda host, port: "PID 999 (node)")
+    conn._socket = _TimeoutSocket()
+
+    with pytest.raises(AbletonConnectionError, match="Another LivePilot client appears to be connected"):
+        conn._send_raw({"type": "ping"})
+
+
+def test_freeze_track_uses_extended_receive_timeout():
+    class _Socket:
+        def __init__(self):
+            self.timeouts = []
+
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            return b'{"ok": true, "result": {"frozen": true}}\n'
+
+        def close(self):
+            return None
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    conn._socket = _Socket()
+
+    result = conn.send_command("freeze_track", {"track_index": 0})
+
+    assert result["frozen"] is True
+    assert conn._socket.timeouts == [40, 20]
+
+
+def test_connect_closes_previously_held_socket():
+    """P2-2: a second connect() without an intervening disconnect() must close
+    the previously held socket before overwriting self._socket, otherwise the
+    old fd/socket leaks."""
+
+    class _FakeSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    first = _FakeSocket()
+    conn._socket = first
+
+    # Real connect to a dead port will raise, but the leak-prevention close
+    # happens at the very top of connect() before any new socket is made.
+    with pytest.raises(AbletonConnectionError):
+        conn.connect()
+
+    assert first.closed is True, "connect() must close the previously held socket"
+
+
+def test_timeout_message_reports_actual_recv_timeout():
+    """P3-2: the timeout message must interpolate the real per-command
+    recv_timeout (e.g. 40s for freeze_track), not the module constant."""
+
+    class _TimeoutSocket:
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            raise socket.timeout()
+
+        def close(self):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    conn._socket = _TimeoutSocket()
+
+    with pytest.raises(AbletonConnectionError, match=r"\(40s\)"):
+        conn._send_raw({"type": "freeze_track"}, recv_timeout=40)
+
+
+def test_timeout_does_not_preserve_partial_buffer():
+    """P3-3: on timeout the connection is torn down and _recv_buf is wiped;
+    the dead 'self._recv_buf = buf' assignment must not survive disconnect()."""
+
+    class _PartialThenTimeoutSocket:
+        def __init__(self):
+            self._sent_partial = False
+
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            if not self._sent_partial:
+                self._sent_partial = True
+                return b'{"partial": tru'  # no newline -> loop continues
+            raise socket.timeout()
+
+        def close(self):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    conn._socket = _PartialThenTimeoutSocket()
+
+    with pytest.raises(AbletonConnectionError):
+        conn._send_raw({"type": "ping"})
+
+    assert conn._recv_buf == b"", "timeout must not leave partial bytes in _recv_buf"
+    assert conn._socket is None, "timeout must disconnect"
+
+
+def test_response_id_mismatch_is_rejected():
+    """P3-4: a response whose 'id' does not match the awaited envelope id is a
+    stale/orphan frame and must not be returned as this command's result."""
+
+    class _MismatchSocket:
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            # Echo a foreign id rather than the one the client just stamped.
+            return b'{"id": "DEADBEEF", "ok": true, "result": {"pong": true}}\n'
+
+        def close(self):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    conn._socket = _MismatchSocket()
+
+    with pytest.raises(AbletonConnectionError, match="id mismatch"):
+        conn._send_raw({"type": "ping"})
+    assert conn._socket is None, "id mismatch must disconnect"
+
+
+def test_response_id_match_is_accepted():
+    """P3-4 guard must not false-positive: a correctly echoed id passes."""
+    captured = {}
+
+    class _EchoSocket:
+        def sendall(self, payload):
+            captured["id"] = json.loads(payload.decode("utf-8").strip())["id"]
+
+        def recv(self, _size):
+            body = json.dumps(
+                {"id": captured["id"], "ok": True, "result": {"pong": True}}
+            )
+            return (body + "\n").encode("utf-8")
+
+        def close(self):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    conn._socket = _EchoSocket()
+
+    result = conn._send_raw({"type": "ping"})
+    assert result["result"]["pong"] is True
+
+
+def test_fresh_connect_retries_single_client_guard(monkeypatch):
+    conn = AbletonConnection(host="127.0.0.1", port=19999)
+    attempts = {"count": 0}
+
+    def fake_connect():
+        conn._socket = object()
+
+    def fake_disconnect():
+        conn._socket = None
+
+    def fake_send_raw(command, recv_timeout=20):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "STATE_ERROR",
+                    "message": "Another client is already connected. LivePilot accepts one client at a time. Disconnect the current client first.",
+                },
+            }
+        return {"ok": True, "result": {"pong": True}}
+
+    monkeypatch.setattr(conn, "connect", fake_connect)
+    monkeypatch.setattr(conn, "disconnect", fake_disconnect)
+    monkeypatch.setattr(conn, "_send_raw", fake_send_raw)
+    monkeypatch.setattr(connection_mod.time, "sleep", lambda _seconds: None)
+
+    result = conn.send_command("ping")
+
+    assert result == {"pong": True}
+    assert attempts["count"] == 2

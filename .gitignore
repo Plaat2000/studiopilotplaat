@@ -1,0 +1,129 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+package-lock.json
+
+# Build
+dist/
+build/
+
+# Release artifacts (shipped via GitHub Releases / npm, not git)
+livepilot.mcpb
+livepilot-*.tgz
+
+# .amxd freeze-workflow scratch files (thin/fat variants kept locally only)
+m4l_device/*.pre-presentation-backup
+m4l_device/*.amxd.backup
+m4l_device/*.pre-*-backup
+
+# Local-only toggles
+.mcp.json.disabled
+.codex/
+
+# Environment
+.env
+.env.*
+
+# Two-tier CONTEXT pattern: public CONTEXT.md ships, CONTEXT-local.md
+# carries session-specific paths and personal notes.
+CONTEXT-local.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# MCP Registry tokens
+.mcpregistry_*
+
+# Playwright artifacts
+.playwright-mcp/
+
+# Ableton project files
+demo Project/
+*.als
+
+# User's personal library data — NEVER upload to GitHub
+# (Native Ableton device atlas files ARE committed — they help all users)
+livepilot/skills/livepilot-core/references/device-atlas/synths-m4l.md
+livepilot/skills/livepilot-core/references/device-atlas/plugins-synths.md
+livepilot/skills/livepilot-core/references/device-atlas/utility-and-workflow.md
+livepilot/skills/livepilot-core/references/device-atlas/samples-and-irs.md
+livepilot/skills/livepilot-core/references/device-atlas/presets-by-vibe.md
+# M4L vendor catalog + depth-pass findings live in livepilot-dreamrec-extensions/
+livepilot/skills/livepilot-devices/references/m4l-vendor/
+livepilot/skills/livepilot-devices/references/m4l-depth-pass-findings.md
+livepilot/skills/livepilot-devices/references/m4l-depth-pass-resume.md
+livepilot/skills/livepilot-devices/references/m4l-library-deep.md
+livepilot/skills/livepilot-devices/references/m4l-master-reference.md
+livepilot/skills/livepilot-devices/references/m4l-technique-map.md
+private/
+.mcp.json
+
+# Internal dev docs (keep locally, not on GitHub)
+docs/plans/
+docs/research/
+docs/specs/
+docs/superpowers/
+docs/v2-master-spec/
+docs/strategy/
+docs/archive/
+docs/*.md
+!docs/EXTENSION_API.md
+!docs/USER_CORPUS_GUIDE.md
+!docs/PLUGIN_KNOWLEDGE_ENGINE.md
+!docs/M4L_BRIDGE.md
+!docs/MAX_FREEZE_WORKFLOW.md
+# Pending-work tracker referenced from mcp_server/m4l_bridge.py + server.py —
+# must ride the repo so the batched .amxd re-freeze isn't lost with a worktree.
+!docs/PENDING_AMXD_REFREEZE.md
+.git-backup-full/
+
+# Worktrees
+.worktrees/
+docs/LivePilot-1.7-Perception/
+m4l_device/externals/
+
+# Splice API capture — reverse-engineered endpoints, local research only
+docs/research/splice-api-capture/
+
+# Internal test-session journals — capture artist names + producer themes
+# that violate §12 (Public Artifacts Stay Generic). Keep local only.
+BUGS_TESTING_*.md
+BUGS_LIVE_*.md
+
+# User corpus output (defense in depth — output normally lives at ~/.livepilot/
+# atlas-overlays/user/ which is outside the repo, but if a future invocation
+# writes into a path inside the repo by accident, these patterns guarantee it
+# never gets committed)
+.livepilot/
+atlas-overlays/user/
+**/_inventory.json
+**/_canonical.json
+**/_clusters.json
+**/identity.yaml
+corpus_output/
+user_corpus_output/
+
+# Beta-SDK spike vendoring. The Ableton Extensions SDK tarballs are
+# Centercode-gated beta distribution and must never enter this public repo.
+# The spike/12.4.5 branch ignores these; main did not, so `git add spikes/`
+# here would have published them. (2026-07-31)
+spikes/**/vendor/*.tgz
+spikes/**/dist/
+spikes/**/__pycache__/

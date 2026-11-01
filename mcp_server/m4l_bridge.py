@@ -1,0 +1,1423 @@
+"""
+LivePilot M4L Bridge — UDP communication with the LivePilot Analyzer device.
+
+Receives spectral data (spectrum bands, RMS, peak, pitch) via UDP/OSC from
+the M4L device on the master track. Sends commands back for deep LOM access.
+
+Architecture:
+    M4L → UDP:9880 → SpectralReceiver → SpectralCache → MCP tools
+    MCP tools → M4LBridge → UDP:9881 → M4L device
+
+OSC address convention:
+    - OUTGOING (this side → M4L): address string is sent WITHOUT a leading
+      slash because Max's `udpreceive` treats a literal '/' as part of the
+      selector. The JS side (livepilot_bridge.js) routes on bare selectors
+      like "cmd" / "ping".
+    - INCOMING (M4L → this side): the M4L side uses Max's `udpsend`, whose
+      outlet messages include the leading slash (e.g. "/response"). The
+      `_parse_osc` helper normalizes with `rest = "/" + rest.lstrip("/\\")`
+      so both forms are tolerated — keep that normalization; both sides
+      bend toward leniency but the outgoing convention here is slash-less.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import base64
+import json
+import os
+import random
+import re
+import secrets
+import socket
+import struct
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+
+# ─── Bridge command authentication (shared-secret token) ─────────────────────
+#
+# Max's `udpreceive 9881` binds on ALL interfaces (it takes no bind-interface
+# argument), so a LAN-adjacent host can blindly fire any of the bridge
+# commands. Defense: this server generates a random token per startup,
+# publishes it to a file only local processes can read, and prepends
+# ``__livepilot_token:<hex>`` as the FIRST OSC argument of every command.
+# The frozen JS (livepilot_bridge.js `_auth_check`) validates and drops
+# non-matching commands. The token itself only ever travels over loopback
+# UDP and the local filesystem — it is never exposed to the LAN.
+#
+# Compatibility (the reason for the version gate): a pre-token frozen .amxd
+# would consume the token as its first positional argument and misparse the
+# command, so the token is only attached once the device's ping response
+# reports a build that strips it. See docs/PENDING_AMXD_REFREEZE.md.
+
+BRIDGE_TOKEN_ARG_PREFIX = "__livepilot_token:"
+
+# First frozen livepilot_bridge.js build that validates the token. If the
+# re-freeze ships in a later release than 1.28.0, bump this to the actual
+# first frozen version (tracked in docs/PENDING_AMXD_REFREEZE.md).
+TOKEN_AUTH_MIN_BRIDGE_VERSION = (1, 28, 0)
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+def default_bridge_token_path() -> Path:
+    """~/Documents/LivePilot/bridge_token.
+
+    Must mirror ``_auth_token_path()`` in m4l_device/livepilot_bridge.js,
+    which derives the same home directory from ``max.appsupportpath`` (the
+    ``_get_captures_dir()`` pattern).
+    """
+    return Path.home() / "Documents" / "LivePilot" / "bridge_token"
+
+
+def parse_bridge_version(version: Any) -> Optional[tuple[int, int, int]]:
+    """Parse a ping ``version`` string into a comparable (major, minor, patch).
+
+    Tolerates suffixes ("1.28.0-beta") and a missing patch ("1.28").
+    Returns None for anything that doesn't start with digits — an
+    unparseable version must never enable token auth.
+    """
+    if not isinstance(version, str):
+        return None
+    match = _VERSION_RE.match(version.strip())
+    if not match:
+        return None
+    major, minor, patch = match.group(1), match.group(2), match.group(3)
+    return (int(major), int(minor), int(patch or 0))
+
+
+def _token_auth_disabled_by_env() -> bool:
+    """Manual kill switch: LIVEPILOT_BRIDGE_TOKEN_DISABLE=1 keeps the wire
+    format exactly as pre-1.28 (no token arg, no token file)."""
+    return os.environ.get("LIVEPILOT_BRIDGE_TOKEN_DISABLE", "").strip() not in ("", "0")
+
+
+def _encode_string_arg(value: str) -> str:
+    """Encode a Python string arg into an ASCII-safe OSC payload.
+
+    The Max JS side decodes values with the ``b64:`` prefix back to UTF-8.
+    Keeping the wire payload ASCII-only avoids OSC/client issues with
+    non-ASCII file paths and device names.
+    """
+    encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    return "b64:" + encoded.rstrip("=")
+
+
+def _normalize_macos_path(path: str) -> str:
+    """Convert Max-style HFS-ish paths into POSIX paths when possible."""
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return path
+
+    colon = path.find(":")
+    slash = path.find("/")
+    if colon <= 0 or (slash != -1 and colon > slash):
+        return path
+
+    rest = path[colon + 1:]
+    if ":" in rest:
+        rest = rest.replace(":", "/")
+    if not rest.startswith("/"):
+        rest = "/" + rest.lstrip("/\\")
+    return rest
+
+
+def _normalize_bridge_payload(value: Any) -> Any:
+    """Normalize filesystem paths inside bridge payloads."""
+    if isinstance(value, dict):
+        normalized = {}
+        for key, item in value.items():
+            if key == "file_path" and isinstance(item, str):
+                normalized[key] = _normalize_macos_path(item)
+            else:
+                normalized[key] = _normalize_bridge_payload(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_bridge_payload(item) for item in value]
+    return value
+
+
+class SpectralCache:
+    """Thread-safe cache for incoming spectral data from M4L.
+
+    Data goes stale after max_age seconds (default 5).
+    When the M4L device is removed, data stops arriving and
+    get() returns None — graceful degradation.
+    """
+
+    def __init__(self, max_age: float = 5.0):
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+        self._max_age = max_age
+        self._connected = False
+        self._last_seen = 0.0
+
+    def update(self, key: str, value: Any) -> None:
+        with self._lock:
+            prev = self._data.get(key)
+            self._data[key] = {
+                "value": value,
+                "time": time.monotonic(),
+                # Per-key frame counter — lets windowed readers tell
+                # "same value, new frame" apart from "same frame re-read"
+                # when the OSC stream stalls for less than max_age.
+                "generation": (prev.get("generation", 0) + 1) if prev else 1,
+            }
+            self._last_seen = time.monotonic()
+            self._connected = True
+
+    def get(self, key: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            age = time.monotonic() - entry["time"]
+            if age > self._max_age:
+                return None
+            return {
+                "value": entry["value"],
+                "age_ms": int(age * 1000),
+                "generation": entry.get("generation"),
+            }
+
+    @property
+    def is_connected(self) -> bool:
+        with self._lock:
+            if not self._connected:
+                return False
+            return (time.monotonic() - self._last_seen) < self._max_age
+
+    def get_all(self) -> dict:
+        """Get all cached data that hasn't gone stale."""
+        with self._lock:
+            now = time.monotonic()
+            result = {}
+            for key, entry in self._data.items():
+                age = now - entry["time"]
+                if age <= self._max_age:
+                    result[key] = {
+                        "value": entry["value"],
+                        "age_ms": int(age * 1000),
+                    }
+            return result
+
+
+# ─── MIDI Tool bridge (Live 12.0+ MIDI Generators / Transformations) ─────────
+
+
+class MidiToolCache:
+    """Thread-safe cache for MIDI Tool requests from live.miditool.in.
+
+    Mirrors SpectralCache semantics: entries age out after max_age seconds
+    (default 5). Distinct cache so MIDI-Tool state doesn't get mixed in with
+    analyzer spectrum/RMS/pitch data that tools read by key.
+
+    The last-received request payload carries ``{context, notes}`` where
+    ``context`` is ``{grid, selection, scale, seed, tuning}`` emitted by
+    Live's ``live.miditool.in`` right outlet, and ``notes`` is the note
+    list from the left outlet.
+    """
+
+    def __init__(self, max_age: float = 5.0):
+        self._lock = threading.Lock()
+        self._max_age = max_age
+        self._context: Optional[dict] = None
+        self._notes: Optional[list] = None
+        self._last_seen = 0.0
+        self._request_time = 0.0
+        self._connected = False
+        self._target_tool: Optional[str] = None
+        self._target_params: dict = {}
+
+    def set_request(self, context: dict, notes: list) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._context = context
+            self._notes = notes
+            self._last_seen = now
+            # Timestamp the request payload independently of _last_seen so a
+            # later mark_ready() heartbeat (which bumps _last_seen for
+            # is_connected) cannot resurrect an expired context/notes payload.
+            self._request_time = now
+            self._connected = True
+
+    def mark_ready(self) -> None:
+        """Called when the bridge announces itself (``/miditool/ready``)."""
+        with self._lock:
+            self._last_seen = time.monotonic()
+            self._connected = True
+
+    def get_last_context(self) -> Optional[dict]:
+        with self._lock:
+            if self._context is None:
+                return None
+            age = time.monotonic() - self._request_time
+            if age > self._max_age:
+                return None
+            return dict(self._context)
+
+    def get_last_notes(self) -> Optional[list]:
+        with self._lock:
+            if self._notes is None:
+                return None
+            age = time.monotonic() - self._request_time
+            if age > self._max_age:
+                return None
+            return list(self._notes)
+
+    @property
+    def is_connected(self) -> bool:
+        with self._lock:
+            if not self._connected:
+                return False
+            return (time.monotonic() - self._last_seen) < self._max_age
+
+    def set_target(self, tool_name: Optional[str], params: Optional[dict]) -> None:
+        with self._lock:
+            self._target_tool = tool_name
+            self._target_params = dict(params or {})
+
+    def get_target(self) -> tuple[Optional[str], dict]:
+        with self._lock:
+            return self._target_tool, dict(self._target_params)
+
+
+# ─── Built-in generator implementations ──────────────────────────────────────
+#
+# These run in-process when a MIDI Tool request arrives. Each takes
+# ``(notes, context, params)`` and returns a new notes list. Notes are dicts
+# matching Live's live.miditool.in format:
+#   {pitch, start_time, duration, velocity, mute, probability,
+#    velocity_deviation, release_velocity, note_id}
+#
+# Generators should preserve unknown fields so Live's richer note data round-
+# trips unchanged through the bridge.
+
+
+def _bjorklund(pulses: int, steps: int) -> list[int]:
+    """Classic Bjorklund equidistribution. Returns [0, 1] pattern of length steps."""
+    if steps <= 0:
+        return []
+    if pulses <= 0:
+        return [0] * steps
+    if pulses >= steps:
+        return [1] * steps
+
+    counts: list[int] = []
+    remainders: list[int] = [pulses]
+    divisor = steps - pulses
+    level = 0
+    while True:
+        counts.append(divisor // remainders[level])
+        remainders.append(divisor % remainders[level])
+        divisor = remainders[level]
+        level += 1
+        if remainders[level] <= 1:
+            break
+    counts.append(divisor)
+
+    def build(lv: int) -> list[int]:
+        if lv == -1:
+            return [0]
+        if lv == -2:
+            return [1]
+        out: list[int] = []
+        for _ in range(counts[lv]):
+            out += build(lv - 1)
+        if remainders[lv] != 0:
+            out += build(lv - 2)
+        return out
+
+    pattern = build(level)
+    return pattern[:steps] if len(pattern) >= steps else pattern + [0] * (steps - len(pattern))
+
+
+def _euclidean_rhythm(notes: list, context: dict, params: dict) -> list:
+    """Replace the selection with a Bjorklund-distributed rhythm.
+
+    params:
+      steps (int, required)         — subdivisions of the selection
+      pulses (int, required)        — hits to distribute
+      rotation (int, optional)      — pattern rotation, default 0
+      note (int, optional)          — MIDI pitch, default 36 (C1)
+      velocity (float, optional)    — 0.0..1.0, default 0.8
+
+    Selection span comes from context["selection"] if present, otherwise
+    falls back to min/max of input note start_times.
+    """
+    steps = int(params.get("steps", 16))
+    pulses = int(params.get("pulses", 4))
+    rotation = int(params.get("rotation", 0))
+    pitch = int(params.get("note", 36))
+    velocity = float(params.get("velocity", 0.8))
+
+    if steps <= 0:
+        return list(notes)
+    pulses = max(0, min(pulses, steps))
+
+    pattern = _bjorklund(pulses, steps)
+    if rotation:
+        rotation = rotation % steps
+        pattern = pattern[rotation:] + pattern[:rotation]
+
+    selection = context.get("selection") or {}
+    try:
+        start = float(selection.get("start", 0.0))
+        end = float(selection.get("end", start + float(steps)))
+    except (TypeError, ValueError):
+        start = 0.0
+        end = float(steps)
+    if end <= start:
+        # Fall back to input note span, else a bar at current tempo.
+        if notes:
+            start = min(float(n.get("start_time", 0.0)) for n in notes)
+            end = max(
+                float(n.get("start_time", 0.0)) + float(n.get("duration", 0.25))
+                for n in notes
+            )
+        if end <= start:
+            end = start + 4.0
+
+    step_dur = (end - start) / float(steps)
+    velocity = max(0.0, min(1.0, velocity))
+
+    out: list[dict] = []
+    for i, hit in enumerate(pattern):
+        if not hit:
+            continue
+        out.append({
+            "pitch": max(0, min(127, pitch)),
+            "start_time": round(start + i * step_dur, 6),
+            "duration": round(step_dur, 6),
+            "velocity": velocity,
+            "mute": False,
+            "probability": 1.0,
+            "velocity_deviation": 0.0,
+            "release_velocity": 0.5,
+            "note_id": -1,
+        })
+    return out
+
+
+def _tintinnabuli(notes: list, context: dict, params: dict) -> list:
+    """Add an Arvo Pärt-style companion voice on the tonic triad.
+
+    For each input note, emit the input plus a companion note locked to
+    the nearest member of the supplied triad (above / below / alternating).
+
+    params:
+      t_voice_triad (list[int], optional) — semitone offsets from scale root.
+                                             default [0, 4, 7] (major triad)
+      direction (str, optional)            — "above" | "below" | "alternate".
+                                             default "above"
+    """
+    triad = params.get("t_voice_triad")
+    if not triad:
+        triad = [0, 4, 7]
+    triad = [int(t) % 12 for t in triad]
+    direction = str(params.get("direction", "above")).lower()
+
+    scale = context.get("scale") or {}
+    try:
+        scale_root = int(scale.get("root", 0)) % 12
+    except (TypeError, ValueError):
+        scale_root = 0
+
+    out: list[dict] = []
+    for i, n in enumerate(notes):
+        out.append(dict(n))  # preserve the melody
+        try:
+            pitch = int(n.get("pitch", 60))
+        except (TypeError, ValueError):
+            continue
+
+        # Build absolute candidate triad pitches within ±1 octave of the note.
+        candidates = []
+        for octave in range(-2, 3):
+            for t in triad:
+                cand = ((pitch // 12) + octave) * 12 + ((scale_root + t) % 12)
+                if 0 <= cand <= 127 and cand != pitch:
+                    candidates.append(cand)
+        if not candidates:
+            continue
+
+        if direction == "below":
+            below = [c for c in candidates if c < pitch]
+            companion = max(below) if below else min(candidates)
+        elif direction == "alternate":
+            if i % 2 == 0:
+                above = [c for c in candidates if c > pitch]
+                companion = min(above) if above else max(candidates)
+            else:
+                below = [c for c in candidates if c < pitch]
+                companion = max(below) if below else min(candidates)
+        else:  # "above" (default)
+            above = [c for c in candidates if c > pitch]
+            companion = min(above) if above else max(candidates)
+
+        comp = dict(n)
+        comp["pitch"] = max(0, min(127, companion))
+        comp["note_id"] = -1  # new note
+        out.append(comp)
+    return out
+
+
+def _humanize(notes: list, context: dict, params: dict) -> list:
+    """Humanize timing + velocity of existing notes.
+
+    params:
+      timing_spread (float, optional)   — beats, default 0.05
+      velocity_spread (float, optional) — 0.0..1.0, default 0.1
+
+    Uses context["seed"] for deterministic jitter when present, otherwise
+    system randomness.
+    """
+    timing = float(params.get("timing_spread", 0.05))
+    vel_spread = float(params.get("velocity_spread", 0.1))
+
+    seed = context.get("seed")
+    rng = random.Random()
+    if seed is not None:
+        try:
+            rng.seed(int(seed))
+        except (TypeError, ValueError):
+            rng.seed(str(seed))
+
+    out: list[dict] = []
+    for n in notes:
+        m = dict(n)
+        try:
+            start = float(m.get("start_time", 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
+        try:
+            vel = float(m.get("velocity", 0.8))
+        except (TypeError, ValueError):
+            vel = 0.8
+        m["start_time"] = round(max(0.0, start + rng.uniform(-timing, timing)), 6)
+        m["velocity"] = round(max(0.0, min(1.0, vel + rng.uniform(-vel_spread, vel_spread))), 4)
+        out.append(m)
+    return out
+
+
+# Registry: name -> callable(notes, context, params) -> list[note_dict]
+_GENERATORS: dict[str, Callable[[list, dict, dict], list]] = {
+    "euclidean_rhythm": _euclidean_rhythm,
+    "tintinnabuli": _tintinnabuli,
+    "humanize": _humanize,
+}
+
+
+# Metadata for list_miditool_generators.
+GENERATOR_METADATA: dict[str, dict] = {
+    "euclidean_rhythm": {
+        "description": "Bjorklund-distributed rhythm over the selection",
+        "required_params": ["steps", "pulses"],
+        "optional_params": ["rotation", "note", "velocity"],
+    },
+    "tintinnabuli": {
+        "description": "Pärt-style voice with tintinnabuli companion",
+        "required_params": [],
+        "optional_params": ["t_voice_triad", "direction"],
+    },
+    "humanize": {
+        "description": "Humanize timing + velocity of existing notes",
+        "required_params": [],
+        "optional_params": ["timing_spread", "velocity_spread"],
+    },
+}
+
+
+def available_generators() -> list[str]:
+    """List registered generator names."""
+    return sorted(_GENERATORS.keys())
+
+
+def run_generator(tool_name: str, notes: list, context: dict, params: dict) -> list:
+    """Invoke a registered generator by name. Raises KeyError if unknown."""
+    fn = _GENERATORS[tool_name]
+    return fn(list(notes or []), dict(context or {}), dict(params or {}))
+
+
+class SpectralReceiver(asyncio.DatagramProtocol):
+    """Receives OSC-formatted UDP packets from the M4L device.
+
+    OSC messages:
+        /spectrum f f f f f f f f [f]  — 8 or 9 band spectrum
+                                          (9 = v1.16+ with sub_low; 8 = legacy)
+        /peak f                    — peak level
+        /rms f                     — RMS level
+        /pitch f f                 — MIDI note, amplitude
+        /response s                — base64-encoded JSON (single packet)
+        /response_chunk [s] i i s  — chunked response. New builds prefix the
+                                     per-response request id so chunks of
+                                     different commands never share a bucket;
+                                     legacy builds omit it: (index, total, data)
+        /capture_error s           — capture command rejected (busy guard /
+                                     invalid filename). Resolves the capture
+                                     future; legacy builds wrongly replied on
+                                     /response, which send_capture never sees.
+    """
+
+    # Band names keyed by how many bands the .amxd emits. 8 bands is the v1.x
+    # layout (sub starts at 20 Hz, ~octave per band). 9 bands is v1.16.x+
+    # with an explicit sub_low (20-60 Hz) split off so Villalobos-style kicks
+    # at 40-50 Hz are no longer hidden inside the sub band. The .amxd is the
+    # source of truth for band count — this server picks the right names
+    # based on how many floats actually arrive on /spectrum.
+    BAND_NAMES_8 = ["sub", "low", "low_mid", "mid", "high_mid", "high", "presence", "air"]
+    BAND_NAMES_9 = ["sub_low", "sub", "low", "low_mid", "mid", "high_mid", "high", "presence", "air"]
+    # Default alias kept for any external reader.
+    BAND_NAMES = BAND_NAMES_9
+
+    def __init__(self, cache: SpectralCache, miditool_cache: Optional["MidiToolCache"] = None):
+        self.cache = cache
+        self.miditool_cache = miditool_cache
+        self._chunks: dict[str, dict] = {}  # Reassembly buffer for chunked responses
+        self._chunk_times: dict[str, float] = {}  # Monotonic timestamp per chunk sequence
+        self._chunk_id = 0
+        self._chunk_key: Optional[str] = None  # Key of the single active reassembly bucket
+        self._response_callback: Optional[asyncio.Future] = None
+        self._response_request_id: Optional[str] = None
+        # Set True the first time a response arrives carrying a request id.
+        # Once the analyzer build is known to stamp ids, a response that
+        # arrives with NO id (or a mismatched one) while a future is live is a
+        # stale straggler and must be dropped — see _handle_response.
+        self._seen_request_id = False
+        self._capture_future: Optional[asyncio.Future] = None
+        self._miditool_handler: Optional[Callable[[str, dict, list], None]] = None
+        # Source-address allowlist: the M4L device always sends from loopback.
+        # Track which non-loopback senders we've already warned about so a
+        # spoofing/collision source doesn't spam stderr once per packet.
+        self._warned_sources: set[str] = set()
+
+    def set_miditool_handler(self, handler: Optional[Callable[[str, dict, list], None]]) -> None:
+        """Register a callback invoked on each /miditool/request packet.
+
+        Signature: ``handler(request_id, context, notes) -> None``.
+        The handler is expected to run the configured generator and push
+        a ``/miditool/response`` OSC back via M4LBridge.send_miditool_response.
+        """
+        self._miditool_handler = handler
+
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    # Any local process can send to this UDP port, so a stray/malicious
+    # sender could poison the spectral cache or spoof /response packets to
+    # resolve pending bridge futures. The M4L device always sends from
+    # loopback, so anything else is dropped. This is a source-address
+    # allowlist, not authentication — a full shared-token handshake between
+    # the .amxd and the bridge is a deeper fix, tracked separately.
+    _ALLOWED_HOSTS = ("127.0.0.1", "::1")
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        host = addr[0] if addr else None
+        if host not in self._ALLOWED_HOSTS:
+            if host not in self._warned_sources:
+                self._warned_sources.add(host)
+                import sys
+                print(
+                    f"LivePilot: dropping UDP packet from non-loopback source "
+                    f"{addr!r} on spectral bridge port (further packets from "
+                    "this source will be dropped silently)",
+                    file=sys.stderr,
+                )
+            return
+        try:
+            self._parse_osc(data)
+        except Exception as exc:
+            import sys
+            print(f"LivePilot: malformed OSC packet from {addr}: {exc}", file=sys.stderr)
+
+    def _parse_osc(self, data: bytes) -> None:
+        """Parse a minimal OSC message (address + typed args).
+
+        BUG-audit-C2: earlier versions used `data.index(b'\\x00')` directly,
+        which raises ValueError on malformed/truncated packets. When UDP
+        port 9880 gets traffic from a non-OSC source (port collision,
+        corrupt sender), every packet was logging a noisy stack trace.
+        Now we bounds-check null terminators and drop bad packets silently.
+        """
+        # OSC address is a null-terminated string, padded to 4-byte boundary
+        null_pos = data.find(b'\x00')
+        if null_pos < 0:
+            return  # No null byte at all — not an OSC packet, drop silently
+        address = data[:null_pos].decode('ascii', errors='replace')
+
+        # Skip to type tag string (after address padding)
+        offset = null_pos + 1
+        while offset % 4 != 0:
+            offset += 1
+
+        # Type tag string starts with ','
+        if offset < len(data) and data[offset] == ord(','):
+            tag_null = data.find(b'\x00', offset)
+            if tag_null < 0:
+                return  # Tag string missing terminator — drop silently
+            type_tags = data[offset + 1:tag_null].decode('ascii', errors='replace')
+            offset = tag_null + 1
+            while offset % 4 != 0:
+                offset += 1
+        else:
+            type_tags = ""
+
+        # Parse arguments based on type tags
+        args = []
+        for tag in type_tags:
+            if tag == 'f':
+                if offset + 4 > len(data):
+                    return  # Truncated float arg
+                val = struct.unpack('>f', data[offset:offset + 4])[0]
+                args.append(val)
+                offset += 4
+            elif tag == 'i':
+                if offset + 4 > len(data):
+                    return  # Truncated int arg
+                val = struct.unpack('>i', data[offset:offset + 4])[0]
+                args.append(val)
+                offset += 4
+            elif tag == 's':
+                s_null = data.find(b'\x00', offset)
+                if s_null < 0:
+                    return  # String arg missing terminator — drop silently
+                val = data[offset:s_null].decode('ascii', errors='replace')
+                args.append(val)
+                offset = s_null + 1
+                while offset % 4 != 0:
+                    offset += 1
+
+        self._handle_message(address, args)
+
+    def _handle_message(self, address: str, args: list) -> None:
+        if address == "/spectrum" and len(args) >= 8:
+            # Pick the right name set based on how many bands the .amxd emits.
+            # 9-band payloads come from v1.16.x+ devices with the sub_low split.
+            # 8-band payloads come from older frozen .amxd builds — we keep
+            # working against them until every user has re-frozen.
+            if len(args) >= 9:
+                names = self.BAND_NAMES_9
+            else:
+                names = self.BAND_NAMES_8
+            bands = {}
+            for i, name in enumerate(names):
+                if i < len(args):
+                    bands[name] = round(float(args[i]), 4)
+            self.cache.update("spectrum", bands)
+
+        elif address == "/peak" and len(args) >= 1:
+            self.cache.update("peak", round(float(args[0]), 4))
+
+        elif address == "/rms" and len(args) >= 1:
+            self.cache.update("rms", round(float(args[0]), 4))
+
+        elif address == "/pitch" and len(args) >= 2:
+            self.cache.update("pitch", {
+                "midi_note": round(float(args[0]), 2),
+                "amplitude": round(float(args[1]), 4),
+            })
+
+        elif address == "/key" and len(args) >= 2:
+            self.cache.update("key", {
+                "key": str(args[0]),
+                "scale": str(args[1]),
+            })
+
+        elif address == "/spectral_shape" and len(args) >= 7:
+            names = ["centroid", "spread", "skewness", "kurtosis", "rolloff", "flatness", "crest"]
+            self.cache.update("spectral_shape", {
+                n: round(float(args[i]), 4) for i, n in enumerate(names)
+            })
+
+        elif address == "/mel_bands" and len(args) >= 1:
+            self.cache.update("mel_bands", [round(float(a), 6) for a in args])
+
+        elif address == "/chroma" and len(args) >= 12:
+            self.cache.update("chroma", [round(float(a), 4) for a in args[:12]])
+
+        elif address == "/onset" and len(args) >= 1:
+            strength = round(float(args[0]), 4)
+            self.cache.update("onset", {
+                "detected": strength > 0.5,
+                "strength": strength,
+            })
+
+        elif address == "/novelty" and len(args) >= 1:
+            score = round(float(args[0]), 4)
+            self.cache.update("novelty", {
+                "score": score,
+                "boundary": score > 0.5,
+            })
+
+        elif address == "/loudness" and len(args) >= 2:
+            self.cache.update("loudness", {
+                "momentary_lufs": round(float(args[0]), 1),
+                "true_peak_dbtp": round(float(args[1]), 1),
+            })
+
+        elif address == "/capture_complete" and len(args) >= 1:
+            self._handle_capture_complete(str(args[0]))
+
+        elif address == "/capture_error" and len(args) >= 1:
+            # Busy-guard / invalid-filename rejections from cmd_capture_audio.
+            # Same payload shape and same resolution target as
+            # /capture_complete — what matters is the CHANNEL: send_capture
+            # only resolves via the capture future, so a /response reply here
+            # would be dropped (or worse, resolve an unrelated command).
+            self._handle_capture_complete(str(args[0]))
+
+        elif address == "/response" and len(args) >= 1:
+            self._handle_response(str(args[0]))
+
+        elif address == "/response_chunk" and len(args) >= 3:
+            # New builds prefix the request id (string): (rid, index, total, data).
+            # Legacy builds send (index, total, data). Distinguish by the type
+            # of the first arg — OSC ints decode to int, the id to a str.
+            if len(args) >= 4 and isinstance(args[0], str):
+                self._handle_chunk(
+                    int(args[1]), int(args[2]), str(args[3]),
+                    request_id=str(args[0]),
+                )
+            else:
+                self._handle_chunk(int(args[0]), int(args[1]), str(args[2]))
+
+        elif address == "/miditool/request" and len(args) >= 1:
+            self._handle_miditool_request(str(args[0]))
+
+        elif address == "/miditool/ready":
+            if self.miditool_cache is not None:
+                self.miditool_cache.mark_ready()
+
+    def _handle_response(self, encoded: str) -> None:
+        """Decode a single-packet base64 response.
+
+        Updated analyzer JS echoes ``_livepilot_request_id`` on every response
+        (single-packet here, and on the chunk header for chunked responses).
+        Correlation rules, once this device is known to stamp ids:
+          * a response whose id does NOT match the in-flight future is dropped;
+          * a response with NO id at all is also dropped — it is a stale
+            straggler (e.g. a batched read that outlived its timeout), not a
+            pre-request-id build.
+        Pre-request-id builds (which never stamp an id) stay supported: until
+        the first id is ever seen, no-id responses are accepted.
+        """
+        try:
+            # URL-safe base64 decode (- and _ instead of + and /)
+            padded = encoded + "=" * (-len(encoded) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode('utf-8')
+            result = _normalize_bridge_payload(json.loads(decoded))
+            response_request_id = None
+            if isinstance(result, dict):
+                response_request_id = result.pop("_livepilot_request_id", None)
+
+            if response_request_id is not None:
+                # This analyzer build stamps request ids — remember it so a
+                # later no-id straggler is recognised as stale rather than
+                # mistaken for an old build that never sends ids.
+                self._seen_request_id = True
+
+            cb = self._response_callback
+            expected_request_id = self._response_request_id
+            if cb and not cb.done() and expected_request_id is not None:
+                mismatched = (
+                    response_request_id is not None
+                    and str(response_request_id) != str(expected_request_id)
+                )
+                missing_but_expected = (
+                    response_request_id is None and self._seen_request_id
+                )
+                if mismatched or missing_but_expected:
+                    # Stale/uncorrelated reply — drop it and keep waiting for
+                    # the response that actually matches this command.
+                    return
+
+            if cb and not cb.done():
+                cb.set_result(result)
+            # Clear regardless — either we consumed it, or it was already
+            # done/abandoned. Future packets with no owner get dropped.
+            self._response_callback = None
+            self._response_request_id = None
+        except Exception as exc:
+            import sys
+            print(f"LivePilot: failed to decode bridge response: {exc}", file=sys.stderr)
+
+    def _handle_miditool_request(self, encoded: str) -> None:
+        """Decode a /miditool/request packet and dispatch to the configured handler.
+
+        Payload: base64(JSON({request_id, context, notes})).
+        Packet arrives on the asyncio event-loop thread (SpectralReceiver is a
+        DatagramProtocol, not a separate thread); the registered handler is
+        expected to schedule work on an event loop rather than block here.
+        """
+        try:
+            padded = encoded + "=" * (-len(encoded) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+            payload = json.loads(decoded)
+        except Exception as exc:
+            import sys
+            print(f"LivePilot: failed to decode miditool request: {exc}", file=sys.stderr)
+            return
+
+        request_id = str(payload.get("request_id", ""))
+        context = payload.get("context") or {}
+        notes = payload.get("notes") or []
+
+        if self.miditool_cache is not None:
+            self.miditool_cache.set_request(context, notes)
+
+        handler = self._miditool_handler
+        if handler is not None:
+            try:
+                handler(request_id, context, notes)
+            except Exception as exc:
+                import sys
+                print(f"LivePilot: miditool handler error: {exc}", file=sys.stderr)
+
+    def _handle_chunk(
+        self,
+        index: int,
+        total: int,
+        encoded: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Reassemble chunked responses.
+
+        New analyzer builds stamp the per-response request id on every
+        ``/response_chunk`` header, so chunks from different commands land in
+        SEPARATE buckets and can never be interleaved — even if a stale chunk
+        from a timed-out command arrives mid-flight. Legacy builds omit the id
+        (``request_id`` None/""); they fall back to a single rolling bucket,
+        which is safe because ``send_command`` serialises on ``_cmd_lock``.
+
+        Hardening (v1.27.2): an index outside ``[0, total)`` is dropped — a
+        duplicate or malformed packet must never count toward completion — and
+        reassembly only fires once EVERY index ``0..total-1`` is present. The
+        old ``len(parts) == total`` check could KeyError on a duplicate or
+        out-of-range index, silently losing the response and forcing a full
+        timeout.
+        """
+        # Drop chunks that cannot belong to a well-formed response.
+        if total <= 0 or index < 0 or index >= total:
+            return
+
+        if request_id:
+            # Collision-free per-response bucket.
+            key = f"rid:{request_id}"
+            active = self._chunks.get(key)
+            if active is None or active["total"] != total:
+                self._chunks[key] = {"parts": {}, "total": total}
+                self._chunk_times[key] = time.monotonic()
+            self._chunk_key = key
+        else:
+            # Legacy single-active-bucket model (no id on the wire). A chunk
+            # with a different `total` means a new response started (e.g. the
+            # previous one timed out without ever completing) — evict + reopen.
+            active = self._chunks.get(self._chunk_key)
+            if active is None or active["total"] != total:
+                if active is not None:
+                    self._chunks.pop(self._chunk_key, None)
+                    self._chunk_times.pop(self._chunk_key, None)
+                self._chunk_id += 1
+                self._chunk_key = str(self._chunk_id)
+                self._chunks[self._chunk_key] = {"parts": {}, "total": total}
+                self._chunk_times[self._chunk_key] = time.monotonic()
+            key = self._chunk_key
+
+        parts = self._chunks[key]["parts"]
+        parts[index] = encoded
+
+        if len(parts) == total and all(i in parts for i in range(total)):
+            # Every chunk present — reassemble in order.
+            full = "".join(parts[i] for i in range(total))
+            del self._chunks[key]
+            self._chunk_times.pop(key, None)
+            self._handle_response(full)
+
+        # Evict incomplete chunk sequences older than 30 seconds
+        now = time.monotonic()
+        stale = [k for k, t in self._chunk_times.items() if now - t > 30.0]
+        for k in stale:
+            self._chunks.pop(k, None)
+            self._chunk_times.pop(k, None)
+
+    def _handle_capture_complete(self, encoded: str) -> None:
+        """Decode a /capture_complete OSC message and resolve _capture_future."""
+        try:
+            padded = encoded + "=" * (-len(encoded) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode('utf-8')
+            result = _normalize_bridge_payload(json.loads(decoded))
+            if self._capture_future and not self._capture_future.done():
+                self._capture_future.set_result(result)
+            # Clear the reference so a completed future isn't retained until the
+            # next capture, and so send_capture's done()-guarded cancel has no
+            # stale object to consider.
+            self._capture_future = None
+        except Exception as exc:
+            import sys
+            print(f"LivePilot: failed to decode capture response: {exc}", file=sys.stderr)
+
+    def set_response_future(
+        self,
+        future: Optional[asyncio.Future],
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Set a future to be resolved with the next response."""
+        self._response_callback = future
+        self._response_request_id = request_id if future is not None else None
+
+    def set_capture_future(self, future: asyncio.Future) -> None:
+        """Set a future to be resolved when a capture_complete OSC arrives."""
+        self._capture_future = future
+
+
+class M4LBridge:
+    """Sends commands to the M4L device and waits for responses.
+
+    Commands are sent via UDP to port 9881. Responses come back on port 9880
+    and are handled by the SpectralReceiver.
+    """
+
+    def __init__(
+        self,
+        cache: SpectralCache,
+        receiver: Optional[SpectralReceiver] = None,
+        miditool_cache: Optional[MidiToolCache] = None,
+        *,
+        auth_token: Optional[str] = None,
+        token_file_path: Optional[Path] = None,
+    ):
+        self.cache = cache
+        self.receiver = receiver
+        self.miditool_cache = miditool_cache
+
+        # Shared-secret command auth (see module header). The token is
+        # generated here but only WRITTEN to disk by publish_auth_token() —
+        # the server lifespan calls that explicitly, so unit tests can
+        # construct bridges without touching ~/Documents.
+        self._auth_token = auth_token if auth_token else secrets.token_hex(16)
+        self._token_file_path = (
+            Path(token_file_path) if token_file_path else default_bridge_token_path()
+        )
+        # Compat flag: no token on the wire until the device's ping version
+        # proves the frozen build strips + validates it. None = version not
+        # yet learned (triggers the ping handshake on the first command).
+        self._auth_enabled = False
+        self._bridge_version: Optional[str] = None
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Non-blocking so a momentarily-full send buffer never stalls the
+        # asyncio event loop. The miditool response path sends from inside a
+        # DatagramProtocol callback that runs ON the loop thread — a blocking
+        # sendto there would freeze every pending coroutine. UDP loopback sends
+        # essentially never block; _safe_sendto guards the rare case anyway.
+        self._sock.setblocking(False)
+        self._m4l_addr = ("127.0.0.1", 9881)
+        self._closed = False
+        self._cmd_lock: Optional[asyncio.Lock] = None
+        # BUG-audit-C1: send_capture uses _capture_future, which is
+        # independent of _response_callback used by send_command.
+        # They must be serialised independently — sharing a lock made
+        # send_command block for the entire capture duration (up to 35s).
+        self._capture_lock: Optional[asyncio.Lock] = None
+
+        # Wire the miditool dispatch: receiver calls us on /miditool/request,
+        # we look up the configured generator and push the response back.
+        if self.receiver is not None:
+            self.receiver.set_miditool_handler(self._dispatch_miditool_request)
+            if self.receiver.miditool_cache is None and miditool_cache is not None:
+                self.receiver.miditool_cache = miditool_cache
+
+        # Best-effort: release this bridge's OUTGOING UDP 9881 send socket on a
+        # clean interpreter exit. NOTE: this is NOT the 9880 analyzer listener —
+        # that socket lives on the SpectralReceiver transport (created in the
+        # server lifespan) and is closed in the lifespan finally. The OS reclaims
+        # BOTH ports on any process death, INCLUDING the SIGTERM/SIGKILL the
+        # orphan-kill runbook uses (which bypasses atexit). The real defense
+        # against an orphan squatting 9880 is the §9b kill-orphan procedure +
+        # reconnect_bridge, not this handler.
+        atexit.register(self.close)
+
+    def _safe_sendto(self, data: bytes) -> None:
+        """Send a UDP packet without ever blocking the event loop.
+
+        The socket is non-blocking; if the OS send buffer is momentarily full
+        (vanishingly rare on loopback) sendto raises BlockingIOError. We drop
+        the packet rather than stall — the caller's timeout/retry handles it.
+        """
+        try:
+            self._sock.sendto(data, self._m4l_addr)
+        except BlockingIOError:
+            import sys
+            print(
+                "LivePilot: M4L UDP send buffer full — packet dropped",
+                file=sys.stderr,
+            )
+
+    # ── Shared-secret token auth ────────────────────────────────────────
+
+    @property
+    def auth_token(self) -> str:
+        return self._auth_token
+
+    @property
+    def token_auth_enabled(self) -> bool:
+        return self._auth_enabled
+
+    @property
+    def bridge_version(self) -> Optional[str]:
+        """Last version string reported by the analyzer's ping (None until
+        the first successful ping)."""
+        return self._bridge_version
+
+    def publish_auth_token(self) -> Optional[Path]:
+        """Write the token file the frozen .amxd validates against.
+
+        Called from the server lifespan, NOT __init__ (tests construct
+        bridges freely and must not touch ~/Documents). Non-fatal on
+        failure: the JS treats a missing/unreadable token file as legacy
+        compat mode and keeps accepting untokened commands, so a failed
+        write degrades to pre-1.28 behavior rather than breaking the bridge.
+
+        PLATFORM NOTE: the 0600 mode below is only meaningful on POSIX.
+        Python's ``os.chmod`` on Windows toggles the read-only bit and
+        nothing else, so the file lands at 0o666 there and confidentiality
+        rests on the default ACLs of the user profile directory instead.
+        That is acceptable for the threat model this token addresses — a
+        LAN-adjacent host firing blind OSC at UDP 9881, not a hostile local
+        user — but it is an assumption worth knowing about, and it is why
+        the mode assertion in tests/test_bridge_token_auth.py is POSIX-only.
+        """
+        if _token_auth_disabled_by_env():
+            return None
+        path = self._token_file_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Create with 0600 atomically so the token is never readable by
+            # other users, even transiently; re-chmod covers a pre-existing
+            # file from an earlier run with different permissions.
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, (self._auth_token + "\n").encode("ascii"))
+            finally:
+                os.close(fd)
+            os.chmod(str(path), 0o600)
+            return path
+        except OSError as exc:
+            import sys
+            print(
+                f"LivePilot: could not write bridge token file {path} ({exc}) — "
+                "bridge commands stay on the legacy untokened path",
+                file=sys.stderr,
+            )
+            return None
+
+    def note_bridge_version(self, version: Any) -> None:
+        """Record the analyzer's self-reported ping version and flip the
+        token-auth compat flag when the frozen build is new enough."""
+        if version is None:
+            # Ping succeeded but carried no version — an unknown build.
+            # Remember that we asked (stops the per-command handshake) but
+            # keep auth off: we cannot prove the device strips the token.
+            self._bridge_version = ""
+            self._auth_enabled = False
+            return
+        self._bridge_version = str(version)
+        if _token_auth_disabled_by_env():
+            self._auth_enabled = False
+            return
+        parsed = parse_bridge_version(self._bridge_version)
+        self._auth_enabled = bool(
+            parsed is not None and parsed >= TOKEN_AUTH_MIN_BRIDGE_VERSION
+        )
+
+    def _with_auth_token(self, args: tuple) -> tuple:
+        """Prepend the token as the FIRST OSC argument when auth is active.
+
+        The frozen JS strips it in anything() before positional parsing;
+        pre-token devices never get it (see note_bridge_version)."""
+        if not self._auth_enabled:
+            return args
+        return (BRIDGE_TOKEN_ARG_PREFIX + self._auth_token, *args)
+
+    async def _ensure_bridge_version_known(self) -> None:
+        """Ping handshake before the first real command of a session.
+
+        Untokened commands are dropped by a 1.28+ device once its token file
+        exists, and tokened commands break a pre-1.28 device — so the very
+        first command must learn which build is on the other side. Ping is
+        exempt from the JS token check precisely so this probe always works.
+        A failed ping leaves the version unknown (retried on the next
+        command) and the command proceeds untokened, matching legacy
+        behavior.
+        """
+        if self._bridge_version is None and not _token_auth_disabled_by_env():
+            # `bridge = self` keeps scripts/scan_async_blocking.py accurate:
+            # its receiver heuristic exempts *bridge*/m4l/spectral chains, and
+            # this send_command is the async-native M4L one, not the blocking
+            # AbletonConnection.send_command the scanner hunts.
+            bridge = self
+            await bridge.send_command("ping", timeout=2.0)
+
+    def _dispatch_miditool_request(
+        self, request_id: str, context: dict, notes: list,
+    ) -> None:
+        """Handle a decoded /miditool/request: run the configured generator,
+        send /miditool/response back with {request_id, notes}.
+
+        Invoked from SpectralReceiver on the asyncio event-loop thread
+        (it is a DatagramProtocol, not a separate UDP thread). We do not
+        await anything here — generators are synchronous, pure Python.
+        If no target is configured, pass notes through unchanged (identity).
+        """
+        if self.miditool_cache is None:
+            return
+        tool_name, params = self.miditool_cache.get_target()
+
+        try:
+            if tool_name and tool_name in _GENERATORS:
+                out_notes = run_generator(tool_name, notes, context, params)
+            else:
+                out_notes = list(notes)
+        except Exception as exc:
+            import sys
+            print(
+                f"LivePilot: miditool generator '{tool_name}' failed: {exc} — "
+                f"passing input unchanged.",
+                file=sys.stderr,
+            )
+            out_notes = list(notes)
+
+        try:
+            self.send_miditool_response(request_id, out_notes)
+        except Exception as exc:
+            import sys
+            print(f"LivePilot: failed to send miditool response: {exc}", file=sys.stderr)
+
+    def send_miditool_config(self, tool_name: Optional[str], params: Optional[dict]) -> None:
+        """Push the currently-selected generator config to the JS bridge.
+
+        Sends ``miditool/config`` OSC with a JSON blob. The underlying
+        ``_build_osc`` applies the standard ``b64:`` prefix encoding to the
+        string arg, so we just pass the raw JSON — single-encoded on the wire.
+        The JS side decodes via ``_decode_b64_arg`` like every other command.
+        """
+        payload = {"tool_name": tool_name or "", "params": params or {}}
+        osc = self._build_osc("miditool/config", (json.dumps(payload),))
+        self._safe_sendto(osc)
+
+    def send_miditool_response(self, request_id: str, notes: list) -> None:
+        """Send transformed notes back to the JS bridge.
+
+        Packet: ``miditool/response`` <b64-encoded JSON({request_id, notes})>.
+        The JS side matches request_id and emits notes out live.miditool.out.
+        """
+        payload = {"request_id": str(request_id or ""), "notes": list(notes or [])}
+        osc = self._build_osc("miditool/response", (json.dumps(payload),))
+        self._safe_sendto(osc)
+
+    async def send_command(self, command: str, *args: Any, timeout: float = 5.0) -> dict:
+        """Send an OSC command to the M4L device and wait for the response."""
+        if not self.cache.is_connected:
+            return {"error": "LivePilot Analyzer not connected. Drop it on the master track."}
+
+        # Fail fast if there is no receiver to correlate the response. The
+        # previous version sent the OSC packet anyway, dropped the reply
+        # inside _handle_response (no future registered), and waited out
+        # the full 5s timeout before returning a misleading "device may be
+        # busy or removed" error. The real cause was "no receiver wired",
+        # which the caller should see immediately.
+        if self.receiver is None:
+            return {
+                "error": "M4L bridge has no active receiver — the UDP 9880 "
+                         "listener did not start. Check server startup logs "
+                         "for a bind failure on port 9880."
+            }
+
+        # Learn the frozen build's version before the first real command so
+        # the token compat flag is set correctly (see _ensure_bridge_version_known).
+        if command != "ping":
+            await self._ensure_bridge_version_known()
+
+        if self._cmd_lock is None:
+            self._cmd_lock = asyncio.Lock()
+        async with self._cmd_lock:
+            # Create a future for the response
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            request_id = uuid.uuid4().hex
+            self.receiver.set_response_future(future, request_id=request_id)
+
+            # Build and send OSC message (no leading / — Max udpreceive
+            # passes messagename with / intact to JS, breaking dispatch)
+            request_arg = f"__livepilot_request_id:{request_id}"
+            osc_data = self._build_osc(
+                command, self._with_auth_token((*args, request_arg))
+            )
+            self._safe_sendto(osc_data)
+
+            # Wait for response with timeout
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+                if command == "ping" and isinstance(result, dict) \
+                        and not result.get("error"):
+                    # The ping response is the version oracle that gates the
+                    # token compat flag — the frozen .amxd, not the repo JS,
+                    # is authoritative for what's actually running.
+                    self.note_bridge_version(result.get("version"))
+                return result
+            except asyncio.TimeoutError:
+                return {"error": "M4L bridge timeout — device may be busy or removed"}
+            finally:
+                # Always clear the future — on success the receiver has already
+                # cleared it inside _handle_response, but calling again is a
+                # no-op. On timeout this is what prevents a delayed packet from
+                # resolving a future belonging to the next command.
+                self.receiver.set_response_future(None)
+
+    async def send_capture(self, command: str, *args: Any, timeout: float = 35.0) -> dict:
+        """Send a capture command to the M4L device and wait for /capture_complete."""
+        if not self.cache.is_connected:
+            return {"error": "LivePilot Analyzer not connected. Drop it on the master track."}
+
+        # Fail fast if there is no receiver to correlate the reply. Prior
+        # versions sent the OSC packet anyway, never registered a future,
+        # and then waited out the full 35s timeout with a misleading
+        # "device may be busy or removed" diagnosis — the real cause was
+        # "no receiver wired" (UDP 9880 failed to bind at startup).
+        if self.receiver is None:
+            return {
+                "error": "M4L bridge has no active receiver — the UDP 9880 "
+                         "listener did not start. Check server startup logs "
+                         "for a bind failure on port 9880."
+            }
+
+        # Same version handshake as send_command — a capture command is just
+        # as version-sensitive as any other (token vs no token on the wire).
+        await self._ensure_bridge_version_known()
+
+        # BUG-audit-C1: use a dedicated _capture_lock (not _cmd_lock) so
+        # concurrent send_command calls are not blocked for the full
+        # recording duration. _capture_future and _response_callback are
+        # independent receiver state and can be driven concurrently.
+        if self._capture_lock is None:
+            self._capture_lock = asyncio.Lock()
+        async with self._capture_lock:
+            # Cancel any stale capture future before creating a new one
+            if self.receiver._capture_future and not self.receiver._capture_future.done():
+                self.receiver._capture_future.cancel()
+
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self.receiver.set_capture_future(future)
+
+            osc_data = self._build_osc(command, self._with_auth_token(args))
+            self._safe_sendto(osc_data)
+
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+                return result
+            except asyncio.TimeoutError:
+                # Clean up the dangling future
+                self.receiver._capture_future = None
+                return {"error": "M4L capture timeout — device may be busy or removed"}
+
+    async def cancel_capture_future(self, device_result: Optional[dict] = None) -> None:
+        """Resolve any in-progress capture future with a stopped result.
+
+        Does NOT acquire _capture_lock — send_capture holds it during recording.
+        Resolving (not cancelling) the future lets send_capture return a
+        clean partial-result dict instead of raising CancelledError.
+
+        ``device_result`` is the M4L device's own capture_stop response —
+        its file/file_path are merged into the resolved result so the
+        in-flight capture_audio caller learns where the partial recording
+        landed (review 2026-07-30: previously the path was silently dropped).
+
+        capture_stop's own ``_cmd_lock`` and capture_audio's ``_capture_lock``
+        are deliberately independent (BUG-audit-C1), so a capture_stop can
+        land while an UNRELATED, still-recording capture_audio owns the live
+        future. When ``device_result`` is supplied it must actually confirm
+        the device stopped a capture (``stopped=True``) before we graft onto
+        that future — a "nothing to stop" reply ({"ok": true, "stopped":
+        false}) or a bridge-level error/timeout dict must leave the in-flight
+        future untouched so it completes normally or times out on its own
+        (review 2026-07-31: previously any ``ok``-ish reply resolved
+        whichever future happened to be live, silently truncating an
+        unrelated recording).
+        """
+        if self.receiver and self.receiver._capture_future \
+                and not self.receiver._capture_future.done():
+            if device_result is not None and not device_result.get("stopped"):
+                return
+            result = {"ok": True, "stopped_early": True}
+            if device_result and device_result.get("ok"):
+                for key in ("file", "file_path"):
+                    if device_result.get(key):
+                        result[key] = device_result[key]
+            self.receiver._capture_future.set_result(result)
+            self.receiver._capture_future = None
+
+    def _build_osc(self, address: str, args: tuple) -> bytes:
+        """Build a minimal OSC message.
+
+        OSC addresses are ASCII-only command names.
+        String arguments are encoded into an ASCII-safe ``b64:...`` payload
+        and decoded back to UTF-8 in the Max bridge.
+        """
+        # Address string — always ASCII (command names like "get_params")
+        addr_bytes = address.encode('ascii') + b'\x00'
+        while len(addr_bytes) % 4 != 0:
+            addr_bytes += b'\x00'
+
+        # Type tag string
+        type_tags = ","
+        arg_data = b""
+        for arg in args:
+            if isinstance(arg, int):
+                type_tags += "i"
+                arg_data += struct.pack('>i', arg)
+            elif isinstance(arg, float):
+                type_tags += "f"
+                arg_data += struct.pack('>f', arg)
+            elif isinstance(arg, str):
+                type_tags += "s"
+                encoded = _encode_string_arg(arg)
+                s_bytes = encoded.encode('ascii') + b'\x00'
+                while len(s_bytes) % 4 != 0:
+                    s_bytes += b'\x00'
+                arg_data += s_bytes
+            else:
+                raise TypeError(
+                    "OSC argument for %s must be int, float, or str, got %s"
+                    % (address, type(arg).__name__)
+                )
+
+        tag_bytes = type_tags.encode('ascii') + b'\x00'
+        while len(tag_bytes) % 4 != 0:
+            tag_bytes += b'\x00'
+
+        return addr_bytes + tag_bytes + arg_data
+
+    def close(self) -> None:
+        """Close the outgoing UDP socket and mark this bridge as shut down.
+
+        Idempotent — safe to call multiple times (from the server lifespan
+        finally block AND from the atexit handler registered at construction).
+
+        Releases this bridge's OUTGOING UDP 9881 send socket (M4LBridge._sock).
+        This is NOT the 9880 analyzer listener — that is the SpectralReceiver
+        transport, closed in the server lifespan finally. Called from both the
+        lifespan shutdown and an atexit handler; on abrupt process death the OS
+        reclaims the socket regardless (see the §9b orphan-kill runbook for the
+        actual stale-9880 defense).
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass

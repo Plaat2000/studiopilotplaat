@@ -1,0 +1,5 @@
+{
+  "_comment": "Known pre-existing 'blocking call on the event loop' sites, recorded so CI fails on NEW violations instead of the backlog. Keyed by (repo-relative file, function, kind, target) \u2014 not line number, and not an absolute path, so the baseline matches on CI and on every developer machine. Shrinking this list is the goal; adding to it needs a reason. Regenerate with: python3 scripts/scan_async_blocking.py --update-baseline",
+  "_root_causes": {},
+  "known_violations": []
+}

@@ -1,0 +1,123 @@
+id: disco
+name: Disco
+type: genre
+aliases:
+  - "disco"
+  - "nu disco"
+  - "nu-disco"
+  - "french house"  # French house is disco-filtering lineage
+
+sonic_identity:
+  - 110-125 BPM 4/4 straight
+  - filtered disco samples (band-pass sweeps)
+  - funk guitar chops as rhythmic content
+  - pumping sidechained kick-bass
+  - vocoder or pitched-down vocal hooks
+
+reach_for:
+  instruments:
+    - Simpler  # disco loop chops
+    - Bass  # Creative Extensions
+  effects:
+    - Vocoder
+    - Auto Filter  # band-pass sweeps
+    - Chorus-Ensemble
+    - Compressor  # heavy sidechain via Envelope Follower
+    - Saturator
+  packs:
+    - Chop and Swing
+    - Core Library
+  utilities:
+    - EQ Eight
+
+avoid:
+  - non-sidechained kick/bass
+  - clean vocals (use vocoder or pitch-shift)
+  - minimal-techno-style restraint
+
+rhythm_idioms:
+  - straight 4/4 house kick
+  - hi-hat on off-beat
+  - heavy sidechain pumping
+  - funk guitar strum on off-beats
+
+harmony_idioms:
+  - disco-sample chord content
+  - minor-key bass
+  - vocoder chord voicings
+
+arrangement_idioms:
+  - filter-automation-driven build
+  - drop + filter-sweep into main section
+  - breakdown with filter closed, build via filter open
+  - 6-8 minute tracks (club format)
+
+texture_idioms:
+  - chorus/ensemble on synths
+  - sidechain pumping as rhythmic texture
+  - filtered disco as sustained element
+
+sample_roles:
+  - melodic_source
+  - vocal_source
+  - rhythmic_chop
+
+key_techniques:
+  - name: "Classic Robot Voice"
+    source: atlas
+    device: Vocoder
+  - name: "Noise-Carried Drums"
+    source: sample-techniques.md
+  - name: band-pass-filter automation on disco samples
+    source: sample-techniques.md
+  - name: "Reese-style bass"
+    source: atlas
+    device: Bass
+
+evaluation_bias:
+  target_dimensions:
+    groove: 0.22
+    motion: 0.20
+    contrast: 0.16
+    cohesion: 0.12
+    novelty: 0.10
+    depth: 0.10
+    clarity: 0.10
+  protect:
+    clarity: 0.65
+    cohesion: 0.75
+    low_end: 0.72
+
+move_family_bias:
+  favor:
+    - sound_design
+    - mix
+    - arrangement
+  deprioritize:
+    - performance
+
+dimensions_in_scope:
+  - rhythmic
+  - timbral
+  - structural
+  - spatial
+dimensions_deprioritized: []
+
+novelty_budget_default: 0.45
+
+tempo_hint:
+  min: 110
+  max: 125
+  time_signature: "4/4"
+
+canonical_artists:
+  - daft-punk
+
+canonical_genres: []
+
+notes: |
+  Disco covers classic disco, nu-disco (modern revivals), and
+  French house (Daft Punk / Stardust lineage — disco-filtered,
+  vocoder-heavy). The distinguishing feature across all variants is
+  sidechain pumping on every non-kick element and aggressive filter
+  automation as the arrangement driver.

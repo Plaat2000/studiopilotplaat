@@ -1,0 +1,778 @@
+"""Device Atlas v2 — indexed in-memory device knowledge base.
+
+Loads a JSON atlas file and builds indexes for fast lookup, search,
+suggestion, chain building, and device comparison.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# BUG-B39: the real atlas scanner emits "instruments" / "audio_effects" but
+# older callers and test fixtures sometimes pass the singular "instrument" /
+# "effect". Hoisted to module scope (was previously re-declared inline in
+# search()) so both search() and the truncation-warning helper below share
+# one alias table instead of drifting independently.
+_CATEGORY_ALIASES: Dict[str, set] = {
+    "instrument": {"instrument", "instruments"},
+    "instruments": {"instrument", "instruments"},
+    "effect": {"effect", "effects", "audio_effects"},
+    "effects": {"effect", "effects", "audio_effects"},
+    "audio_effect": {"effect", "effects", "audio_effects", "audio_effect"},
+    "audio_effects": {"effect", "effects", "audio_effects", "audio_effect"},
+}
+
+
+class AtlasManager:
+    """In-memory device atlas with indexed lookups."""
+
+    def __init__(self, atlas_path: str):
+        with open(atlas_path, "r") as f:
+            data = json.load(f)
+
+        # v1.21.2 audit-response #2: atlas JSONs ship with `.version` at
+        # top level (e.g. "2.0.0"), not under `.meta.version`. Pre-fix,
+        # `self._meta = data.get("meta", {})` always evaluated to {} on
+        # the shipped atlas because there's no `meta` key, which made
+        # `self.version` return "unknown". Read both locations and let
+        # the top-level win — falling back to `.meta.version` preserves
+        # backward-compat with any internal/dev atlas using the older
+        # schema.
+        self._meta = dict(data.get("meta", {}))
+        if "version" in data and "version" not in self._meta:
+            self._meta["version"] = data["version"]
+        self._devices: List[Dict[str, Any]] = data.get("devices", [])
+
+        # P3-47 truncation observability: scan_full_library persists
+        # stats.category_truncated (keyed by atlas device-category, e.g.
+        # "drum_kits"/"sounds"/"samples") whenever the last scan hit its
+        # max_per_category cap — or ran out of the remote script's shared
+        # iteration safety bound — mid-category. Read it once here so
+        # search()/suggest() callers can be warned their results for a
+        # truncated category are a lower bound, not the full inventory.
+        raw_stats = data.get("stats", {})
+        raw_truncated = (
+            raw_stats.get("category_truncated", {})
+            if isinstance(raw_stats, dict) else {}
+        )
+        self._category_truncated: Dict[str, bool] = {
+            str(cat): bool(hit)
+            for cat, hit in raw_truncated.items()
+        } if isinstance(raw_truncated, dict) else {}
+
+        # ── Build indexes ───────────────────────────────────────────
+        # P2-12: _by_id / _by_name keep a LIST of every device sharing a
+        # key, in scan order, so colliding ids/names no longer shadow each
+        # other (last-wins). 719 ids + 702 names collide in the shipped
+        # atlas while URIs are 100% unique, so every device stays reachable
+        # via lookup_all() / atlas_device_info's surfaced URIs. lookup()
+        # still returns a single Dict (the first, deterministic match) to
+        # preserve its Optional[Dict] contract for compare()/browser.py/
+        # _research_engine.py.
+        self._by_id: Dict[str, List[Dict[str, Any]]] = {}
+        self._by_name: Dict[str, List[Dict[str, Any]]] = {}  # lowercase key
+        self._by_uri: Dict[str, Dict[str, Any]] = {}
+        self._by_category: Dict[str, List[Dict[str, Any]]] = {}
+        self._by_tag: Dict[str, List[Dict[str, Any]]] = {}
+        self._by_genre: Dict[str, List[Dict[str, Any]]] = {}
+        self._by_pack: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Perf batch (v1.27.3): a real 40k-device user atlas can carry
+        # ~16k duplicate ids/names/uris, and warning once per duplicate
+        # produced ~16k logger.warning calls (~122ms + multi-MB of stderr)
+        # at index-build time. Cap each category at _DUP_WARN_CAP explicit
+        # warnings and emit one summary line for the rest.
+        _DUP_WARN_CAP = 20
+        _dup_id_count = 0
+        _dup_name_count = 0
+        _dup_uri_count = 0
+
+        for dev in self._devices:
+            dev_id = dev.get("id", "")
+            dev_name = dev.get("name", "")
+            dev_uri = dev.get("uri", "")
+            dev_category = dev.get("category", "")
+
+            if dev_id:
+                bucket = self._by_id.setdefault(dev_id, [])
+                if bucket and dev not in bucket:
+                    _dup_id_count += 1
+                    if _dup_id_count <= _DUP_WARN_CAP:
+                        logger.warning(
+                            "atlas: duplicate device id %r (name=%r); both kept, "
+                            "lookup() returns the first — disambiguate by uri %r",
+                            dev_id, dev_name, dev_uri,
+                        )
+                if dev not in bucket:
+                    bucket.append(dev)
+            if dev_name:
+                name_key = dev_name.lower()
+                name_bucket = self._by_name.setdefault(name_key, [])
+                if name_bucket and dev not in name_bucket:
+                    _dup_name_count += 1
+                    if _dup_name_count <= _DUP_WARN_CAP:
+                        logger.warning(
+                            "atlas: duplicate device name %r (id=%r); both kept, "
+                            "lookup() returns the first — disambiguate by uri %r",
+                            dev_name, dev_id, dev_uri,
+                        )
+                if dev not in name_bucket:
+                    name_bucket.append(dev)
+            if dev_uri:
+                if dev_uri in self._by_uri and self._by_uri[dev_uri] is not dev:
+                    _dup_uri_count += 1
+                    if _dup_uri_count <= _DUP_WARN_CAP:
+                        logger.warning(
+                            "atlas: duplicate device uri %r shadows a prior entry "
+                            "(id=%r); last-wins", dev_uri, dev_id,
+                        )
+                self._by_uri[dev_uri] = dev
+
+            # Category index
+            if dev_category:
+                self._by_category.setdefault(dev_category, []).append(dev)
+
+            # Tag index — pull from BOTH legacy "tags" AND enriched
+            # "character_tags". BUG-P (caught 2026-05-01 live demo): the
+            # bundled factory atlas uses character_tags exclusively, so
+            # _by_tag was empty across the board, breaking every tag-based
+            # role picker. Reading both fields makes the index actually
+            # populated for normal user atlases.
+            seen_tags = set()
+            for tag in dev.get("tags", []) or []:
+                tag_lower = str(tag).lower()
+                if tag_lower not in seen_tags:
+                    seen_tags.add(tag_lower)
+                    self._by_tag.setdefault(tag_lower, []).append(dev)
+            for tag in dev.get("character_tags", []) or []:
+                tag_lower = str(tag).lower()
+                if tag_lower not in seen_tags:
+                    seen_tags.add(tag_lower)
+                    self._by_tag.setdefault(tag_lower, []).append(dev)
+
+            # Genre index (primary + secondary)
+            for genre in dev.get("genres", {}).get("primary", []):
+                self._by_genre.setdefault(genre.lower(), []).append(dev)
+            for genre in dev.get("genres", {}).get("secondary", []):
+                self._by_genre.setdefault(genre.lower(), []).append(dev)
+            # Also read the enriched genre_affinity field, which is where
+            # curated YAML entries land after merge (scanners emit `genres`,
+            # enrichments emit `genre_affinity` — both must feed the index
+            # or new minimal/microhouse/dub_techno tags would never surface).
+            aff = dev.get("genre_affinity", {}) or {}
+            for genre in aff.get("primary", []) if isinstance(aff, dict) else []:
+                self._by_genre.setdefault(str(genre).lower(), []).append(dev)
+            for genre in aff.get("secondary", []) if isinstance(aff, dict) else []:
+                self._by_genre.setdefault(str(genre).lower(), []).append(dev)
+
+            # Pack index — enriched devices declare `pack:` in YAML. Native
+            # Live devices without an explicit pack default to "Core Library"
+            # so the index covers everything shipped with the stock install.
+            pack_name = dev.get("pack")
+            if not pack_name and dev.get("source") in (None, "native", "browser"):
+                # Heuristic: if we have no explicit pack and the scan source
+                # is the built-in browser, treat as Core Library. Don't fake
+                # a pack for plugins/user samples where the source isn't the
+                # stock library.
+                if dev_category in ("instruments", "audio_effects",
+                                    "midi_effects", "max_for_live"):
+                    pack_name = "Core Library"
+            if pack_name:
+                self._by_pack.setdefault(pack_name, []).append(dev)
+
+        if _dup_id_count > _DUP_WARN_CAP:
+            logger.warning(
+                "atlas: %d more duplicate device ids suppressed",
+                _dup_id_count - _DUP_WARN_CAP,
+            )
+        if _dup_name_count > _DUP_WARN_CAP:
+            logger.warning(
+                "atlas: %d more duplicate device names suppressed",
+                _dup_name_count - _DUP_WARN_CAP,
+            )
+        if _dup_uri_count > _DUP_WARN_CAP:
+            logger.warning(
+                "atlas: %d more duplicate device uris suppressed",
+                _dup_uri_count - _DUP_WARN_CAP,
+            )
+
+    # ── Properties ──────────────────────────────────────────────────
+
+    @property
+    def version(self) -> str:
+        return self._meta.get("version", "unknown")
+
+    @property
+    def device_count(self) -> int:
+        return len(self._devices)
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        categories: Dict[str, int] = {}
+        for dev in self._devices:
+            cat = dev.get("category", "unknown")
+            categories[cat] = categories.get(cat, 0) + 1
+        return {
+            "version": self.version,
+            "device_count": self.device_count,
+            "categories": categories,
+            "index_sizes": {
+                "by_id": len(self._by_id),
+                "by_name": len(self._by_name),
+                "by_uri": len(self._by_uri),
+                "by_category": len(self._by_category),
+                "by_tag": len(self._by_tag),
+                "by_genre": len(self._by_genre),
+                "by_pack": len(self._by_pack),
+            },
+        }
+
+    # ── Truncation observability (P3-47) ──────────────────────────
+    def truncated_categories(self) -> List[str]:
+        """Categories where the atlas's last scan_full_library run hit
+        its max_per_category cap (or the remote script's shared iteration
+        safety bound) mid-category. Devices in these categories are a
+        lower bound, not the full inventory, until a rescan completes."""
+        return sorted(
+            cat for cat, hit in self._category_truncated.items() if hit
+        )
+
+    def truncation_warning(self, category: str = "all") -> Optional[str]:
+        """Return a warning string if `category` overlaps a category
+        flagged truncated in the loaded atlas's scan stats, else None.
+
+        category="all" (the default `atlas_search`/`atlas_suggest` filter)
+        warns if ANY category was truncated, since an unfiltered query
+        silently includes those partial results alongside complete ones.
+        A specific category only warns when it (or an alias — see
+        _CATEGORY_ALIASES) is in the truncated set.
+        """
+        truncated = self.truncated_categories()
+        if not truncated:
+            return None
+
+        if category == "all":
+            hit = truncated
+        else:
+            allowed = _CATEGORY_ALIASES.get(category, {category})
+            hit = [cat for cat in truncated if cat in allowed]
+            if not hit:
+                return None
+
+        return (
+            "Atlas categor%s %s may be incomplete — the last scan hit its "
+            "size cap for %s. Run scan_full_library(force=True) (raise "
+            "max_per_category if your library is unusually large) for a "
+            "complete inventory before trusting an exhaustive search here."
+        ) % (
+            "y" if len(hit) == 1 else "ies",
+            ", ".join(sorted(hit)),
+            "this category" if len(hit) == 1 else "these categories",
+        )
+
+    # ── Pack lookup ────────────────────────────────────────────────
+    def pack_info(self, pack_name: str) -> Dict[str, Any]:
+        """Return summary of a pack — device list + enrichment coverage.
+
+        Matches the pack name case-insensitively; the index stores the
+        canonical casing from the YAML (e.g. "Core Library", "Drone Lab").
+        """
+        if not pack_name:
+            return {"pack": "", "device_count": 0, "enriched_count": 0,
+                    "devices": []}
+
+        target = pack_name.strip().lower()
+        # Find canonical name
+        canonical = None
+        for name in self._by_pack.keys():
+            if name.lower() == target:
+                canonical = name
+                break
+
+        if canonical is None:
+            return {
+                "pack": pack_name,
+                "device_count": 0,
+                "enriched_count": 0,
+                "devices": [],
+                "available_packs": sorted(self._by_pack.keys()),
+            }
+
+        devices = self._by_pack[canonical]
+        enriched = [d for d in devices if d.get("enriched")]
+        return {
+            "pack": canonical,
+            "device_count": len(devices),
+            "enriched_count": len(enriched),
+            "devices": [
+                {
+                    "id": d.get("id", ""),
+                    "name": d.get("name", ""),
+                    "category": d.get("category", ""),
+                    "enriched": bool(d.get("enriched")),
+                    "uri": d.get("uri", ""),
+                }
+                for d in devices
+            ],
+        }
+
+    def list_packs(self) -> List[Dict[str, Any]]:
+        """All known packs with device counts, sorted by size descending."""
+        packs = [
+            {
+                "name": name,
+                "device_count": len(devs),
+                "enriched_count": sum(1 for d in devs if d.get("enriched")),
+            }
+            for name, devs in self._by_pack.items()
+        ]
+        packs.sort(key=lambda p: -p["device_count"])
+        return packs
+
+    # ── Lookup ──────────────────────────────────────────────────────
+
+    def lookup(self, name_or_id: str) -> Optional[Dict[str, Any]]:
+        """Exact match by ID, name (case-insensitive), or URI. Returns None on miss.
+
+        When an id/name collides across devices (719 ids / 702 names in the
+        shipped atlas), this returns the FIRST device in scan order
+        deterministically. Use lookup_all() to reach every colliding device,
+        or pass a unique URI (URIs never collide) to target a specific one.
+        """
+        # Try ID first
+        bucket = self._by_id.get(name_or_id)
+        if bucket:
+            return bucket[0]
+        # Try name (case-insensitive)
+        name_bucket = self._by_name.get(name_or_id.lower())
+        if name_bucket:
+            return name_bucket[0]
+        # Try URI — the only key that is guaranteed unique
+        if name_or_id in self._by_uri:
+            return self._by_uri[name_or_id]
+        return None
+
+    def lookup_all(self, name_or_id: str) -> List[Dict[str, Any]]:
+        """Return EVERY device matching an id, name, or URI — collision-aware.
+
+        P2-12: lookup() returns a single Dict (its contract), which shadows
+        the ~719 devices sharing a colliding id and ~702 sharing a name. This
+        companion returns all of them so id/name-keyed tools can disambiguate
+        (e.g. surface each candidate's unique URI). Matches are returned in
+        scan order with duplicates removed; an exact URI match alone returns
+        the single device for that URI.
+        """
+        out: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def _extend(devs: List[Dict[str, Any]]) -> None:
+            for d in devs:
+                if id(d) not in seen:
+                    seen.add(id(d))
+                    out.append(d)
+
+        _extend(self._by_id.get(name_or_id, []))
+        _extend(self._by_name.get(name_or_id.lower(), []))
+        uri_hit = self._by_uri.get(name_or_id)
+        if uri_hit is not None:
+            _extend([uri_hit])
+        return out
+
+    # ── Search ──────────────────────────────────────────────────────
+
+    def search(
+        self, query: str, category: str = "all", limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Multi-signal search scoring across name, tags, use_cases, genre, description."""
+        if not query:
+            return []
+
+        query_lower = query.lower()
+        query_words = query_lower.split()
+        results: List[Dict[str, Any]] = []
+
+        # Tolerant category alias set so "instrument" and "instruments"
+        # (etc.) both work — see module-level _CATEGORY_ALIASES.
+        allowed_cats = (
+            _CATEGORY_ALIASES.get(category, {category})
+            if category != "all" else None
+        )
+
+        for dev in self._devices:
+            # Category filter
+            if allowed_cats is not None and dev.get("category", "") not in allowed_cats:
+                continue
+
+            score = 0
+            dev_name = dev.get("name", "")
+            dev_name_lower = dev_name.lower()
+
+            # Name scoring. BUG-B41 fix: dropped weight dramatically
+            # (was 100 exact / 50 substring) so a device literally
+            # named "Bass" no longer blows past character-tag matches
+            # for a sonic query like "warm analog bass". An exact name
+            # match is still the strongest single signal, but a device
+            # with 2+ matching character-tags now beats a name-only
+            # accident.
+            if dev_name_lower == query_lower:
+                score += 45  # was 100
+            elif query_lower in dev_name_lower:
+                score += 20  # was 50
+            else:
+                # Partial: any query word present in name — small signal
+                for word in query_words:
+                    if len(word) >= 3 and word in dev_name_lower:
+                        score += 5
+
+            # Tag scoring — prefer enriched character_tags.
+            # BUG-B40 / B41: also read character_tags so enriched devices
+            # actually compete with name-based matches.
+            dev_tags = [
+                t.lower() for t in (
+                    dev.get("character_tags") or dev.get("tags", [])
+                )
+            ]
+            # BUG-B41: bumped to 35pts per tag so multi-tag matches beat
+            # a single substring-name match.
+            for word in query_words:
+                if word in dev_tags:
+                    score += 35
+                # Partial tag match (word appears as substring in a tag)
+                else:
+                    for tag in dev_tags:
+                        if word in tag:
+                            score += 10
+                            break
+
+            # Use case scoring: 25pts per match
+            for use_case in dev.get("use_cases", []):
+                use_lower = use_case.lower()
+                for word in query_words:
+                    if word in use_lower:
+                        score += 25
+                        break
+
+            # Genre scoring: 20pts primary, 10pts secondary.
+            # BUG-B40: also read genre_affinity (enriched field).
+            genres = dev.get("genre_affinity") or dev.get("genres", {}) or {}
+            for genre in genres.get("primary", []):
+                if query_lower in genre.lower() or genre.lower() in query_lower:
+                    score += 20
+            for genre in genres.get("secondary", []):
+                if query_lower in genre.lower() or genre.lower() in query_lower:
+                    score += 10
+
+            # Description keyword scoring: 15pts.
+            # BUG-B40: prefer sonic_description when present.
+            description = (
+                dev.get("sonic_description") or dev.get("description", "")
+            ).lower()
+            for word in query_words:
+                if len(word) >= 3 and word in description:
+                    score += 15
+
+            if score > 0:
+                results.append({"device": dev, "score": score})
+
+        # Sort by score descending, then by name for stability
+        results.sort(key=lambda r: (-r["score"], r["device"].get("name", "")))
+        return results[:limit]
+
+    # ── Suggest ─────────────────────────────────────────────────────
+
+    def suggest(
+        self,
+        intent: str,
+        genre: str = "",
+        energy: str = "medium",
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Suggest devices for an intent, returning ranked list with rationale and recipe."""
+        # Use search to find candidates
+        search_query = intent
+        if genre:
+            search_query = f"{intent} {genre}"
+        candidates = self.search(search_query, limit=limit * 2)
+
+        results = []
+        for candidate in candidates[:limit]:
+            dev = candidate["device"]
+            dev_name = dev.get("name", "")
+            dev_category = dev.get("category", "")
+            dev_tags = dev.get("tags", [])
+            dev_sweet_spot = dev.get("sweet_spot", "")
+
+            # Build rationale
+            rationale_parts = []
+            if dev_category:
+                rationale_parts.append(f"{dev_name} is a {dev_category}")
+            if dev_tags:
+                rationale_parts.append(f"suited for {', '.join(dev_tags[:3])}")
+            if genre:
+                primary_genres = dev.get("genres", {}).get("primary", [])
+                if any(genre.lower() in g.lower() for g in primary_genres):
+                    rationale_parts.append(f"commonly used in {genre}")
+            rationale = " — ".join(rationale_parts) if rationale_parts else f"{dev_name} matches your intent"
+
+            # Build recipe
+            recipe = {}
+            if dev_sweet_spot:
+                recipe["sweet_spot"] = dev_sweet_spot
+            recipe["energy"] = energy
+            key_params = dev.get("key_parameters", [])
+            if key_params:
+                recipe["start_with"] = key_params[:3]
+
+            results.append({
+                "device": dev,
+                "rationale": rationale,
+                "recipe": recipe,
+            })
+
+        return results
+
+    # ── Chain Suggest ───────────────────────────────────────────────
+
+    def chain_suggest(
+        self, role: str, genre: str = ""
+    ) -> Dict[str, Any]:
+        """Suggest a device chain for a given role (e.g., 'bass', 'lead', 'pad').
+
+        BUG-B39 fix: the old code passed category="instrument" (singular)
+        and category="effect" to self.search(), but the atlas stores
+        devices with category="instruments" / "audio_effects" (plural).
+        Every filtered search missed and the chain came back empty.
+        """
+        chain: List[Dict[str, Any]] = []
+        position = 0
+
+        # Determine chain structure based on role
+        role_lower = role.lower()
+
+        # Stage 1: Instrument (if the role implies one)
+        instrument_intents = {
+            "bass": "bass synthesizer",
+            "lead": "lead synthesizer",
+            "pad": "pad synthesizer",
+            "keys": "keyboard instrument",
+            "drums": "drum machine",
+            "vocal": "vocal",
+        }
+
+        intent = instrument_intents.get(role_lower, role_lower)
+        search_q = f"{intent} {genre}" if genre else intent
+
+        # Find instrument — atlas category is "instruments" (plural)
+        instrument_candidates = self.search(search_q, category="instruments", limit=3)
+        if instrument_candidates:
+            best = instrument_candidates[0]["device"]
+            chain.append({
+                "position": position,
+                "device": best,
+                "reason": f"Primary {role} instrument",
+            })
+            position += 1
+
+        # Stage 2: Effects — atlas category is "audio_effects"
+        effect_stages = [
+            ("eq", f"Shape the {role} tone"),
+            ("compression", f"Control {role} dynamics"),
+            ("reverb", f"Add space to {role}"),
+        ]
+
+        for effect_type, reason in effect_stages:
+            effect_q = f"{effect_type} {genre}" if genre else effect_type
+            effect_candidates = self.search(
+                effect_q, category="audio_effects", limit=2,
+            )
+            if effect_candidates:
+                best = effect_candidates[0]["device"]
+                chain.append({
+                    "position": position,
+                    "device": best,
+                    "reason": reason,
+                })
+                position += 1
+
+        return {
+            "role": role,
+            "genre": genre,
+            "chain": chain,
+        }
+
+    # ── Compare ─────────────────────────────────────────────────────
+
+    def compare(
+        self, device_a: str, device_b: str, role: str = ""
+    ) -> Dict[str, Any]:
+        """Compare two devices side-by-side with a recommendation."""
+        dev_a = self.lookup(device_a)
+        dev_b = self.lookup(device_b)
+
+        if not dev_a:
+            return {"error": f"Device not found: {device_a}"}
+        if not dev_b:
+            return {"error": f"Device not found: {device_b}"}
+
+        def _summarize(dev: Dict[str, Any]) -> Dict[str, Any]:
+            # BUG-B40 fix: enriched atlas entries use character_tags /
+            # sonic_description / genre_affinity — the old _summarize
+            # looked for "tags" / "description" / "genres" which are
+            # the UN-enriched raw scanner fields. We prefer enriched
+            # fields, fall back to raw when enrichment is absent.
+            return {
+                "name": dev.get("name", ""),
+                "category": dev.get("category", ""),
+                "tags": dev.get("character_tags") or dev.get("tags", []),
+                "genres": dev.get("genre_affinity") or dev.get("genres", {}),
+                "use_cases": dev.get("use_cases", []),
+                "description": (
+                    dev.get("sonic_description")
+                    or dev.get("description", "")
+                ),
+                "cpu_weight": dev.get("cpu_weight", "unknown"),
+                "sweet_spot": dev.get("sweet_spot", ""),
+                "enriched": dev.get("enriched", False),
+            }
+
+        summary_a = _summarize(dev_a)
+        summary_b = _summarize(dev_b)
+
+        # Recommendation logic: score each for the role.
+        # BUG-B40: scorer also reads the enriched field names.
+        score_a = 0
+        score_b = 0
+        if role:
+            role_lower = role.lower()
+            for uc in dev_a.get("use_cases", []):
+                if role_lower in uc.lower():
+                    score_a += 20
+            for uc in dev_b.get("use_cases", []):
+                if role_lower in uc.lower():
+                    score_b += 20
+            # Tag scoring — prefer character_tags (enriched)
+            a_tags = dev_a.get("character_tags") or dev_a.get("tags", [])
+            b_tags = dev_b.get("character_tags") or dev_b.get("tags", [])
+            for tag in a_tags:
+                if role_lower in tag.lower():
+                    score_a += 10
+            for tag in b_tags:
+                if role_lower in tag.lower():
+                    score_b += 10
+
+        if score_a > score_b:
+            recommendation = f"{summary_a['name']} is better suited for {role}" if role else f"{summary_a['name']} scores higher"
+        elif score_b > score_a:
+            recommendation = f"{summary_b['name']} is better suited for {role}" if role else f"{summary_b['name']} scores higher"
+        else:
+            recommendation = "Both devices are equally suited" + (f" for {role}" if role else "")
+
+        return {
+            "device_a": summary_a,
+            "device_b": summary_b,
+            "recommendation": recommendation,
+        }
+
+
+# ── Module-level lazy loader ───────────────────────────────────────
+#
+# Thread-safe via services.singletons.Singleton. The previous check-then-set
+# pattern raced under FastMCP concurrency (two handlers could both construct
+# AtlasManager) and never refreshed the in-memory index after a rebuild of
+# device_atlas.json on disk. The Singleton helper handles both.
+#
+# The ``_atlas_instance`` module attribute is preserved for backward
+# compatibility with call sites that read it directly (atlas/tools.py),
+# but new code should call ``get_atlas()`` / ``invalidate_atlas()`` instead.
+
+from pathlib import Path
+from ..services.singletons import Singleton
+
+# v1.22.0: the atlas now has TWO possible homes —
+#
+#   BUNDLED_ATLAS_PATH — mcp_server/atlas/device_atlas.json
+#     Ships with the package. Gives fresh installs a functional
+#     baseline device index before any personalized scan has run.
+#     Updated only when the repo's canonical baseline is regenerated.
+#
+#   USER_ATLAS_PATH — ~/.livepilot/atlas/device_atlas.json
+#     Written by scan_full_library on the user's machine. Reflects
+#     their actual installed packs, User Library, and plugins. Lives
+#     in the user-data directory (same convention as
+#     ~/.livepilot/memory/) so npm updates can't blow it away.
+#
+# Resolution order at load time: user atlas wins if present, else
+# bundled baseline. Written scans ALWAYS go to the user path — never
+# the bundled path — so the repo/npm package stays clean regardless of
+# where a user runs scan_full_library from. This split lands in v1.22.0
+# and solves three prior issues (see tests/test_atlas_user_override.py
+# for the full rationale).
+BUNDLED_ATLAS_PATH = Path(__file__).parent / "device_atlas.json"
+USER_ATLAS_DIR = Path.home() / ".livepilot" / "atlas"
+USER_ATLAS_PATH = USER_ATLAS_DIR / "device_atlas.json"
+
+
+def _resolve_atlas_path() -> Path:
+    """Return the effective atlas path — user if present, bundled if not.
+
+    Called from _build_atlas and get_atlas. Kept as a module-level
+    function (rather than inlined) so tests can monkeypatch HOME and
+    reimport the module to re-evaluate USER_ATLAS_PATH cleanly.
+    """
+    if USER_ATLAS_PATH.exists():
+        return USER_ATLAS_PATH
+    return BUNDLED_ATLAS_PATH
+
+
+# Backward-compat alias. External code that imported ATLAS_PATH before
+# v1.22.0 (e.g. pre-existing scripts outside this repo) gets the
+# resolved path. Internal code should call _resolve_atlas_path() so the
+# value is re-evaluated after the user first runs scan_full_library.
+ATLAS_PATH = _resolve_atlas_path()
+
+_atlas_instance: Optional[AtlasManager] = None  # kept for legacy imports
+
+
+def _build_atlas() -> AtlasManager:
+    return AtlasManager(str(_resolve_atlas_path()))
+
+
+_atlas_holder = Singleton(_build_atlas)
+
+
+def get_atlas() -> AtlasManager:
+    """Thread-safe accessor. Re-reads the resolved atlas path if its
+    mtime advanced. Uses the resolver, so if the user's first
+    scan_full_library call runs mid-session, the next get_atlas()
+    picks up the new user path (via invalidate_atlas, which
+    scan_full_library already calls on success)."""
+    global _atlas_instance
+    instance = _atlas_holder.get(reload_if_newer=_resolve_atlas_path())
+    _atlas_instance = instance   # keep legacy attribute in sync
+    return instance
+
+
+def invalidate_atlas() -> None:
+    """Force the next get_atlas() to re-read the resolved atlas path
+    from disk. Called by scan_full_library after writing a fresh
+    user atlas so subsequent tool calls see the new data without
+    an MCP server restart."""
+    global _atlas_instance
+    _atlas_holder.invalidate()
+    _atlas_instance = None
+
+
+def _load_atlas() -> AtlasManager:
+    """Legacy shim — kept so atlas/tools.py still works. Prefer get_atlas()."""
+    return get_atlas()
+
+
+# v1.23.0: re-export overlay accessor so callers can do
+# `from mcp_server.atlas import get_overlay_index` mirroring the existing
+# `from mcp_server.atlas import get_atlas` ergonomic.
+from .overlays import get_overlay_index, load_overlays  # noqa: E402, F401

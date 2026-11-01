@@ -1,0 +1,129 @@
+id: downtempo
+name: Downtempo
+type: genre
+aliases:
+  - "downtempo"
+  - "down tempo"
+  - "electronica"  # BoC-adjacent aesthetic is often called electronica
+  - "chillout"
+
+sonic_identity:
+  - 70-100 BPM slow groove
+  - hip-hop-adjacent drum programming at half-speed
+  - warm detuned analog synths
+  - atmospheric pads and field recordings
+  - degraded-tape aesthetic (BoC lineage)
+
+reach_for:
+  instruments:
+    - Drift
+    - Simpler  # vocal chops, degraded samples
+    - Electric Keyboards  # tape-warped
+    - Bass
+  effects:
+    - Echo
+    - Grain Delay
+    - Vinyl Distortion
+    - Erosion
+    - Saturator
+  packs:
+    - Chop and Swing
+    - Electric Keyboards
+    - Mood Reel
+  utilities:
+    - EQ Eight
+
+avoid:
+  - pristine samples
+  - modern drum production
+  - bright mixes
+  - fast tempos
+  - clean signal chains
+
+rhythm_idioms:
+  - slow boom-bap-adjacent beats
+  - soft hand percussion
+  - lo-fi break programming
+
+harmony_idioms:
+  - detuned analog pad chords
+  - minor-key melancholic melodic fragments
+  - child-voice or vocal-chop samples as melody
+
+arrangement_idioms:
+  - long slow reveal
+  - 4-6 minute tracks
+  - single mood sustained throughout
+
+texture_idioms:
+  - tape warmth on everything
+  - slight tuning instability
+  - nostalgic haze
+
+sample_roles:
+  - vocal_source
+  - texture_bed
+  - melodic_source
+
+key_techniques:
+  - name: "Tape-warped EP"
+    source: atlas
+    device: Electric Keyboards
+  - name: "reverse_layer"
+    source: sample-techniques.md
+  - name: "Dense grain cloud"
+    source: atlas
+    device: Vector Grain
+  - name: "micro_chop"
+    source: sample-techniques.md
+
+evaluation_bias:
+  target_dimensions:
+    depth: 0.22
+    cohesion: 0.18
+    motion: 0.14
+    groove: 0.14
+    contrast: 0.12
+    novelty: 0.10
+    clarity: 0.10
+  protect:
+    clarity: 0.55
+    cohesion: 0.72
+    low_end: 0.65
+
+move_family_bias:
+  favor:
+    - sound_design
+    - device_creation
+    - arrangement
+  deprioritize:
+    - mix
+    - performance
+
+dimensions_in_scope:
+  - timbral
+  - structural
+  - rhythmic
+  - spatial
+dimensions_deprioritized: []
+
+novelty_budget_default: 0.45
+
+tempo_hint:
+  min: 70
+  max: 100
+  time_signature: "4/4"
+
+canonical_artists:
+  - boards-of-canada
+  - burial
+  - j-dilla
+
+canonical_genres: []
+
+notes: |
+  Downtempo spans from BoC (tape-warm detuned analog) through Burial
+  (urban-decay 2-step) to Dilla's slower work. The unifying thread is
+  tempo (70-100 BPM) and degraded-aesthetic. Use the specific artist
+  packet when the user names one — this packet is the fallback when
+  only a genre term is given.

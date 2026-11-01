@@ -1,0 +1,554 @@
+"""Tests for runtime capability probes (PR-B).
+
+The probes live in ``mcp_server/runtime/tools.py`` inside
+``get_capability_state``. Before PR-B they were hardcoded
+(``web_ok = False`` / ``flucoma_ok = False``), so orchestration picked
+degraded paths on machines where these capabilities were available.
+
+These tests verify the probes actually do work — that they return True
+when the probed surface is reachable, and False (without raising) when
+it isn't.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+# ── Shared fakes ────────────────────────────────────────────────────────
+
+
+class _Ableton:
+    """Minimal ableton stand-in; answers get_session_info only."""
+
+    def send_command(self, cmd, params=None):
+        if cmd == "get_session_info":
+            return {"tempo": 120, "track_count": 0, "tracks": []}
+        return {}
+
+
+class _Ableton124(_Ableton):
+    def send_command(self, cmd, params=None):
+        if cmd == "get_session_info":
+            return {
+                "tempo": 120,
+                "track_count": 0,
+                "tracks": [],
+                "live_version": "12.4.2",
+            }
+        return {}
+
+
+def _make_ctx(spectral=None, ableton=None):
+    return SimpleNamespace(
+        lifespan_context={"ableton": ableton or _Ableton(), "spectral": spectral},
+    )
+
+
+class _Spectral:
+    def __init__(self, *, connected=True, values=None):
+        self.is_connected = connected
+        self._values = values or {}
+
+    def get(self, key):
+        value = self._values.get(key)
+        if value is None:
+            return None
+        return {"value": value}
+
+
+# ── Task B1: web probe ──────────────────────────────────────────────────
+
+
+def test_web_probe_true_when_github_reachable(monkeypatch):
+    """When the HEAD probe to api.github.com succeeds, web domain is available."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    # Force the probe to report reachable
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: True)
+
+    ctx = _make_ctx()
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert "web" in domains
+    assert domains["web"]["available"] is True
+    assert domains["web"]["mode"] == "available"
+
+
+def test_web_probe_false_on_timeout(monkeypatch):
+    """A failed/timed-out probe must resolve cleanly to False, never raise."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+
+    ctx = _make_ctx()
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert domains["web"]["available"] is False
+    assert "web_unavailable" in domains["web"]["reasons"]
+
+
+def test_web_probe_helper_swallows_exceptions(monkeypatch):
+    """The probe helper itself must swallow all network exceptions to False.
+
+    This guards against any future refactor that forgets the try/except.
+    """
+    from mcp_server.runtime import tools as runtime_tools
+
+    def _raises(*_args, **_kwargs):
+        raise OSError("simulated dns failure")
+
+    monkeypatch.setattr(runtime_tools.urllib.request, "urlopen", _raises)
+
+    assert runtime_tools._probe_web(timeout=0.01) is False
+
+
+# ── P3-7: _probe_flucoma_package must not return True for ANY existing dir ──
+
+
+def test_probe_flucoma_package_false_when_dir_exists_but_empty(monkeypatch, tmp_path):
+    """A package dir that exists but has neither package-info.json nor
+    externals/fluid.* must NOT count as "installed".
+
+    Pre-fix, the loop's final `return True` fired unconditionally for any
+    existing directory (even an empty one), so this reproduced a false
+    positive: a leftover/empty FluidCorpusManipulation folder reported
+    FluCoMa as installed.
+    """
+    from mcp_server.runtime import tools as runtime_tools
+
+    empty_dir = tmp_path / "FluidCorpusManipulation"
+    empty_dir.mkdir()
+
+    monkeypatch.setattr(runtime_tools, "_flucoma_package_dirs", lambda: [empty_dir])
+
+    assert runtime_tools._probe_flucoma_package() is False
+
+
+def test_probe_flucoma_package_true_with_package_info(monkeypatch, tmp_path):
+    from mcp_server.runtime import tools as runtime_tools
+
+    pkg_dir = tmp_path / "FluidCorpusManipulation"
+    pkg_dir.mkdir()
+    (pkg_dir / "package-info.json").write_text("{}")
+
+    monkeypatch.setattr(runtime_tools, "_flucoma_package_dirs", lambda: [pkg_dir])
+
+    assert runtime_tools._probe_flucoma_package() is True
+
+
+def test_probe_flucoma_package_true_with_externals(monkeypatch, tmp_path):
+    from mcp_server.runtime import tools as runtime_tools
+
+    pkg_dir = tmp_path / "FluidCorpusManipulation"
+    externals = pkg_dir / "externals"
+    externals.mkdir(parents=True)
+    (externals / "fluid.bufinfo.mxo").touch()
+
+    monkeypatch.setattr(runtime_tools, "_flucoma_package_dirs", lambda: [pkg_dir])
+
+    assert runtime_tools._probe_flucoma_package() is True
+
+
+def test_probe_flucoma_package_false_when_no_dirs_exist(monkeypatch, tmp_path):
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(
+        runtime_tools, "_flucoma_package_dirs",
+        lambda: [tmp_path / "does_not_exist"],
+    )
+
+    assert runtime_tools._probe_flucoma_package() is False
+
+
+# ── Task B2: flucoma probe ──────────────────────────────────────────────
+
+
+def test_flucoma_domain_present_when_streams_are_active(monkeypatch):
+    """When FluCoMa streams are active, the domain is emitted as available."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma_package", lambda: True)
+
+    ctx = _make_ctx(_Spectral(values={"spectral_shape": {"centroid": 900.0}}))
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert "flucoma" in domains, (
+        f"Expected 'flucoma' domain in capability state; got {sorted(domains)}"
+    )
+    assert domains["flucoma"]["available"] is True
+    assert domains["flucoma"]["mode"] == "available"
+    assert domains["flucoma"]["device_loaded"] is True
+    assert domains["flucoma"]["reasons"] == []
+
+
+def test_flucoma_domain_installed_but_bridge_unavailable(monkeypatch):
+    """Installed Max package should not be misreported as not installed."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma_package", lambda: True)
+
+    ctx = _make_ctx()
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert "flucoma" in domains
+    assert domains["flucoma"]["available"] is False
+    assert domains["flucoma"]["device_loaded"] is True
+    assert "flucoma_bridge_unavailable" in domains["flucoma"]["reasons"]
+    assert "flucoma_not_installed" not in domains["flucoma"]["reasons"]
+
+
+def test_flucoma_domain_unavailable_when_not_installed(monkeypatch):
+    """When the Max package is missing, the domain says not installed."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma_package", lambda: False)
+
+    ctx = _make_ctx()
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert "flucoma" in domains
+    assert domains["flucoma"]["available"] is False
+    assert domains["flucoma"]["device_loaded"] is False
+    assert "flucoma_not_installed" in domains["flucoma"]["reasons"]
+
+
+def test_flucoma_probe_streams_prove_available_even_without_package(monkeypatch):
+    """Frozen analyzers can work even when no global Max package is present."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma_package", lambda: False)
+    probe = runtime_tools._probe_flucoma(
+        _Spectral(values={"mel_bands": [0.0, 0.1, 0.2]})
+    )
+
+    assert probe["available"] is True
+    assert probe["device_loaded"] is True
+    assert probe["active_streams"] == 1
+    assert probe["reasons"] == []
+
+
+# ── P2#3 (v1.17.3) — probes must propagate through get_session_kernel ──
+#
+# Prior behavior: get_session_kernel called build_capability_state() with
+# only session/analyzer/memory arguments, so web_ok and flucoma_ok
+# defaulted to False. Meanwhile get_capability_state correctly probed
+# both and passed them through. Higher-level planners use the session
+# kernel as the orchestration entrypoint, so they stayed on degraded
+# paths even when probes would have reported available.
+
+
+def test_session_kernel_surfaces_web_probe_result(monkeypatch):
+    """monkeypatch _probe_web to return True; get_session_kernel must
+    report web as available in its capability state."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: True)
+    # Keep flucoma default (off) to isolate the web signal
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: False)
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    # v1.17.4: capability_state is flat — kernel["capability_state"]["domains"].
+    cap_state = kernel.get("capability_state")
+    assert cap_state is not None, (
+        f"kernel must expose capability_state; got kernel keys {list(kernel.keys())!r}"
+    )
+    domains = cap_state.get("domains", {})
+    assert "web" in domains, (
+        f"kernel capability state must include web domain; got {list(domains)!r}"
+    )
+    assert domains["web"]["available"] is True, (
+        f"web probe returned True, but kernel reports web unavailable; "
+        f"domains['web']={domains['web']!r}"
+    )
+
+
+def test_session_kernel_surfaces_flucoma_probe_result(monkeypatch):
+    """monkeypatch _probe_flucoma to return True; kernel must report it."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: True)
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    cap_state = kernel.get("capability_state")
+    assert cap_state is not None
+    domains = cap_state.get("domains", {})
+    assert domains.get("flucoma", {}).get("available") is True, (
+        f"flucoma probe returned True, but kernel reports unavailable; "
+        f"domains['flucoma']={domains.get('flucoma')!r}"
+    )
+
+
+def test_session_kernel_reports_both_unavailable_when_probes_false(monkeypatch):
+    """Back-compat: when both probes return False, kernel still reports
+    them correctly (unavailable)."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: False)
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    cap_state = kernel.get("capability_state")
+    assert cap_state is not None
+    domains = cap_state.get("domains", {})
+    assert domains.get("web", {}).get("available") is False
+    assert domains.get("flucoma", {}).get("available") is False
+
+
+# ── v1.17.4 — memory_ok must be probed, not hardcoded ──────────────────
+#
+# Prior behavior (v1.17.3): get_session_kernel hardcoded memory_ok=True
+# regardless of whether the memory store was actually functional. If the
+# store raised on list_techniques (disk full, corrupted index, permissions
+# error), the kernel still reported memory as available to orchestration
+# planners. Same truth-gap class as the v1.17.3 web/flucoma fix.
+# get_capability_state already probes correctly; kernel should too.
+
+
+def test_session_kernel_reports_memory_unavailable_when_store_raises(monkeypatch):
+    """When the underlying technique store raises, get_session_kernel must
+    NOT report memory as available. Previously hardcoded True — the bug."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    class _ExplodingStore:
+        def list_techniques(self, **kwargs):
+            raise RuntimeError("simulated store failure")
+
+    monkeypatch.setattr(runtime_tools, "_memory_store", _ExplodingStore())
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    cap_state = kernel.get("capability_state")
+    assert cap_state is not None
+    domains = cap_state.get("domains", {})
+    memory = domains.get("memory", {})
+    assert memory.get("available") is False, (
+        f"memory probe raised, but kernel reports memory available; "
+        f"domains['memory']={memory!r}"
+    )
+
+
+def test_session_kernel_reports_memory_available_when_store_works(monkeypatch):
+    """Back-compat: when the store works, memory.available must be True."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    class _WorkingStore:
+        def list_techniques(self, **kwargs):
+            return []  # empty list is a valid probe response
+
+    monkeypatch.setattr(runtime_tools, "_memory_store", _WorkingStore())
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    cap_state = kernel.get("capability_state")
+    assert cap_state is not None
+    domains = cap_state.get("domains", {})
+    memory = domains.get("memory", {})
+    assert memory.get("available") is True, (
+        f"memory probe succeeded, but kernel reports unavailable; "
+        f"domains['memory']={memory!r}"
+    )
+
+
+# ── v1.17.4 — flatten capability_state shape (no double-nesting) ───────
+#
+# Prior behavior: get_session_kernel passed build_capability_state(...).to_dict()
+# as-is to build_session_kernel. state.to_dict() already wraps its own
+# output in {"capability_state": {...}}, so consumers had to navigate
+# kernel["capability_state"]["capability_state"]["domains"] — ugly.
+# v1.17.3 tests worked around it with `outer.get("capability_state", outer)`.
+# Fix: pass state.to_dict()["capability_state"] so the kernel stores the
+# inner dict directly. Consumer path becomes kernel["capability_state"]["domains"].
+
+
+def test_kernel_capability_state_is_flat_not_double_nested(monkeypatch):
+    """The kernel's capability_state field must be the capability state dict
+    directly — NOT a dict wrapping another 'capability_state' key.
+
+    Old shape (broken): kernel["capability_state"]["capability_state"]["domains"]
+    New shape (fixed):  kernel["capability_state"]["domains"]
+    """
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: False)
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    cap_state = kernel["capability_state"]
+    # The flat shape MUST expose domains + overall_mode at this level
+    assert "domains" in cap_state, (
+        f"kernel['capability_state'] must contain 'domains' directly; "
+        f"got keys {list(cap_state.keys())!r}"
+    )
+    assert "overall_mode" in cap_state, (
+        f"kernel['capability_state'] must contain 'overall_mode' directly; "
+        f"got keys {list(cap_state.keys())!r}"
+    )
+    # And MUST NOT have a nested 'capability_state' key (the old broken shape)
+    assert "capability_state" not in cap_state, (
+        f"kernel['capability_state'] must not double-wrap 'capability_state' "
+        f"key; found keys {list(cap_state.keys())!r}. Old shape was "
+        f"kernel['capability_state']['capability_state']['domains'] — we "
+        f"want the inner dict at kernel['capability_state'] directly."
+    )
+
+
+def test_kernel_flat_shape_preserves_domain_access():
+    """End-to-end: with the flat shape, planners access
+    kernel['capability_state']['domains']['session_access'] directly
+    without any outer-wrapper hop."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    ctx = _make_ctx()
+    kernel = runtime_tools.get_session_kernel(ctx)
+
+    # Direct access without any defensive fallback
+    cap_state = kernel["capability_state"]
+    domains = cap_state["domains"]
+    session = domains["session_access"]
+
+    assert session["available"] is True  # _Ableton returns a valid session_info
+    assert session["name"] == "session_access"
+
+
+# ── v1.27.0 — Live 12.4 probe-first capability surfaces ────────────────
+
+
+def test_probe_link_audio_reports_manual_only_without_routing_evidence(monkeypatch):
+    """The public probe can succeed while still refusing to claim routing support."""
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_link_audio_surface",
+        lambda ableton, session_info=None: {
+            "mode": "manual_only",
+            "available": False,
+            "reasons": ["link_audio_not_exposed"],
+            "observed": {"peers_visible": False, "inputs_visible": False},
+        },
+    )
+
+    result = runtime_tools.probe_link_audio(_make_ctx(ableton=_Ableton124()))
+
+    assert result["ok"] is True
+    assert result["live_version"] == "12.4.2"
+    assert result["mode"] == "manual_only"
+    assert result["available"] is False
+    assert "link_audio_not_exposed" in result["reasons"]
+    assert result["observed"]["peers_visible"] is False
+
+
+def test_probe_stem_workflow_reports_callable_when_probe_finds_command(monkeypatch):
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_stem_workflow_surface",
+        lambda ableton, session_info=None: {
+            "mode": "callable",
+            "available": True,
+            "reasons": [],
+            "observed": {"callable_paths": ["selected_time_context_command"]},
+        },
+    )
+
+    result = runtime_tools.probe_stem_workflow(_make_ctx(ableton=_Ableton124()))
+
+    assert result["ok"] is True
+    assert result["live_version"] == "12.4.2"
+    assert result["mode"] == "callable"
+    assert result["available"] is True
+    assert result["observed"]["callable_paths"] == ["selected_time_context_command"]
+
+
+def test_capability_state_surfaces_link_and_stem_probe_modes(monkeypatch):
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: False)
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_link_audio_surface",
+        lambda ableton, session_info=None: {
+            "mode": "routable",
+            "available": True,
+            "reasons": [],
+            "observed": {"peers_visible": True, "inputs_visible": True},
+        },
+    )
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_stem_workflow_surface",
+        lambda ableton, session_info=None: {
+            "mode": "manual_only",
+            "available": False,
+            "reasons": ["stem_command_not_observable"],
+            "observed": {"callable_paths": []},
+        },
+    )
+
+    ctx = _make_ctx(ableton=_Ableton124())
+    result = runtime_tools.get_capability_state(ctx)
+
+    domains = result["capability_state"]["domains"]
+    assert domains["link_audio"]["mode"] == "routable"
+    assert domains["link_audio"]["available"] is True
+    assert domains["stem_workflow"]["mode"] == "manual_only"
+    assert domains["stem_workflow"]["available"] is False
+    assert "stem_command_not_observable" in domains["stem_workflow"]["reasons"]
+
+
+def test_session_kernel_surfaces_operation_profile_and_probe_domains(monkeypatch):
+    from mcp_server.runtime import tools as runtime_tools
+
+    monkeypatch.setattr(runtime_tools, "_probe_web", lambda timeout=0.5: False)
+    monkeypatch.setattr(runtime_tools, "_probe_flucoma", lambda spectral=None: False)
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_link_audio_surface",
+        lambda ableton, session_info=None: {
+            "mode": "manual_only",
+            "available": False,
+            "reasons": ["link_audio_not_exposed"],
+        },
+    )
+    monkeypatch.setattr(
+        runtime_tools,
+        "_probe_stem_workflow_surface",
+        lambda ableton, session_info=None: {
+            "mode": "manual_only",
+            "available": False,
+            "reasons": ["stem_workflow_unprobed"],
+        },
+    )
+
+    kernel = runtime_tools.get_session_kernel(
+        _make_ctx(ableton=_Ableton124()),
+        operation_profile="sound_design_deep",
+    )
+
+    assert kernel["operation_profile"] == "sound_design_deep"
+    domains = kernel["capability_state"]["domains"]
+    assert domains["link_audio"]["mode"] == "manual_only"
+    assert domains["stem_workflow"]["mode"] == "manual_only"

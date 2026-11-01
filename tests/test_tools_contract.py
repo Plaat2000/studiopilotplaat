@@ -1,0 +1,1033 @@
+"""Verify all 472 MCP tools are registered (v1.28: +2 listening, +3 taste head)."""
+
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _get_tool_names():
+    from mcp_server.server import mcp
+    tools = asyncio.run(mcp.list_tools())
+    return {tool.name for tool in tools}
+
+
+def test_transport_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_session_info",
+        "set_tempo",
+        "set_time_signature",
+        "start_playback",
+        "stop_playback",
+        "continue_playback",
+        "toggle_metronome",
+        "set_session_loop",
+        "undo",
+        "redo",
+        "get_recent_actions",
+        "get_session_diagnostics",
+    }
+    missing = expected - names
+    assert not missing, f"Missing transport tools: {missing}"
+
+
+def test_tracks_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_track_info",
+        "create_midi_track",
+        "create_audio_track",
+        "create_return_track",
+        "delete_track",
+        "duplicate_track",
+        "set_track_name",
+        "set_track_color",
+        "set_track_mute",
+        "set_track_solo",
+        "set_track_arm",
+        "stop_track_clips",
+        "set_group_fold",
+        "set_track_input_monitoring",
+        # Freeze/flatten
+        "freeze_track",
+        "flatten_track",
+        "get_freeze_status",
+    }
+    missing = expected - names
+    assert not missing, f"Missing tracks tools: {missing}"
+
+
+def test_clips_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_clip_info",
+        "create_clip",
+        "delete_clip",
+        "duplicate_clip",
+        "fire_clip",
+        "stop_clip",
+        "set_clip_name",
+        "set_clip_color",
+        "set_clip_loop",
+        "set_clip_launch",
+        "set_clip_warp_mode",
+        "set_clip_pitch",
+    }
+    missing = expected - names
+    assert not missing, f"Missing clips tools: {missing}"
+
+
+def test_notes_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "add_notes",
+        "get_notes",
+        "remove_notes",
+        "remove_notes_by_id",
+        "modify_notes",
+        "duplicate_notes",
+        "transpose_notes",
+        "quantize_clip",
+    }
+    missing = expected - names
+    assert not missing, f"Missing notes tools: {missing}"
+
+
+def test_devices_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_device_info",
+        "get_device_parameters",
+        "set_device_parameter",
+        "batch_set_parameters",
+        "toggle_device",
+        "delete_device",
+        "load_device_by_uri",
+        "find_and_load_device",
+        "set_simpler_playback_mode",
+        "get_rack_chains",
+        "set_chain_volume",
+        "get_device_presets",
+        # Plugin deep control (M4L)
+        "get_plugin_parameters",
+        "map_plugin_parameter",
+        "get_plugin_presets",
+        # 12.3+ device insertion and drum rack construction
+        "insert_device",
+        "insert_rack_chain",
+        "set_drum_chain_note",
+    }
+    missing = expected - names
+    assert not missing, f"Missing devices tools: {missing}"
+
+
+def test_scenes_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_scenes_info",
+        "create_scene",
+        "delete_scene",
+        "duplicate_scene",
+        "fire_scene",
+        "set_scene_name",
+        "set_scene_color",
+        "set_scene_tempo",
+        # Scene matrix operations
+        "get_scene_matrix",
+        "fire_scene_clips",
+        "stop_all_clips",
+        "get_playing_clips",
+    }
+    missing = expected - names
+    assert not missing, f"Missing scenes tools: {missing}"
+
+
+def test_mixing_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "set_track_volume",
+        "set_track_pan",
+        "set_track_send",
+        "get_return_tracks",
+        "get_master_track",
+        "set_master_volume",
+        "get_track_routing",
+        "set_track_routing",
+        "get_track_meters",
+        "get_master_meters",
+        "get_mix_snapshot",
+    }
+    missing = expected - names
+    assert not missing, f"Missing mixing tools: {missing}"
+
+
+def test_browser_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_browser_tree",
+        "get_browser_items",
+        "search_browser",
+        "load_browser_item",
+    }
+    missing = expected - names
+    assert not missing, f"Missing browser tools: {missing}"
+
+
+def test_arrangement_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_arrangement_clips",
+        "create_arrangement_clip",
+        "add_arrangement_notes",
+        "get_arrangement_notes",
+        "remove_arrangement_notes",
+        "remove_arrangement_notes_by_id",
+        "modify_arrangement_notes",
+        "duplicate_arrangement_notes",
+        "transpose_arrangement_notes",
+        "set_arrangement_clip_name",
+        "set_arrangement_automation",
+        "back_to_arranger",
+        "jump_to_time",
+        "capture_midi",
+        "start_recording",
+        "stop_recording",
+        "get_cue_points",
+        "jump_to_cue",
+        "toggle_cue_point",
+        "set_cue_point_name",
+        "create_cue_point",
+        # 12.1.10+ native arrangement clips
+        "create_native_arrangement_clip",
+    }
+    missing = expected - names
+    assert not missing, f"Missing arrangement tools: {missing}"
+
+
+def test_memory_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "memory_learn",
+        "memory_recall",
+        "memory_get",
+        "memory_replay",
+        "memory_list",
+        "memory_favorite",
+        "memory_update",
+        "memory_delete",
+    }
+    missing = expected - names
+    assert not missing, f"Missing memory tools: {missing}"
+
+
+def test_analyzer_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_master_spectrum",
+        "get_master_rms",
+        "get_detected_key",
+        "get_hidden_parameters",
+        "get_automation_state",
+        "walk_device_tree",
+        # Phase 2: Sample Operations
+        "get_clip_file_path",
+        "replace_simpler_sample",
+        "get_simpler_slices",
+        "crop_simpler",
+        "reverse_simpler",
+        "warp_simpler",
+        # Phase 2: Warp Markers
+        "get_warp_markers",
+        "add_warp_marker",
+        "move_warp_marker",
+        "remove_warp_marker",
+        # Phase 2: Clip & Display
+        "scrub_clip",
+        "stop_scrub",
+        "get_display_values",
+        # Phase 3: Capture
+        "capture_audio",
+        "capture_stop",
+        # Phase 4: FluCoMa Real-Time
+        "get_spectral_shape",
+        "get_mel_spectrum",
+        "get_chroma",
+        "get_onsets",
+        "get_novelty",
+        "get_momentary_loudness",
+        "check_flucoma",
+        "load_sample_to_simpler",
+        # BUG-A2 / A3: deep-LOM properties via M4L bridge
+        "simpler_set_warp",
+        "compressor_set_sidechain",
+    }
+    missing = expected - names
+    assert not missing, f"Missing analyzer tools: {missing}"
+
+
+def test_automation_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_clip_automation",
+        "set_clip_automation",
+        "clear_clip_automation",
+        "apply_automation_shape",
+        "apply_automation_recipe",
+        "get_automation_recipes",
+        "generate_automation_curve",
+        "analyze_for_automation",
+    }
+    missing = expected - names
+    assert not missing, f"Missing automation tools: {missing}"
+
+
+def test_theory_tools_registered():
+    from mcp_server.server import mcp
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    expected = {
+        'analyze_harmony', 'suggest_next_chord', 'detect_theory_issues',
+        'identify_scale', 'harmonize_melody', 'generate_countermelody',
+        'transpose_smart',
+    }
+    missing = expected - names
+    assert not missing, f"Missing theory tools: {missing}"
+
+
+def test_agent_os_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "compile_goal_vector",
+        "build_world_model",
+        "evaluate_move",
+        "analyze_outcomes",
+        "get_technique_card",
+    }
+    missing = expected - names
+    assert not missing, f"Missing agent_os tools: {missing}"
+
+
+def test_composition_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_composition",
+        "get_section_graph",
+        "get_phrase_grid",
+        "plan_gesture",
+        "evaluate_composition_move",
+        "get_harmony_field",
+        "get_transition_analysis",
+        "apply_gesture_template",
+        "get_section_outcomes",
+    }
+    missing = expected - names
+    assert not missing, f"Missing composition tools: {missing}"
+
+
+def test_motif_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_motif_graph",
+        "transform_motif",
+    }
+    missing = expected - names
+    assert not missing, f"Missing motif tools: {missing}"
+
+
+def test_research_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "research_technique",
+        "get_emotional_arc",
+        "get_style_tactics",
+    }
+    missing = expected - names
+    assert not missing, f"Missing research tools: {missing}"
+
+
+def test_planner_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "plan_arrangement",
+        "transform_section",
+    }
+    missing = expected - names
+    assert not missing, f"Missing planner tools: {missing}"
+
+
+def test_project_brain_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "build_project_brain",
+        "get_project_brain_summary",
+    }
+    missing = expected - names
+    assert not missing, f"Missing project_brain tools: {missing}"
+
+
+def test_capability_state_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_capability_state",
+    }
+    missing = expected - names
+    assert not missing, f"Missing capability_state tools: {missing}"
+
+
+def test_action_ledger_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_action_ledger_summary",
+        "get_last_move",
+    }
+    missing = expected - names
+    assert not missing, f"Missing action_ledger tools: {missing}"
+
+
+def test_agent_os_taste_tool_registered():
+    names = _get_tool_names()
+    assert "get_taste_profile" in names, "Missing get_taste_profile tool"
+
+
+def test_evaluation_fabric_tools_registered():
+    names = _get_tool_names()
+    assert "evaluate_with_fabric" in names, "Missing evaluate_with_fabric tool"
+
+
+def test_memory_fabric_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_anti_preferences",
+        "record_anti_preference",
+        "get_promotion_candidates",
+    }
+    missing = expected - names
+    assert not missing, f"Missing memory_fabric tools: {missing}"
+
+
+def test_mix_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_mix",
+        "get_mix_issues",
+        "plan_mix_move",
+        "evaluate_mix_move",
+        "get_masking_report",
+        "get_mix_summary",
+    }
+    missing = expected - names
+    assert not missing, f"Missing mix_engine tools: {missing}"
+
+
+def test_sound_design_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_sound_design",
+        "get_sound_design_issues",
+        "plan_sound_design_move",
+        "get_patch_model",
+    }
+    missing = expected - names
+    assert not missing, f"Missing sound_design tools: {missing}"
+
+
+def test_transition_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_transition",
+        "plan_transition",
+        "score_transition",
+    }
+    missing = expected - names
+    assert not missing, f"Missing transition_engine tools: {missing}"
+
+
+def test_reference_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "build_reference_profile",
+        "analyze_reference_gaps",
+        "plan_reference_moves",
+    }
+    missing = expected - names
+    assert not missing, f"Missing reference_engine tools: {missing}"
+
+
+def test_translation_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "check_translation",
+        "get_translation_issues",
+    }
+    missing = expected - names
+    assert not missing, f"Missing translation_engine tools: {missing}"
+
+
+def test_performance_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_performance_state",
+        "get_performance_safe_moves",
+        "plan_scene_handoff",
+    }
+    missing = expected - names
+    assert not missing, f"Missing performance_engine tools: {missing}"
+
+
+def test_safety_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "check_safety",
+    }
+    missing = expected - names
+    assert not missing, f"Missing safety tools: {missing}"
+
+
+def test_scales_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_song_scale",
+        "set_song_scale",
+        "set_song_scale_mode",
+        "list_available_scales",
+    }
+    missing = expected - names
+    assert not missing, f"Missing scales tools: {missing}"
+
+
+def test_clip_scales_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_clip_scale",
+        "set_clip_scale",
+        "set_clip_scale_mode",
+    }
+    missing = expected - names
+    assert not missing, f"Missing clip scale tools: {missing}"
+
+
+def test_tuning_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_tuning_system",
+        "set_tuning_reference_pitch",
+        "set_tuning_note",
+        "reset_tuning_system",
+    }
+    missing = expected - names
+    assert not missing, f"Missing tuning tools: {missing}"
+
+
+def test_follow_actions_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_clip_follow_action",
+        "set_clip_follow_action",
+        "clear_clip_follow_action",
+        "list_follow_action_types",
+        "apply_follow_action_preset",
+        "get_scene_follow_action",
+        "set_scene_follow_action",
+        "clear_scene_follow_action",
+    }
+    missing = expected - names
+    assert not missing, f"Missing follow action tools: {missing}"
+
+
+def test_grooves_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "list_grooves",
+        "get_groove_info",
+        "set_groove_params",
+        "assign_clip_groove",
+        "get_clip_groove",
+        "get_song_groove_amount",
+        "set_song_groove_amount",
+    }
+    missing = expected - names
+    assert not missing, f"Missing groove tools: {missing}"
+
+
+def test_take_lanes_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_take_lanes",
+        "create_take_lane",
+        "set_take_lane_name",
+        "create_audio_clip_on_take_lane",
+        "create_midi_clip_on_take_lane",
+        "get_take_lane_clips",
+    }
+    missing = expected - names
+    assert not missing, f"Missing take lane tools: {missing}"
+
+
+def test_rack_variations_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_rack_variations",
+        "store_rack_variation",
+        "recall_rack_variation",
+        "delete_rack_variation",
+        "randomize_rack_macros",
+        "add_rack_macro",
+        "remove_rack_macro",
+        "set_rack_visible_macros",
+    }
+    missing = expected - names
+    assert not missing, f"Missing rack variation tools: {missing}"
+
+
+def test_simpler_slice_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "insert_simpler_slice",
+        "move_simpler_slice",
+        "remove_simpler_slice",
+        "clear_simpler_slices",
+        "reset_simpler_slices",
+        "import_slices_from_onsets",
+    }
+    missing = expected - names
+    assert not missing, f"Missing simpler slice tools: {missing}"
+
+
+def test_wavetable_mod_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_wavetable_mod_targets",
+        "add_wavetable_mod_route",
+        "set_wavetable_mod_amount",
+        "get_wavetable_mod_amount",
+        "get_wavetable_mod_matrix",
+    }
+    missing = expected - names
+    assert not missing, f"Missing wavetable mod tools: {missing}"
+
+
+def test_device_ab_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_device_ab_state",
+        "toggle_device_ab",
+        "copy_device_state",
+    }
+    missing = expected - names
+    assert not missing, f"Missing device A/B compare tools: {missing}"
+
+
+def test_control_surfaces_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "list_control_surfaces",
+        "get_control_surface_info",
+        "reload_handlers",
+    }
+    missing = expected - names
+    assert not missing, f"Missing ControlSurface diagnostic tools: {missing}"
+
+
+def test_total_tool_count():
+    from mcp_server.server import mcp
+    tools = asyncio.run(mcp.list_tools())
+    assert len(tools) == 474, f"Expected 474 tools, got {len(tools)}"
+
+
+def test_listening_tools_registered():
+    """v1.28: Listening Engine — offline perceptual analysis of captures."""
+    names = _get_tool_names()
+    expected = {"listen_capture", "listen_ab"}
+    missing = expected - names
+    assert not missing, f"Missing listening tools: {missing}"
+
+
+def test_taste_head_tools_registered():
+    """v1.28: learned taste head — pairwise preferences over CLAP embeddings."""
+    names = _get_tool_names()
+    expected = {"taste_record_pair", "taste_train", "taste_rank"}
+    missing = expected - names
+    assert not missing, f"Missing taste head tools: {missing}"
+
+
+def test_grader_tools_registered():
+    """Phase 2c: grader tools wrapping the rubric framework."""
+    names = _get_tool_names()
+    expected = {"grader_list_rubrics", "grader_evaluate", "grader_evaluate_all"}
+    missing = expected - names
+    assert not missing, f"Missing grader tools: {missing}"
+
+
+def test_audit_tools_registered():
+    """audit_layer aggregates the 8 §5 layer-precision checks into one call."""
+    names = _get_tool_names()
+    expected = {"audit_layer"}
+    missing = expected - names
+    assert not missing, f"Missing audit tools: {missing}"
+
+
+def test_compose_fast_apply_registered():
+    """compose_fast_apply is the Phase-3 of the LLM-creative fast mode
+    (added 2026-05-01 redesign). Together with compose(mode="fast")
+    forming the brief→design→apply two-phase flow."""
+    names = _get_tool_names()
+    expected = {"compose_fast_apply"}
+    missing = expected - names
+    assert not missing, f"Missing compose_fast_apply tool: {missing}"
+
+
+def test_compose_full_apply_registered():
+    """compose_full_apply walks a full-mode plan server-side with
+    $from_step resolution + pre-flight (analyzer + cleanup) + post-flight
+    (leftover default-track cleanup). Eliminates the 60-step manual walk
+    the agent had to do previously (added 2026-05-01)."""
+    names = _get_tool_names()
+    expected = {"compose_full_apply"}
+    missing = expected - names
+    assert not missing, f"Missing compose_full_apply tool: {missing}"
+
+
+def test_consult_ableton_knowledge_registered():
+    """consult_ableton_knowledge is the Tier-3 Ableton Knowledge consultation
+    tool (added 2026-05-01 alongside Tier-1 technique attribution + Tier-2
+    reference-artist mode). Returns a structured search plan + synthesis
+    template the agent fires against the Ableton Knowledge MCP tools."""
+    names = _get_tool_names()
+    expected = {"consult_ableton_knowledge"}
+    missing = expected - names
+    assert not missing, f"Missing consult_ableton_knowledge tool: {missing}"
+
+
+def test_synthesis_brain_tools_registered():
+    """PR5/v2 adds 3 dedicated MCP wrappers on the synthesis_brain subsystem."""
+    names = _get_tool_names()
+    expected = {
+        "analyze_synth_patch",
+        "propose_synth_branches",
+        "extract_timbre_fingerprint",
+    }
+    missing = expected - names
+    assert not missing, f"Missing synthesis_brain tools: {missing}"
+
+
+def test_composer_branch_tool_registered():
+    """PR5/v2 adds propose_composer_branches alongside the existing 3 composer tools."""
+    names = _get_tool_names()
+    assert "propose_composer_branches" in names
+
+
+def test_miditool_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "install_miditool_device",
+        "set_miditool_target",
+        "get_miditool_context",
+        "list_miditool_generators",
+    }
+    missing = expected - names
+    assert not missing, f"Missing MIDI Tool tools: {missing}"
+
+
+def test_song_track_primitives_registered():
+    names = _get_tool_names()
+    expected = {
+        # Song / Transport primitives (9)
+        "tap_tempo",
+        "nudge_tempo",
+        "set_exclusive_arm",
+        "set_exclusive_solo",
+        "capture_and_insert_scene",
+        "set_count_in_duration",
+        "get_link_state",
+        "set_link_enabled",
+        "force_link_beat_time",
+        # Track primitives (3)
+        "jump_in_session_clip",
+        "get_track_performance_impact",
+        "get_appointed_device",
+    }
+    missing = expected - names
+    assert not missing, f"Missing Song/Track primitives tools: {missing}"
+
+
+def test_every_tool_has_description_and_schema():
+    """Every registered tool must have a non-empty description and a schema.
+
+    Previously the contract test only counted tool names. A tool with an
+    empty docstring or null parameters schema would pass — but the FastMCP
+    tool description is what the LLM reads to decide when to call the tool,
+    so empty/duplicate descriptions quietly degrade every agent session.
+    """
+    from mcp_server.server import mcp
+    tools = asyncio.run(mcp.list_tools())
+    offenders = []
+    for t in tools:
+        desc = (t.description or "").strip()
+        if len(desc) < 20:
+            offenders.append(f"{t.name}: description too short ({len(desc)} chars)")
+        if t.parameters is None:
+            offenders.append(f"{t.name}: no parameters schema")
+    # Keep the count so this test is easy to read when it fails.
+    assert not offenders, (
+        f"{len(offenders)} tool(s) fail minimum contract:\n  "
+        + "\n  ".join(offenders[:25])
+        + (f"\n  ...+{len(offenders)-25} more" if len(offenders) > 25 else "")
+    )
+
+
+def test_sample_engine_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_sample",
+        "evaluate_sample_fit",
+        "search_samples",
+        "suggest_sample_technique",
+        "plan_sample_workflow",
+        "get_sample_opportunities",
+        # v1.10.5 Splice online catalog tools
+        "get_splice_credits",
+        "splice_catalog_hunt",
+        "splice_download_sample",
+    }
+    missing = expected - names
+    assert not missing, f"Missing sample engine tools: {missing}"
+
+
+def test_perception_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "analyze_loudness",
+        "analyze_spectrum_offline",
+        "compare_to_reference",
+        "read_audio_metadata",
+    }
+    missing = expected - names
+    assert not missing, f"Missing perception tools: {missing}"
+
+
+def test_generative_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "generate_euclidean_rhythm",
+        "layer_euclidean_rhythms",
+        "generate_tintinnabuli",
+        "generate_phase_shift",
+        "generate_additive_process",
+    }
+    missing = expected - names
+    assert not missing, f"Missing generative tools: {missing}"
+
+
+def test_harmony_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "navigate_tonnetz",
+        "find_voice_leading_path",
+        "classify_progression",
+        "suggest_chromatic_mediants",
+    }
+    missing = expected - names
+    assert not missing, f"Missing harmony tools: {missing}"
+
+
+def test_midi_io_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "export_clip_midi",
+        "import_midi_to_clip",
+        "analyze_midi_file",
+        "extract_piano_roll",
+    }
+    missing = expected - names
+    assert not missing, f"Missing MIDI I/O tools: {missing}"
+
+
+# ── V2 Domain Contract Tests ────────────────────────────────────────
+
+
+def test_semantic_move_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "list_semantic_moves",
+        "preview_semantic_move",
+        "propose_next_best_move",
+        "apply_semantic_move",
+    }
+    missing = expected - names
+    assert not missing, f"Missing semantic move tools: {missing}"
+
+
+def test_experiment_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "create_experiment",
+        "run_experiment",
+        "compare_experiments",
+        "commit_experiment",
+        "discard_experiment",
+        "iterate_toward_goal",
+    }
+    missing = expected - names
+    assert not missing, f"Missing experiment tools: {missing}"
+
+
+def test_musical_intelligence_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "detect_repetition_fatigue",
+        "detect_role_conflicts",
+        "infer_section_purposes",
+        "score_emotional_arc",
+        "analyze_phrase_arc",
+        "compare_phrase_renders",
+    }
+    missing = expected - names
+    assert not missing, f"Missing musical intelligence tools: {missing}"
+
+
+def test_reference_engine_v2_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "build_reference_profile",
+        "analyze_reference_gaps",
+        "plan_reference_moves",
+    }
+    missing = expected - names
+    assert not missing, f"Missing reference engine tools: {missing}"
+
+
+def test_session_kernel_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_session_kernel",
+        "get_capability_state",
+        "probe_link_audio",
+        "probe_stem_workflow",
+    }
+    missing = expected - names
+    assert not missing, f"Missing session kernel tools: {missing}"
+
+
+def test_taste_graph_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_taste_graph",
+        "explain_taste_inference",
+        "rank_moves_by_taste",
+        "record_positive_preference",
+    }
+    missing = expected - names
+    assert not missing, f"Missing taste graph tools: {missing}"
+
+
+# ── Stage 2: The Magic Layer ──────────────────────────────────────
+
+
+def test_song_brain_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "build_song_brain",
+        "explain_song_identity",
+        "detect_identity_drift",
+    }
+    missing = expected - names
+    assert not missing, f"Missing song brain tools: {missing}"
+
+
+def test_preview_studio_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "create_preview_set",
+        "compare_preview_variants",
+        "commit_preview_variant",
+        "discard_preview_set",
+        "render_preview_variant",
+    }
+    missing = expected - names
+    assert not missing, f"Missing preview studio tools: {missing}"
+
+
+def test_hook_hunter_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "find_primary_hook",
+        "rank_hook_candidates",
+        "develop_hook",
+        "measure_hook_salience",
+        "score_phrase_impact",
+        "detect_payoff_failure",
+        "suggest_payoff_repair",
+        "detect_hook_neglect",
+        "compare_phrase_impact",
+    }
+    missing = expected - names
+    assert not missing, f"Missing hook hunter tools: {missing}"
+
+
+def test_stuckness_detector_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "detect_stuckness",
+        "suggest_momentum_rescue",
+        "start_rescue_workflow",
+    }
+    missing = expected - names
+    assert not missing, f"Missing stuckness detector tools: {missing}"
+
+
+def test_wonder_mode_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "enter_wonder_mode",
+        "rank_wonder_variants",
+    }
+    missing = expected - names
+    assert not missing, f"Missing wonder mode tools: {missing}"
+
+
+def test_session_continuity_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "get_session_story",
+        "resume_last_intent",
+        "record_turn_resolution",
+        "rank_by_taste_and_identity",
+        "list_open_creative_threads",
+        "explain_preference_vs_identity",
+        "open_creative_thread",
+    }
+    missing = expected - names
+    assert not missing, f"Missing session continuity tools: {missing}"
+
+
+def test_creative_constraints_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "apply_creative_constraint_set",
+        "distill_reference_principles",
+        "map_reference_principles_to_song",
+        "generate_constrained_variants",
+        "generate_reference_inspired_variants",
+    }
+    missing = expected - names
+    assert not missing, f"Missing creative constraints tools: {missing}"
+
+
+def test_atlas_tools_registered():
+    names = _get_tool_names()
+    expected = {
+        "atlas_search",
+        "atlas_device_info",
+        "atlas_suggest",
+        "atlas_chain_suggest",
+        "atlas_compare",
+        "scan_full_library",
+        # v1.25 hybrid knowledge surface
+        "atlas_explore",
+        "atlas_audition",
+        "atlas_substitute",
+    }
+    missing = expected - names
+    assert not missing, f"Missing atlas tools: {missing}"

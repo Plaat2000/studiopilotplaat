@@ -1,0 +1,53 @@
+id: snipper
+name: Snipper
+sonic_description: >
+  Audio snippet replayer with pitch modulation (Building Max Devices
+  tutorial pack). Re-plays snippets of incoming audio at modulated
+  pitches. Small tool, surprisingly aesthetic-critical for microhouse —
+  the 'replay this hat with a slightly different pitch each bar' pattern.
+category: audio_rearranger
+character_tags: [replay, pitched, micro_chop, glitch]
+use_cases: [micro_chop, pitched_replay, vocal_stutter]
+genre_affinity:
+  primary: [microhouse, deep_minimal, glitch]
+  secondary: [idm]
+complexity: intermediate
+introduced_in: "11.0"
+pack: Building Max Devices
+creator: Ableton
+class_name: PluginDevice
+
+key_parameters:
+  - name: "Snippet Length"
+    description: "Duration of the captured snippet."
+  - name: "Replay Rate"
+    description: "How often the snippet re-triggers."
+  - name: "Pitch Modulation"
+    description: "Per-replay pitch shift."
+  - name: "Randomize"
+    description: "Random variation on pitch/replay timing."
+
+signature_techniques:
+  - name: "Vocal micro-chop"
+    description: "Route vocal → Snipper → short snippet, fast replay, pitch mod → instant Akufen-adjacent micro-vocal pattern."
+    aesthetic: [microhouse]
+  - name: "Hat replay pitch drift"
+    description: "Closed hat → Snipper with tiny snippet length, pitch mod ±3 semitones, randomize on → every hat is pitched differently. Microhouse signature."
+    aesthetic: [microhouse, deep_minimal]
+
+pairs_well_with:
+  - device: "Convolution Reverb"
+    reason: "Short reverb IR tail on the snipper output blurs the micro-chop into a texture instead of pointillistic hits"
+  - device: "PitchLoop89"
+    reason: "Stack Snipper into PitchLoop89 for dual-pitch staggered micro-chops — the Henke-style signature"
+  - device: "Gate"
+    reason: "Gate after Snipper to carve silence between snippets for rhythmic precision"
+
+gotchas:
+  - "Snipper's snippet window can end up shorter than audible grain — at very short lengths it becomes comb-filter territory, not chopping"
+  - "Randomize at max with long snippets sounds chaotic rather than musical — pair random intensity with snippet length"
+  - "It's an M4L device — first-hit audio buffers aren't pre-filled. Expect silence for the first bar on a fresh load"
+  - "Not automatable from MCP beyond the top-level parameters — internal state is private to the Max patcher"
+
+learn_more:
+  pack: "Building Max Devices"

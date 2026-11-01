@@ -1,0 +1,5874 @@
+# Changelog
+
+## Unreleased
+
+### Changed — dependencies
+- `fastmcp` moves to the 4.0 line (`>=4.0.3,<4.1.0`). The private tool
+  registry `_get_all_tools()` reads (`_local_provider._components`) is
+  unchanged in 4.0.3, so all 474 tools still register and pass the startup
+  self-test.
+- Floor bumps: `scipy>=1.18.1`, `grpcio>=1.83.1`, `protobuf>=7.36.1`. The
+  NumPy floor stays at 2.3 by design; the existing `<2.6` cap already admits
+  2.5.3.
+
+### Added — troubleshooting
+- Windows: a Claude Desktop MSIX install can leave the extension unable to
+  start because the extensions folder is virtualized. The manual now lists the
+  one-line workaround.
+
+### Fixed — optional list/dict arguments rejected an explicit null
+- Eight optional arguments were annotated `list = None` / `dict = None`:
+  `atlas_macro_fingerprint.pack_filter`, `atlas_demo_story.focus_tracks`,
+  `atlas_cross_pack_chain.customize_aesthetic`,
+  `corpus_add_source.exclude_globs`, `corpus_detect_plugins.formats`,
+  `corpus_canonicalize_plugins.skip_vendors` / `skip_name_prefixes` and
+  `corpus_emit_synthesis_briefs.plugin_ids`. The schema advertised
+  `"default": null` on an array/object-only type, so a client sending that
+  default explicitly got a validation error before the tool ran. They are now
+  `list | None` / `dict | None`; `tests/test_tool_schemas_nullable.py` checks
+  every tool for this.
+
+### Fixed — per-clip scale tools failed with an opaque AttributeError
+- `get_clip_scale`, `set_clip_scale` and `set_clip_scale_mode` assumed Live
+  publishes per-clip scale (`Clip.root_note` / `scale_name` / `scale_mode`)
+  alongside the song-level scale API. It does not — verified on Live 12.4.5,
+  where a MIDI clip's `dir()` contains no scale attribute of any kind. Every
+  call died with `'Clip' object has no attribute 'root_note'`, which gave no
+  hint that the capability was absent or that the song-level tools work fine.
+  They now raise a clear error naming the Live version and pointing at
+  `get_song_scale` / `set_song_scale` / `set_song_scale_mode`.
+- The version gate could not have caught this: `has_feature("song_scale_api")`
+  is a comparison against 12.0 that gates the *Song* scale API, a different
+  capability. The handlers now probe the object instead of trusting the
+  version, and stay transparent if a future Live does publish per-clip scale.
+### Fixed — Claude Desktop extension never completed the handshake
+- The Node entry point spawned the Python server with `stdio: "inherit"`. Claude
+  Desktop hosts `node` extensions inside an Electron UtilityProcess, where the
+  MCP transport is an IPC MessagePort rather than file descriptors 0/1, so the
+  `initialize` response went to a descriptor the host never read and every
+  attempt timed out. Streams are now forwarded explicitly, which works under
+  both hosting models.
+- The Python child is reaped. `SIGTERM`/`SIGINT`/`SIGHUP` are forwarded and
+  escalate to `SIGKILL` after 5s, so a failed or cancelled start no longer
+  leaves an orphan holding UDP 9880 and the single TCP client slot on 9878.
+  Orphans previously accumulated across restarts and silently disabled the
+  analyzer bridge.
+- A signal-killed server reported exit code 0. Signal deaths now exit non-zero
+  and name the signal.
+- Interpreter selection took whatever `python3` resolved to. Under a
+  GUI-launched host that is macOS's 3.9.6 and the CLI aborted despite suitable
+  interpreters being installed; elsewhere it could pick a release with no
+  prebuilt wheels and fall back to compiling from source. Versioned
+  interpreters are tried first, then generic names, then well-known install
+  directories. `LIVEPILOT_PYTHON` overrides the search.
+- Auto-install wrote plain text to stdout while stdout was the JSON-RPC
+  transport, corrupting the stream on exactly the fresh machines that needed
+  the install. That output now goes to stderr.
+- The dependency install timeout was shorter than a real cold install, so pip
+  was killed partway, the venv stamp was never written, and the next launch
+  restarted from scratch — a permanent loop. Raised, and overridable with
+  `LIVEPILOT_PIP_TIMEOUT_MS`.
+- `manifest.json` now declares `compatibility.runtimes.node`.
+### Added — optional streamable-http transport
+- `LIVEPILOT_TRANSPORT=http` (alias `streamable-http`) serves MCP over
+  streamable-http at `/mcp` instead of stdio, so one long-lived process can
+  back several clients rather than each client spawning its own server.
+  Ableton's Remote Script accepts exactly one TCP client on port 9878, so a
+  single shared server keeps that socket single-owner instead of having
+  concurrent stdio processes contend for it. `AbletonConnection` already
+  serialises every send/receive cycle, so concurrent sessions queue rather
+  than interleave.
+- Host and port come from `LIVEPILOT_HTTP_HOST` (default `127.0.0.1`) and
+  `LIVEPILOT_HTTP_PORT` (default `8109`). The endpoint is unauthenticated, so
+  binding is loopback-only with DNS-rebinding protection enabled.
+- stdio remains the default and is unchanged.
+
+### Fixed — Tuning System tools crashed on every set without a custom tuning
+- `Song.tuning_system` is `None` whenever no custom Tuning System is loaded,
+  which is the default state of every Live set. All four handlers dereferenced
+  it unconditionally, so `get_tuning_system` died with `'NoneType' object has
+  no attribute 'name'` — the one tool that answers "is my tuning standard?"
+  failed on every session that was, in fact, standard.
+- `get_tuning_system` now reports `loaded: false` with `tuning: "12-TET"`.
+  The global reference pitch is a Live preference the LOM does not expose, so
+  it is reported as `null` rather than assumed to be 440 Hz.
+- `set_tuning_reference_pitch`, `set_tuning_note` and `reset_tuning_system`
+  raise a clear error saying no Tuning System is loaded and what to do.
+- `has_feature("tuning_system")` could not catch this: it gates on Live >= 12.1
+  and says nothing about whether a tuning system is actually loaded.
+## v1.30.0 — 2026-08-30
+
+### Changed — smaller context, clearer creative decisions
+- The default MCP catalog is now a search-first `producer` profile: 26 pinned
+  production tools plus `search_tools` and `call_tool`, with all 474 tools still
+  searchable and directly callable. Optional `composition`, `mixing`,
+  `sampling`, and `full` profiles make the tradeoff explicit.
+- Creative Director work now scales through FAST, NORMAL, and DEEP lanes.
+  Quick reversible requests use one grounded plan and one verification; full
+  three-family exploration is reserved for real ambiguity or an explicit ask.
+- Mix and evaluation responses distinguish measured audio, setup-derived
+  heuristics, mixed evidence, and artistic judgment. Signed goals now evaluate
+  “less brightness” and other reductions in the correct direction.
+
+### Fixed — options now do what their schemas imply
+- Removed unused Composer, Atlas, and stuckness parameters; `search_samples.q`
+  works without also supplying `query`; material, role, and section filters now
+  affect sample results and workflow plans.
+- Full Composer plans reject abstract `events` with translation guidance instead
+  of accepting and silently ignoring them. Develop-mode bridge lookup uses the
+  live lifespan key.
+- Routing no longer treats ordinary words such as “set” or “loop” as proof of a
+  live-performance or sampling request when the stronger intent is mixing or
+  arranging a song.
+- Direct taste dimensions persist with evidence and reach Composer device
+  ranking; arbitrary axes such as warmth, width, and punch no longer disappear.
+
+### Fixed — runtime and installation reliability
+- Ambiguous socket failures replay only proven-safe commands; clip, note, track,
+  and delete mutations report an unknown outcome instead of risking duplicates.
+- Optional startup probes run in the background, so a slow or absent Ableton,
+  analyzer, Splice app, or project store no longer delays the MCP handshake.
+- Project continuity uses saved-set path or Live session identity, preventing
+  ordinary edits from creating a new project while keeping newly opened sets
+  isolated. Live testing caught that `ControlSurface.song()` returns a fresh
+  Python proxy on every read; the identity token now follows Live's underlying
+  Song equality instead of the wrapper's changing memory address.
+- The installer copies `livepilot_bridge.js` beside the Analyzer every time,
+  and Codex plugin cleanup refuses repository or broad recursive targets.
+
+## v1.29.0 — 2026-08-21
+
+Perceptual taste learning, named Arrangement locators, and dependency/runtime
+compatibility updates. The public surface is now 474 tools across 57 domains.
+
+### Added — named locators (2 tools, 472 → 474)
+- `create_cue_point(time, name)` places a **named** section marker at a beat;
+  `set_cue_point_name(cue_index, name)` renames an existing one. `get_cue_points`
+  already read `cue.name`, but nothing could set it, so every locator made through
+  `toggle_cue_point` kept Live's default name — "1", "2", "3".
+- **Creation lives in the MCP tool, not the Remote Script handler, and the split
+  is required rather than stylistic.** Live's `Song` offers exactly one way to make a locator —
+  `set_or_delete_cue()`, which acts at `current_song_time` and *toggles* — and
+  `CuePoint.time` has no setter, so reaching a chosen beat means moving the playhead
+  there. Assigning `song.current_song_time` does not take effect until control returns
+  to Live's main loop, so a seek-then-toggle inside one handler toggles at the **old**
+  playhead: requesting beats 0 and 64 both produced a locator at beat 20. Splitting the
+  seek and the toggle into separate round trips gives Live a chance to apply the seek.
+- Idempotent by necessity: `toggle_cue_point` on an existing locator **deletes** it, so
+  `create_cue_point` checks first and renames instead. It also restores the playhead.
+- `tests/test_cue_point_tools.py` models toggle-at-playhead semantics against a stateful
+  fake, so dropping the seek or toggling blind fails in CI rather than in a live set.
+- Verified on Live 12.4.3.
+
+### Fixed — `serverInfo.version` reported FastMCP's version, not LivePilot's
+- `FastMCP()` defaults `serverInfo.version` to the **fastmcp library** version, so a
+  stock 1.28.0 install announced itself over the wire as `3.4.7` (the current fastmcp
+  release). That is indistinguishable from an unknown fork, and it cost us a long detour
+  second-guessing which build was actually running before we checked `package.json`.
+  Now passes `version=` explicitly.
+
+### Added — optional learned perceptual distance in the Listening Engine
+- `listen_capture(embed=True)` returns a 512-dim CLAP embedding; `listen_ab(embed=True)`
+  returns a `perceptual_distance` block. The DSP measurements answer "what changed,
+  numerically"; the embedding answers "do these sound like different *things*", which no
+  single hand-designed feature captures.
+- Calibrated on real capture families: `<0.05` is indistinguishable from re-rendering the
+  same take, `0.05–0.10` a real but modest change, `>0.10` clearly a different version.
+- **Optional by design.** `torch`+`transformers` are ~2 GB and are NOT added to
+  `requirements.txt`. Absent, both tools behave exactly as before and return an install
+  hint. Weights download from HuggingFace on first use and are never redistributed.
+- Backend is `laion/clap-htsat-fused` (Apache-2.0 / CC0), selected over MERT on measured
+  quality as well as licensing: benchmarked on real capture families, MERT won mean SNR
+  (3.71 vs 2.96) but collapsed on the subtlest family to 1.07 — barely above its own
+  within-take noise — where CLAP held 3.00 and stayed in a 2.71–3.17 band throughout.
+  A preference model has to work on the subtle pairs. See `spikes/embedding-benchmark/`.
+- **No text-query surface**, deliberately. CLAP is a joint text-audio model but its text
+  tower proved unreliable on this material (asked for "white noise hiss" it ranked an
+  actual white-noise capture 4th of 5), so it is not exposed. Audio-to-audio only.
+- Tool count unchanged at 469 — existing tools gained an optional parameter rather than
+  adding a surface.
+
+### Added — learned taste head (3 tools, 469 → 472)
+- `taste_record_pair` / `taste_train` / `taste_rank`. Every kept-over-discarded decision
+  is a pairwise preference; recorded, they fit a Bradley-Terry head over CLAP embeddings —
+  a model of what gets kept, learned from audio rather than from named qualities. This
+  complements the symbolic taste system in `memory/`: that side explains *why*, this side
+  notices *that*.
+- Linear head, so fitting is logistic regression on difference vectors — convex, no GPU,
+  milliseconds on tens of pairs. No bias term: Bradley-Terry is shift-invariant, so scores
+  are comparable to each other and to nothing else. `taste_rank` therefore ranks and never
+  thresholds.
+- **Training accuracy is never reported.** With 512 dimensions and tens of pairs a linear
+  head separates almost any labelling, including random noise, so the number would read
+  ~100% regardless. Reported instead: cross-validated accuracy, an exact binomial p-value
+  against chance, and a plain-language verdict.
+- Three measured honesty guards, each added after it caught a real failure:
+  - **Significance.** 20 pairs of random labels produced 65% held-out accuracy —
+    indistinguishable from a genuinely learnable signal at that sample size. Without the
+    binomial test the head called pure noise "a weak but real signal".
+  - **Grouped cross-validation.** On 7 real capture pairs from 3 sessions, leave-one-pair-out
+    read 100% where leave-one-session-out read 57%: the head was learning session identity,
+    not preference. Whole groups are held out whenever there are ≥2; the single-group
+    fallback is labelled OPTIMISTIC and withholds its p-value rather than certifying a leak.
+  - **Degenerate grouping.** If every pair lands in its own group the grouping constrains
+    nothing and the scheme says so, instead of letting the reassuring name stand alone.
+- Group defaults to the longest shared prefix of the two capture names, which collapses
+  iterations of one session (`set3_bright_…` / `set3_darker_…` → `set3`); override with
+  `group` when filenames do not reflect the real grouping.
+- Same optional backend as above — absent `torch`/`transformers`, all three tools return
+  the install hint and nothing else changes.
+
+### Fixed — two ways the taste head certified confidence it had not earned
+Found by an adversarial audit run against the head immediately after it shipped, on the
+theory that the first three guards were each discovered by accident rather than by
+looking. Both defects are measured, not argued.
+
+- **A reused baseline capture was certified as taste.** Keeping one reference render and
+  A/B-ing candidates against it — the most natural way anyone compares anything — puts the
+  same anchor on every pair, so every cross-validation fold learns "not the anchor" and
+  scores perfectly. Grouped CV could not see it, because the anchor sits inside every
+  group. Measured: 6 pairs across 3 explicitly-labelled sessions reported 100% accuracy,
+  p=0.016, `significant: true`, *"the head has learned a real preference signal"* — in 40
+  of 40 runs, for a head scoring 50.7% on fresh pairs. The identical corpus without a
+  shared anchor: 3 of 40. Groups sharing a capture are now merged before scoring, which
+  routes them to the existing OPTIMISTIC path, withholds the p-value and makes
+  `taste_rank` warn. Reported as `groups_merged`. **Superseded below — that fix closed
+  only the re-USED-file case, roughly a quarter of the defect.**
+- **Significance counted pairs as independent trials.** Grouping the CV split left the
+  test itself ungrouped, but every pair in a held-out session is scored by one fitted `w`
+  against correlated material, so a session is one observation rather than k. False
+  positives on corpora built to contain no transferable signal, nominal 5%: **25%**,
+  rising with how alike a session's pairs are. Significance now counts sessions. After:
+  6.7–8.0%, with power unchanged (100% on a genuine signal at ≥5 sessions).
+- Consequence, deliberate: certification now requires decisions from at least 5 separate
+  sessions with no shared captures. Below that nothing can be certified however good the
+  accuracy looks, and the verdict says so — more pairs from the sessions already recorded
+  will not help. `significant` gained a third state: `null` means "could not be tested",
+  and callers must treat it as `false`.
+- The textbook fix for the residual (a group sign-flip permutation test) was built,
+  measured and **rejected**: `_fit_weights` is deliberately robust, so on the bimodal data
+  sign-flipping creates it settles on the minority direction, 20 of 64 flip patterns score
+  a perfect 1.0, and the test loses essentially all power (p=0.17–0.34 on a clean signal
+  regardless of corpus size). A test that cannot certify anything is not conservative, it
+  is broken — and it would have looked more rigorous than what it replaced. The reasoning
+  is recorded in `_group_sign_test` so it is not re-attempted blind.
+- 5 new regression tests pin the two defects.
+
+### Fixed — the shared-reference guard closed a quarter of its defect, and the measurements said otherwise
+A third audit round, aimed at the previous round's own fixes.
+
+- **Exact-match merging only catches a re-USED file.** `capture_audio` records live
+  playback, so a producer who re-captures their reference each session produces a new
+  file every time — same material, never byte-identical. Measured at production geometry,
+  6 sessions x 2 pairs: a re-recorded anchor at cosine 0.98 / 0.95 / 0.90 / 0.85 / 0.80 /
+  0.70 certified as real taste in **100%** of runs at every one, merging **nothing**,
+  against 1% for a control with an independent reference per session. A cosine threshold
+  cannot fix it: at 0.70 the two anchors are less alike than two independent captures from
+  one project, so any cutoff strict enough would merge every real corpus.
+- Added `_anchor_asymmetry` — mean cross-session cosine among rejected captures minus the
+  same among preferred. It needs no calibration constant because it is relative: anchored
+  corpora measure **+0.47 to +1.00** (sd ~0.006), honest ones **-0.000** (sd 0.008), and a
+  corpus carrying a genuine quality signal **+0.002** (sd 0.011) — a real preference moves
+  both sides apart symmetrically, so it does not trip. Symmetric in which side is anchored
+  (a shared preferred capture measures -0.81). After: 0% certified at every cosine, control
+  untouched, genuine signal still certifies at 100%. Reported as `anchor_asymmetry` and
+  `shared_reference_detected`.
+- **The measurements themselves were the deeper defect.** Real CLAP embeddings are
+  L2-normalised, so difference vectors have norm 0.3-1.4. Every number quoted for the
+  earlier guards was measured on raw gaussians at norm ~30, where `_fit_weights` returns
+  ~1e-8 and every corpus scores at chance. That regime is why a guard closing a quarter of
+  its defect passed a full green suite with a docstring claiming it was measured. Test
+  helpers now generate unit-norm captures at production dimension, and every documented
+  number was re-measured: the session-level false-positive residual is **5.8-12.5%**
+  (previously documented as ~9%), degrading as sessions get thinner; power is unchanged at
+  100% for >=5 sessions.
+- `_fit_weights` is documented for what it is. At `_LR=0.5` and `l2=1.0` the memory
+  coefficient `1 - _LR*2*l2` is exactly 0, so it is a fixed-point iteration rather than
+  gradient descent. Correct in the deployed regime, fragile to any change in those two
+  constants.
+- 4 new regression tests; the suite is 4784 passed / 2 skipped.
+
+## v1.28.0 — 2026-07-31
+
+Listening Engine (new `listening` domain, 469 tools / 57 domains) plus the OSC 9881
+authentication batch. **This release requires a Max re-freeze of
+`LivePilot_Analyzer.amxd`** — the bridge token gate activates only on a device whose
+`ping` reports >= 1.28.0 (`TOKEN_AUTH_MIN_BRIDGE_VERSION` in `mcp_server/m4l_bridge.py`).
+
+### Security — OSC 9881 shared-secret token authentication
+- `udpreceive 9881` binds on all interfaces (it accepts no bind-interface argument), so a
+  LAN-adjacent host could previously fire any of the 32 bridge commands blind. TCP 9878 and
+  UDP 9880 are loopback-only; this was the one exposed channel.
+- The server now generates a per-startup token (`secrets.token_hex(16)`), publishes it to
+  `~/Documents/LivePilot/bridge_token` (mode 0600) for the lifespan of the process, and
+  attaches it as the first OSC argument of every command. The device validates and silently
+  drops non-matching commands with a throttled log line. The token travels only over
+  loopback UDP and the local filesystem.
+- `ping` / `get_version` stay exempt as the version handshake. Pre-1.28 frozen devices never
+  receive a token (they would misparse it as a positional argument), so the wire format is
+  unchanged for them. `LIVEPILOT_BRIDGE_TOKEN_DISABLE=1` restores the pre-1.28 format exactly.
+- Token rotation self-heals: on mismatch the device re-reads the token file (throttled,
+  500 ms floor) before rejecting, so restarting the server mid-session does not wedge it.
+- Known follow-up (unchanged in this release): MIDITool devices and the Elektron bridge
+  listen on the same exposed class of port and remain untokened — they have no version
+  handshake, so tokening them would break every existing frozen device. Tracked in
+  `docs/PENDING_AMXD_REFREEZE.md`.
+
+### Fixed — capture pipeline
+- `capture_audio`'s busy and invalid-filename branches replied on the generic `/response`
+  address while the caller was waiting on the capture future. The caller ate the full 35 s
+  timeout, and the stray un-id'd reply could resolve an unrelated pending command's future.
+  Both branches now reply via a dedicated `/capture_error` address routed to the capture
+  future. Degrades safely in both directions across the device/server version boundary.
+- The batched readers `cmd_get_display_values` and `cmd_get_plugin_params` reschedule via
+  `Task.schedule(20)`; an interleaved command in that gap clobbered the module-level response
+  id, so the final reply went out mis-id'd and was dropped by the correlator. Both now capture
+  the id in a closure, matching the other batch handlers.
+
+### Fixed — concurrency and validation
+- `session_continuity` tracker module globals are now lock-guarded.
+- Input-validation parity across Simpler slice parameters, euclidean rhythm layering, and the
+  warp bridge tools — bounds that existed on one tool but not its siblings.
+- Bridge-offline analyzer errors now name `reconnect_bridge` as the remedy.
+
+### Changed — dependencies
+- `fastmcp>=3.4.5` (upper bound `<3.5.0` unchanged — the tool registry probe reads private
+  internals), `grpcio>=1.83.0`, `pretty_midi>=0.2.11.post0`, and CI moves to
+  `actions/setup-python@v7` / `actions/setup-node@v7`.
+
+### Added — Listening Engine
+- `listen_capture(file, bpm, seconds)` — full offline perceptual report for a
+  master-bus capture: Parseval-calibrated 9-band spectrum, integrated LUFS /
+  true peak / loudness range, transient character, groove microtiming (~4 ms
+  resolution, multi-candidate grid division), stereo width + bass-mono check,
+  per-band loudness movement, technical polish (clipping/DC/headroom).
+- `listen_ab(before_file, after_file, bpm, seconds)` — empirical before/after
+  comparison of two captures; returns dimension deltas, significant feature
+  changes ranked above measurement-noise thresholds, and canonical snapshots
+  consumable directly by `evaluate_move` for numeric keep/undo verdicts.
+- Canonical dimensions are computed by the evaluation stack's own
+  `extract_dimension_value` (parity by construction); extended measurements
+  use non-canonical names (`width`, `polish`, `motion_cv`, `groove_tightness`).
+- Ground-truth test suite (`tests/test_listening_engine.py`) using synthetic
+  signals with known properties; engine hardened by adversarial review
+  (band calibration, onset-latency bias, grid aliasing, silence/short-input
+  edge cases, LUFS flooring).
+- Verified live end-to-end (2026-07-30): capture → move → capture →
+  `listen_ab` → `evaluate_move` produced correct keep and undo verdicts from
+  rendered audio evidence.
+- New dependency: `librosa>=0.10`.
+
+### Fixed — post-graduation review remediation (2026-07-30)
+- `listen_capture`/`listen_ab` path resolution rejected directories and empty
+  names cleanly (`os.path.isfile`) instead of leaking a raw soundfile error.
+- Launcher venv-stamp regression test added (`venvStampPath` doubled-path bug
+  class is now CI-guarded); engine `compare()`/path-resolution tests added.
+- Guidance integration: the capture → `listen_ab` → `evaluate_move` loop is
+  now taught in livepilot-core (reference corpus + speed tiers +
+  perception.md section), livepilot-evaluation (steps 4/6),
+  livepilot-mixing (escalation ladder), livepilot-sound-design-engine,
+  `/evaluate`, and CLAUDE.md §3/§5/§9.
+- Docs: manual perception/evaluation pages cover the listening loop;
+  tool-reference gains a Listening section; stale historical counts and the
+  numpy-based Python-floor rationale corrected; CI pip caching enabled.
+- Windowed analyzer readers (`get_master_spectrum` with `window_ms`,
+  `analyze_loudness_live`) no longer report false stability when the OSC
+  stream stalls for less than the 5s staleness ceiling: `SpectralCache`
+  tracks a per-key frame generation, both loops report `distinct_frames`
+  alongside `samples_collected`, and a `warning` is attached when duplicate
+  re-reads of the same cached frame dominate the window (previously
+  `bands_std=0` over a stalled stream was indistinguishable from a genuinely
+  stable mix). The default single-read path is unchanged.
+
+## v1.27.3 — 2026-07-10
+
+Deep-review remediation campaign (2026-07-09, on top of the 2026-06-24 fix batch): event-loop
+blocking eliminated tree-wide, release-pipeline gates hardened, atlas scan truncation fixed,
+Splice connection health, state-layer race/replay guards, docs drift automation, and +262 tests
+(4326 → 4597 passing). No change to the tool surface (467 tools / 56 domains).
+
+### Fixed — event loop (systemic)
+- Every remaining blocking call in async tool paths offloaded (~80 sites across 13 files):
+  the composer fast/full/develop apply executors, the shared plan-step executor
+  (`execution_router._execute_step_async`), preview/experiment paths, analyzer helper call
+  sites, automation session-record, agent_os iteration, device-forge/file I/O, and lifespan
+  subprocess probes. New canonical wrapper `AbletonConnection.send_command_async()`.
+- The AST regression guard now scans ALL of `mcp_server/` (was analyzer.py-only) with
+  one-hop transitive detection and file-I/O/subprocess patterns (`scripts/scan_async_blocking.py`).
+
+Live-verified on Ableton 12.4.2 (2026-07-10): per-track volume reporting, force_arrangement
+with return tracks, sidechain name resolution (both casings), analyzer bridge reconnect, and a
+full 40k-device library rescan with zero category truncation.
+
+### Fixed — correctness
+- Sidechain source matching gained a case-insensitive EXACT tier (found live: Live 12.4
+  routing menus can list bare unprefixed track names, where the "-name" suffix fallback
+  never fires); matching ladder extracted into a tested helper.
+- `audit_layer` §5.1 timbre check was a silent double no-op (wrong call signature + uppercase
+  band table vs lowercase producers) — now plumbs cached analyzer spectrum and case-folds.
+- Atlas scans no longer truncate alphabetically at 1000 entries/category (drum kits previously
+  cut off before reaching most of the alphabet); scans record per-category counts + truncation
+  flags, and atlas searches warn when a truncated category is queried. Rescan required to
+  rebuild an existing user atlas (`scan_full_library(force=True)`).
+- Semantic mix/sound-design/transition/performance moves now nudge track volume RELATIVE to the
+  current level (bounded, direction-safe) instead of writing absolute constants; the Remote
+  Script now reports per-track volume in `get_session_info`.
+- Splice client marks itself degraded on RPC failure and self-heals with a one-shot reconnect —
+  a Splice desktop restart no longer yields silent fake "0 results" for the session; quota
+  check-and-record is atomic; HTTP retry no longer sleeps after the final attempt.
+- Preview/wonder cached plans carry a session fingerprint and refuse commit with STATE_ERROR
+  when the session changed shape; shared caches are lock-guarded; persisted taste/project
+  stores back up before any version-mismatch reset; `song_brain` ids are content-aware.
+- `get_emotional_arc` harmonic-instability term computed (was structurally zero);
+  flucoma probe no longer reports empty dirs as installed; composer engine renumbers layers
+  after unresolved-sample drops on the experiment-escalation path.
+
+### Changed — release gates & CI
+- New CI jobs: MCPB bundle build (asset previously shipped missing for 4 releases),
+  Python 3.11 compatibility for `remote_script/` (compileall + vermin), content-level
+  .amxd freeze check (full bridge command set, not just the version string).
+- `bin/livepilot.js` venv staleness keyed on a requirements.txt content hash (hardcoded import
+  list had drifted — upgrading users silently never installed the Splice gRPC dependencies).
+- `sync_metadata.py` validates JSON manifests version-field-by-field (caught a live
+  server.json split-version); docs Domain Map is now generated from the live registry;
+  banner assets and README What's New are drift-guarded.
+
+### Changed — performance & analysis quality
+- Server import ~2.0s → ~0.9s (lazy overlay index + libyaml CSafeLoader); atlas duplicate
+  warnings throttled; test suite wall-clock ~41s → ~32s.
+- Mix-critic confidence values are data-derived (sample size, measured-vs-heuristic basis,
+  margin) instead of hardcoded literals; `analyze_mix`/`get_mix_issues` accept
+  `target_style="loud_master"` to suppress the over-compressed flag for intentionally loud
+  masters; Wonder Mode ranking surfaces a `boldest_executable` slot alongside the safe pick.
+- Security hardening: corpus plugin-id path validation, loopback-only UDP analyzer ingestion,
+  competing-TCP-client identification in eviction errors.
+
+### Changed — dependencies
+- **2026-06-25** — Raised the Python floor to 3.12: numpy>=2.5.0 and scipy>=1.18.0 declare `Requires-Python >=3.12`, so the prior 3.11 floor blocked both dependency bumps across the CI matrix. CI now tests only Python 3.12; the install-time Python-version diagnostic and manifest/docs floor references were updated to match. `remote_script/` stays 3.11-syntax-compatible for Ableton's embedded Python (Live 12.3) — the CI matrix change does not relax that constraint.
+
+## v1.27.2 — 2026-06-23
+
+Maintenance release: M4L bridge response-correlation + chunk-reassembly hardening, plan-routing fixes, a Python 3.11 floor with clearer install diagnostics, and a Remote Script Group-track crash guard. No change to the tool surface (467 tools / 56 domains). Re-frozen LivePilot_Analyzer.amxd (analyzer reports 1.27.2).
+
+### Fixed — M4L bridge
+- Correlate responses by request id across batched reads (`get_params` / `get_hidden_params` / `get_auto_state`): the id is captured per command in the analyzer JS and echoed on both single-packet and chunked responses, so an interleaved or timed-out command can no longer resolve another command's future.
+- Chunk reassembly buckets per request id, bounds-checks the chunk index, and requires every index present before reassembling — fixes a `KeyError` / silent-loss + full-timeout path on duplicate or out-of-range chunks.
+- Non-blocking UDP socket so the miditool response path cannot stall the asyncio event loop; clear the capture future after completion.
+
+### Fixed — routing & Remote Script
+- `compressor_set_sidechain` now classifies as an MCP tool (TCP Remote Script path) instead of being mis-routed to the M4L JS bridge; `get_master_rms` is now dispatchable in plans; removed the dead duplicate `get_simpler_file_path` bridge entry.
+- `get_track_info` no longer crashes on Group/Return tracks (guards the LOM-fragile arm/input properties).
+- `reload_handlers` reports per-module reload errors instead of silently swallowing them.
+- Connection retry tears down the stale socket under the lock.
+
+### Changed — install & docs
+- Raised the Python floor to 3.11 (numpy/scipy publish no wheels for 3.9/3.10) with a clear pre-flight message; pip failures surface captured output + a version hint, and the expected grpcio-tools resolver warning is pre-announced.
+- `consult_ableton_knowledge` docstrings corrected; fast brief now notes the `mcp__Ableton_Knowledge__` prefix and that the knowledge MCP is optional; fixed an over-permissive tool-name test.
+
+
+## v1.27.1 — 2026-06-21
+
+Maintenance release: 35 verified fixes from a deep multi-agent audit, recursive installed-plugin scanning, and Windows-CI hardening. No change to the tool surface (467 tools / 56 domains).
+
+### Restored — tools that were silently broken
+- `augment_with_samples`, `get_composition_plan`, `propose_composer_branches` — crashed or returned nothing since the v1.24 refactor removed section templates; they now degrade to a single full-length section.
+- `check_clip_key_consistency` — always returned `"unknown"` (removed FastMCP `.fn` accessor).
+- `compare_phrase_renders` — returned an identical empty critique; now analyzes each render.
+
+### Fixed — correctness
+- Reference engine: project spectrum and stereo width are now populated (gap analysis previously ran against an all-zero project).
+- `infer_section_purposes`: drops are no longer mislabeled as tension.
+- Grader: master/return/group tracks identified by their real field names (group containers were inflating track counts).
+- Hook salience: the memorability boost no longer fires on every candidate.
+- Mix: the `flat_dynamics` critic is now reachable (`over_compressed` is a 3–6 dB band).
+- Wavetable adapter uses the real `Osc 1 Pos` parameter name.
+- Simpler slice playback uses the correct base note (36+N); `vibe_fit` energy proxy normalized.
+- Harmony and phrase-grid analysis read from the correct clip slot.
+- `exclude_globs` now match files inside named directories.
+- A single shared technique store so in-session saves are visible to recall/search.
+- Read-only prefix matcher no longer misclassifies mutating tools as safe.
+- Atlas id/name collisions no longer shadow entries; the overlay index is no longer rescanned per namespace.
+- AMXD device-type map recognizes MIDI Tool devices (Live 12.1+).
+- `apply_full_plan_v2` postflight no longer deletes a reused existing track.
+- Fatigue level no longer diluted by low-severity issues; energy-arc no longer desyncs on skipped scenes; `create_preview_set` no longer silently overwrites an existing set.
+
+### Fixed — installed-plugin scanning (#44)
+- The plugin scanner now recurses into vendor subfolders (e.g. `VST3/<Vendor>/Plugin.vst3`); nested plugins are found and vendor folders are no longer emitted as junk inventory records.
+
+### Fixed — safety and resources
+- Splice `is_free` misclassification that could bypass credit/quota gating.
+- Experiment rollback undoes only `remote_command` steps (no longer reverts unrelated edits).
+- Timed-out write commands are dropped instead of re-executing later on the main thread.
+- Order-tolerant M4L bridge chunk reassembly (no permanent response loss on UDP reordering).
+- Installer install-path guard hardened; Splice bearer token gated to splice.com HTTPS hosts; non-numeric Live version strings tolerated instead of crashing the capability probe.
+
+### Performance
+- Blocking sample I/O (SQLite, file decode, FFT, network) moved off the asyncio event loop.
+- Capped previously-unbounded tool responses (`atlas_device_info`, `extension_atlas_search`, corpus synthesis briefs, piano-roll matrix, plugin `sdk_metadata`).
+- Deduped redundant session round-trips (`enter_wonder_mode`, `build_project_brain`).
+
+### CI and tooling
+- Fixed the Windows CI matrix (cp1252 `UnicodeEncodeError` in verifier scripts; POSIX-path test fixture).
+- `build_mcpb.sh` enforces `.mcpbignore`; portable dev scripts.
+
+### Dependencies
+- fastmcp, soundfile 0.14.0, grpcio 1.81.1, protobuf 7.35.1.
+
+## v1.27.0 — 2026-06-16
+
+Probe-first Live 12.4 capability release.
+
+### Added
+
+- Added read-only `probe_link_audio()` and `probe_stem_workflow()` runtime tools. They report observed capability modes and reasons without invoking UI scripting, menu automation, or destructive stem operations.
+- Added `link_audio` and `stem_workflow` capability domains to `get_capability_state()` and `get_session_kernel()`. Both default to `manual_only` unless a real probe supplies routable/callable evidence.
+- Added Live 12.4 version flags for Link Audio, selected-time stem separation, and merge-selected-stems while keeping workflow support probe-gated.
+- Added `operation_profile` to the session kernel with `studio_deep` as the legacy default and profile names for `safe_live`, `arrangement_build`, `sound_design_deep`, and `release_audit`.
+
+### Changed
+
+- `replace_simpler_sample()` and `load_sample_to_simpler()` now report `native_attempted`, `bridge_attempted`, and `fallback_reason` so native-vs-bridge behavior is observable during Live 12.4 sample workflows.
+- Creative Director guidance now includes a Producer Decision Center: library hunt before loading, inspect enriched atlas hits, avoid Analog/Poli/Drift filler unless explicitly requested, and require instrument/source-level programming before effects-only polish.
+- Capability-mode docs now describe the new Link Audio and stem workflow probe domains instead of treating them as undocumented future work.
+
+### Tests
+
+- Added coverage for Live 12.4 version flags, Link/stem capability domains and probe tools, session-kernel operation profiles, sample fallback reporting, and Producer Decision Center contract text.
+
+## v1.26.3 — 2026-06-16
+
+Truth/knowledge patch for Live 12.4.2, local Codex plugin sync, and runtime capability reporting.
+
+### Fixed
+
+- Runtime FluCoMa capability probing now checks the Max/FluCoMa package and live M4L streams instead of a nonexistent Python `flucoma` module, so installed-but-bridge-blocked systems report `flucoma_bridge_unavailable` or `flucoma_no_streams` instead of the misleading `flucoma_not_installed`.
+- Metadata drift checks now cover `AGENTS.md` bridge-command claims and the runtime capability probe's analyzer-tool unavailable message.
+- README compatibility docs now advertise all four Live 12 capability tiers, including the Live 12.4+ Collaborative tier for native Simpler sample replacement.
+- M4L bridge docs and operating contracts now distinguish the M4L `replace_sample` empty-Simpler limitation from the Live 12.4+ native `replace_sample_native` route.
+
+### Added
+
+- Added `scripts/verify_codex_plugin_sync.py` to verify the local Codex plugin active dir, versioned cache dir, mirrored manifests, `.mcp.json`, payload directories, and Local Plugins marketplace entry.
+
+### Changed
+
+- Refreshed Live 12.4.2 knowledge notes for Link Audio, stem-selection workflows, Erosion, Chorus-Ensemble, Delay LFOs, Max 9.1.4, and `SimplerDevice.replace_sample`, while keeping unprobed Link Audio/stem workflows marked as future LivePilot work.
+
+### Tests
+
+- Added drift guards for AGENTS bridge-command claims, analyzer-tool capability probe text, README Live tier docs, and Codex plugin sync verification.
+
+## v1.26.2 — 2026-05-27
+
+Patch release for Claude/Codex plugin instruction correctness and local install reliability.
+
+### Fixed
+
+- Claude/Codex plugin commands now use `ensure_analyzer_on_master` instead of direct master-track analyzer loading, preserving the invariant that `LivePilot_Analyzer` measures the final post-master-chain signal.
+- `/beat` now builds the master processing chain before ensuring the analyzer, preventing pre-effect spectral/RMS reads in fresh sessions.
+- V2 semantic-move guidance now matches runtime behavior: `apply_semantic_move(mode="improve")` compiles an approval-ready plan and does not execute until the returned steps are run.
+- Plugin device-loading guidance now routes through the Device Atlas first, then exact browser URI loading, with `find_and_load_device` reserved for simple built-in effects.
+- Release checklist stale claims were corrected: removed the obsolete non-analyzer subtotal and updated the domain-list reminder from 45 to 56 domains.
+- Producer-agent capability guidance now distinguishes stale/intermittent analyzer data (`measured_degraded`) from analyzer absence (`judgment_only`).
+
+### Tests
+
+- Added `tests/test_plugin_instruction_contracts.py` to prevent regressions in analyzer preflight guidance, semantic-move approval semantics, release-count claims, and core-skill enriched-device metadata coverage.
+
+## v1.26.1 — 2026-05-24
+
+Patch release for installer/release hygiene and live execution correctness.
+
+### Fixed
+
+- Codex plugin installer now copies the full plugin payload into Codex's local plugin cache, writes the lowercase `.codex-plugin` manifest mirror, and prunes stale cache versions.
+- Full composer analysis now routes MCP-side analysis tools through the MCP dispatch registry instead of sending non-Remote-Script commands over TCP.
+- Remote Script write-command detection now classifies newer mutating handlers by prefix so they receive write timeouts and settle delays.
+- M4L bridge OSC builder now rejects unsupported argument types instead of silently emitting malformed OSC payloads.
+- `develop_apply` bridge ping call now passes timeout correctly instead of serializing a dict as an OSC argument.
+- Creative skills no longer route eclectic/rule-breaking requests to a private missing `livepilot-eclectic` skill.
+- Metadata/docs refreshed for 56 domains, 465 tools, and 44 semantic moves.
+- Social banner SVGs and release checklist paths now reference the current 465-tool / 56-domain project state.
+
+### Added
+
+- Public `CONTEXT.md` with repo vocabulary and architecture decisions.
+- Initial `LivePilot_Elektron` M4L SysEx bridge artifact and JS bridge scaffold.
+
+### Tests
+
+- Added contract coverage for Codex cache installation, MCP dispatch adapters, Remote Script command registry drift, write-command classification, OSC argument validation, and stale skill references.
+
+## v1.26.0 — 2026-05-09
+
+Rubric grader system + atlas-aware load preflight + Drift factory-fingerprint detection. Closes a chronic-regression class: anti-pattern violations of CLAUDE.md §1/§2/§4/§5/§7.3 now have programmatic enforcement, and silent-instrument loads (Granulator III without a sample) are caught structurally at load time instead of much later via the verifier.
+
+### Added — three new MCP tools
+
+- **`grader_list_rubrics()`** — names of registered rubrics + light/heavy classification. Five rubrics ship: `layer_accumulation` (§7.3), `default_preset_check` (§1), `modulation_presence` (§4), `layer_precision` (§5), `sound_design_depth` (§2).
+- **`grader_evaluate(rubric_id, heavy=False, include_brief=True, include_masking=True)`** — runs a single rubric across the current session. Light state (~3s) covers role/volume/banned-default checks. Heavy state (~6s) adds per-clip notes + per-clip automation + wavetable mod-matrix + session masking report — required for §5 sequence/modulation/masking criteria. Returns structured per-criterion verdict + actionable revision_brief markdown.
+- **`grader_evaluate_all(heavy=True, include_brief=True, include_masking=True)`** — runs ALL rubrics in one call against shared state. ~5× cheaper than calling `grader_evaluate` per rubric because state-fetching is the dominant cost. Returns per-rubric verdicts + combined_brief.
+
+### Added — Drift factory-fingerprint detection
+
+- `audit/checks._check_drift_params` and `_drift_engagement_score` — captures Drift's 12-param factory fingerprint (Pitch Mod Amt 1/2 = 0.5, Mod Matrix Amt 2/3 = 0.5, Vel > Vol = 0.5, Spread = 0.10, Strength = 0.05, Drift = 0.07, Thickness = 0.0, LP Mod Amt 1 = 0.97, LP Mod Amt 2 = 0.78, LFO Amt = 1.0). Counts deviations from factory > 0.04 epsilon. Zero deviations on a melodic-role track → `unprogrammed_instrument` fail. Closes the §2 detection gap where Drift's bipolar defaults escaped the generic `_SUSPICIOUS_AT_ZERO` heuristic.
+
+### Added — atlas-aware load preflight
+
+- **`atlas_search`** now surfaces 8 discoverability-critical fields when `enriched=true`: `self_contained`, `synthesis_type`, `complexity`, `use_cases`, `signature_techniques_count`, `first_technique_hint`, `gotchas_count`, `first_gotcha`. Truncation widened 120 → 400 chars. Closes the silent-Granulator-III bug class — the agent now sees `self_contained: false` immediately in search results without a follow-up `atlas_device_info` round-trip.
+- **`load_browser_item`** now appends `atlas_preflight` to the response when the loaded device is enriched AND declares `self_contained: false`. Includes a structured warning + the actionable hint to load a Sounds preset chain that ships with a sample baked in. Granular samplers (Granulator III, Vector Grain) are caught at load time instead of leaving the agent with a silent instrument.
+
+### Added — `mcp_server/audit/state.py` shared module
+
+Hoists `safe_call`, `fetch_notes_for_clips`, `has_clip_automation`, `count_wavetable_routings` from `audit/tools.py` and `grader/tools.py` into one shared module. Removes the duplication that crept in during Phase 2c-β. Now a third caller can import directly without re-copy.
+
+### Changed — instrument + effect class taxonomy
+
+`audit/checks._INSTRUMENT_CLASSES` and `_EFFECT_CATEGORIES` now include Live's actual runtime class names alongside user-facing brand names. Captured live 2026-05-08:
+
+| User-facing | Runtime class_name |
+|---|---|
+| Analog | `UltraAnalog` |
+| Meld | `InstrumentMeld` |
+| Poli | `MxDeviceInstrument` (M4L wrapper) |
+| Electric | `LoungeLizard` |
+| EQ Eight | `Eq8` |
+| Compressor / Compressor 2 | `Compressor2` |
+| Auto Filter | `AutoFilter2` |
+| Glue Compressor | `GlueCompressor` |
+| Multiband Dynamics | `MultibandDynamics` |
+
+§1 banned-default detection now uses `(class_name, name)` fingerprint tuples — catches Drift, UltraAnalog (Analog), InstrumentMeld (Meld), MxDeviceInstrument-Poli (M4L wrapper). Pre-1.26 the flat-set approach only caught Drift.
+
+### Tests
+
+- 8 new test files: `test_grader_layer_accumulation.py`, `test_grader_default_preset_check.py`, `test_grader_modulation_presence.py`, `test_grader_layer_precision.py`, `test_grader_sound_design_depth.py`, `test_audit_state.py`, `test_atlas_search_field_surfacing.py`, `test_browser_atlas_preflight.py`. ~110 new tests covering rubric criteria, false-positive guards, Drift fingerprint, atlas preflight, shared helpers.
+- Updated `test_audit_layer.py` (Drift fingerprint + real-class fixtures) and `test_tools_contract.py` (count 462 → 465 + grader tools registered).
+- 237 tests pass for the grader + audit + browser preflight surfaces.
+
+### CLAUDE.md additions
+
+- §9b — Kill orphan LivePilot processes (don't ask the user). When a tool errors with `UDP 9880 still in use` or `Another client is already connected`, the active session takes the kill action.
+- §9c — Arrangement build finalization. Loop covers full content, cursor at 0, orange button inactive, no leftover session clips. Canonical one-call: `force_arrangement(beat_time=0, loop_start=0, loop_length=<content_end>, play=false)`.
+
+### Live test (this release's evidence)
+
+A 5-layer 130 BPM two-step session built end-to-end exercising all five rubrics, including a 5/4 fill bar, French disco filter sidechain, and a granular drone pad. Multi-violation stress test progressed 0/12 → 8/13 (62%) → 11/12 (92%) → 12/12 (100%) catch rate as fixes landed. The Granulator III silent-instrument bug surfaced during this session and triggered the atlas_search/load_browser_item preflight fix that's now part of this release.
+
+## v1.25.0 — 2026-05-02
+
+Hybrid Knowledge Surface — closes the gap between "compose runs successfully" and "compose makes thoughtful production decisions" by giving the agent three layers of atlas-corpus access during plan design instead of one-shot pre-resolution.
+
+### Added — three new MCP tools
+
+- **`atlas_explore(role, mood, genre, artists?, n=5, avoid_uris?, cohort_constraint?)`** — refined per-role candidate query callable mid-design. Wraps `AtlasResolver.resolve_for_role` with corpus-deep ranking signals: tag/genre match base, signature_techniques mood overlap (+0.20), curated `.adg` boost (+0.10), recent positive preference (+0.10), §1 banned-default penalty for melodic roles (−0.50), opaque-M4L pad penalty (−0.30), §7 #2 anti-repeat (−0.15), caller avoid-list (−0.30). Returns 3-5 ranked candidates with reasoning trails and a cohort_hint inferred from result frequency.
+- **`atlas_audition(uri)`** — full sidecar dump for a single URI: character_tags, signature_techniques (joined from `device_techniques_index.json`), producer-curated macro names (joined via `preset_resolver`), curated `.adg` paths, related demos placeholder. Use BEFORE committing to a candidate when its tags alone aren't enough.
+- **`atlas_substitute(current_uri, anti_tag, n=3)`** — anti-tag-driven swap for after analyze_sound_design or analyze_mix flags an issue. Substring-matches anti_tag against the 11-key map (bright/harsh/aggressive/sparse/thin/muddy/clean/dark/warm/static/generic) to derive (excluded_tags, preferred_tags), filters role-mate candidates that don't carry excluded character_tags, ranks the survivors with preferred_tags as mood boost.
+
+### Added — framework
+
+- **`mcp_server/composer/framework/atlas_resolver.py`** — `AtlasResolver` class with `resolve_anchors()` (Layer A: cohort + role-anchored URIs at brief-build time, wraps `atlas_pack_aware_compose` with coarse→fine role mapping) and `resolve_for_role()` (Layer B: per-role ranked candidates with cohort_constraint + excluded_uris). `AtlasCandidate` and `AtlasAnchors` dataclasses define the shared shape. Memory-rule constants `BANNED_DEFAULT_MELODIC` and `OPAQUE_M4L_FOR_PAD` are exported.
+- **`mcp_server/atlas/explore_tools.py`** — pure-Python implementations for the three new MCP tools, including `_ANTI_TAG_MAP` (11-key inversion table) and `_load_device_techniques_index()` lazy loader.
+
+### Changed — KnowledgePack + brief
+
+- `KnowledgePack.build()` accepts `atlas`, `ableton`, `ctx`, `brief_text` kwargs. When `mode="full"` AND `atlas` AND `brief_text` are provided, populates `atlas_anchors` (best-effort — silently `None` on any failure path).
+- `build_full_brief` now threads the atlas object through. The brief carries `atlas_anchors` alongside the existing fields.
+- `_DESIGN_TARGETS` text in `full/brief_builder.py` updated to teach the LLM about the three new tools and when to call each.
+
+### Tests
+
+- `tests/composer/framework/test_atlas_resolver.py` — 17 cases covering ranking math (8), `resolve_for_role` (6), candidate shape (1), `resolve_anchors` integration with mocked `pack_aware_compose` (2).
+- `tests/atlas/test_explore_tools.py` — 20 cases covering `atlas_explore` (6), `atlas_audition` (5), `_resolve_anti_tags` (3), `atlas_substitute` (6).
+- `tests/test_tools_contract.py` — count assertion updated 459 → 462; atlas tool registry expects the three new names.
+
+### Tool count
+
+- Net delta: **459 → 462** (+3: atlas_explore, atlas_audition, atlas_substitute).
+
+### Changed — `resolve_for_role` four-source union
+
+- **`AtlasResolver.resolve_for_role()`** previously queried only the bundled atlas tag index (`self._atlas._by_tag`). User-curated rack instruments and pack overlays were structurally invisible to the agent's design-time queries.
+- Two-pass overlay union added via new helper `_gather_from_overlays()`:
+  - **Pass A** — explicit `entity_type="demo_project"` query against the `packs` namespace. Demo-project entries (analyzed `.als` parses with `track_names` + `parent_pack` + `device_class_counts`) are the highest-confidence per-role anchors. Each survivor receives a **+0.15 score boost** with reasoning trail entry `"demo_project ground-truth (+0.15)"`.
+  - **Pass B** — full overlay search with no namespace filter. Captures `packs/pack`, `packs/cross_pack_workflow`, `m4l-devices/*`, `user.*`, `elektron/*` entries that share role tags.
+- New helper `_overlay_entry_to_device()` synthesizes `overlay://<namespace>/<entity_id>` URIs so overlay candidates render in the same shape as factory atlas candidates. Agents resolve to a loadable URI via `extension_atlas_get(namespace, entity_id)` afterward.
+- Best-effort: import or runtime failure of the overlay backend silently returns an empty list rather than raising — matches the existing `resolve_anchors` failure semantics.
+
+### Changed — `_DESIGN_TARGETS` four-source search mandate
+
+- Brief text in `mcp_server/composer/full/brief_builder.py::_DESIGN_TARGETS` rewritten to explicitly require the agent to UNION four sources before committing any role pick:
+  1. **Source 1 — Factory atlas** (already in `atlas_anchors`): `atlas_explore` / `atlas_audition` / `atlas_substitute`.
+  2. **Source 2 — User corpus** (mandatory): `extension_atlas_search(query=role)` and `extension_atlas_search(query=role, entity_type="demo_project")` for ground-truth role→URI mappings, plus `extension_atlas_get(namespace, entity_id)` for full-body inspection.
+  3. **Source 3 — Anthropic Ableton Knowledge MCP**: `mcp__Ableton_Knowledge__search_transcripts` / `search_live_manual` / `search_knowledge_base` / `search_videos` for tutorial-grade context.
+  4. **Five-step protocol** documented per role: read anchor → atlas_explore → extension_atlas_search (corpus + demo_project) → Ableton_Knowledge search → union, score, commit.
+- Production motivation: factory-atlas-only selection consistently missed canonical user-curated rack instruments (e.g., the `808 Trap Selector Rack.adg` from the Trap Drums by Sound Oracle pack lives in the packs overlay, not the factory tag index).
+
+### Fixed — `load_browser_item(role="drum")` post-load defaults
+
+Two compounding bugs in `mcp_server/tools/browser.py` made `role="drum"` a no-op since v1.20:
+
+- **Wrong parameter name** — `_SIMPLER_ROLE_DEFAULTS["drum"]` set `"Sample Pitch Coarse"` to 36, but that parameter does NOT exist on `OriginalSimpler`. The `set_device_parameter` call raised `Parameter 'Sample Pitch Coarse' not found`, was swallowed by the per-param try/except, and silently lost. Replaced with `("Transpose", 24)` (range −48..+48 semitones); +24 compensates for Simpler's default sample root C3 vs the drum-pad MIDI convention C1. Melodic and texture roles updated to `("Transpose", 0)` (no shift — C3 default matches their input range).
+- **Device-detection logic never triggered** — wrapper checked `result.get("device_index")` and `result.get("class_name")` from the load response, but the underlying TCP `load_browser_item` command returns only `{loaded, name, device_count}`. Both fields were always `None`/`""`, the `Simpler in device_class` check failed, and the entire role-defaults branch was skipped on every call. Fixed: post-load probe via `get_device_info(track_index, device_index=0)` to read class + name, treating chain-head as the canonical instrument slot Live places fresh instruments at.
+- Same broken parameter name was also patched in `mcp_server/tools/_analyzer_engine/sample.py::_simpler_post_load_hygiene`. Auto-detect-drum-root-note now translates `drum_root → Transpose = 60 − drum_root`, clamped to ±48 semitones.
+- Response now carries `role`, `role_defaults_applied: [{parameter, value|skipped}…]`, and `device_class` so callers can verify the four defaults landed.
+
+### Added — M4L instrument post-load hygiene
+
+- New `_M4L_INSTRUMENT_HYGIENE` dict in `mcp_server/tools/browser.py` maps a device-name substring to a list of `(parameter_name, value)` tames. Runs **unconditionally** (not gated on `role`) post-load, after Simpler role defaults.
+- Initial entry: `Harmonic Drone Generator` (Drone Lab pack) — sets `Latch=0` (off), `Volume=-40` (≈ −20 dB display, vs default ≈ −6 dB), `Density=40` (40 %, vs default 80 %). Without these tames every fresh HDG load slammed an 8-voice drone at full volume the moment any MIDI note hit it. The `Latch` issue compounded by keeping that note ringing forever even after the MIDI source released.
+- Response now carries `m4l_hygiene: {device_name, applied: [{parameter, value|skipped}…]}` when a hygiene entry matches. One match per load (`break` after first hit).
+
+### Tests
+
+- `tests/test_next_steps_2026_04_22.py::test_role_defaults_reasonable_for_drum_role` — assertion updated to `Transpose == 24`; regression guard `"Sample Pitch Coarse" not in drum` prevents the broken param name from ever reappearing.
+- `tests/test_next_steps_2026_04_22.py::test_role_defaults_reasonable_for_melodic_role` — assertion updated to `Transpose == 0` plus the same regression guard.
+- All four role-defaults tests pass against the new `_SIMPLER_ROLE_DEFAULTS` shape.
+
+## v1.24.0 — 2026-05-02
+
+Compose framework rebuild — fast / full / develop modes share an Applier substrate; full mode is a clean-room rewrite around an LLM-creative two-phase brief flow (LLM provides FORM, framework provides VOCABULARY).
+
+### Added — compose framework
+
+- **`mcp_server/composer/framework/applier.py`** — shared pre-flight + post-flight skeleton. `preflight()` loads analyzer, reconnects bridge, retries handshake up to 3× with 200ms gaps (fixes the M4L UDP-bind race that previously left "bridge not connected" failures on the first instrument-load call). `postflight()` sets monitoring=Auto on every newly-created track and calls `back_to_arranger`. Functions are dependency-injected so each mode's apply.py wires its own analyzer/bridge funcs.
+- **`mcp_server/composer/framework/knowledge_pack.py`** — `event_lexicon` (42 structural events across 7 categories: drum_density, harmonic, texture, vocal, rhythm_feel, tension, fx_gesture), `genre_context` loader (parses `livepilot/skills/livepilot-core/references/genre-vocabularies.md`, 15 genres), `artist_context` loader (parses `artist-vocabularies.md`, ~25 producers). `atlas_candidates_per_role` is scaffolded but **left as empty stub** — see v1.25 plan.
+- **`mcp_server/composer/full/apply.py::apply_full_plan_v2`** — full-mode rebuild. Takes an LLM-authored plan with `form` (sections), `tracks` (instruments + variants + arrangement_clips), `events`. Per-section variants prevent the BUG-FULL-MODE-18 flat tile. Native arrangement clip flow via `create_native_arrangement_clip` + `add_arrangement_notes` + `set_clip_loop` produces a single arrangement clip per section instead of 32 tiny tiles (BUG-FULL-MODE-23).
+- **`mcp_server/composer/develop/`** — develop mode (extend an existing 8-bar loop). `seed_introspector.py` classifies tracks by name + content; `brief_builder.py` pulls artist references from the user prompt + research hooks; `apply.py` writes per-track variants without disturbing the seed.
+- **`mcp_server/composer/fast/brief_builder.py`** — fast-mode brief authoring with tier classification (Tier-A curated > Tier-B audible default > Tier-C never). Hunt order: `search_browser(path="sounds")` first to surface curated `.adg` chains, then atlas, then bare instruments only as last resort. Bans bare-melodic Tier-B when curated alternatives exist (§1 violation prevention).
+
+### Fixed — live-test wave
+
+- **BUG-FULL-MODE-14: bridge UDP race** — `apply_full_plan` returned success on `bridge.connect()` but the M4L JS listener takes 100-500ms to bind the UDP socket; next bridge call ("UDP bridge is not connected"). Fixed in `Applier.preflight` with handshake retry loop.
+- **BUG-FULL-MODE-17: monitoring=In on all tracks** — Phase 4 Task 4 set monitoring `state=0` ("In", always passes input) instead of `state=1` ("Auto", default). Live screenshot showed every track armed-red. Fixed: state=1 in `Applier.postflight`.
+- **BUG-FULL-MODE-18: flat tiling instead of per-section variants** — full mode reused one MIDI variant for the whole arrangement. Fixed: per-section `variant_id` in plan + per-section variant resolution in apply.
+- **BUG-FULL-MODE-19: `track_index` vs `index` field** — `apply_full_plan_v2` read `result["track_index"]` from `create_midi_track`, but the Remote Script returns `result["index"]`. Same bug class as the v1.23.x `parameter_name` vs `name_or_index` fix.
+- **BUG-FULL-MODE-20: zombie/leftover tracks from previous sessions** — postflight only deleted default-named tracks (`1-MIDI`, `2-Audio`). Now also deletes tracks with no clips AND no instrument device (true-empty zombies) regardless of name.
+- **BUG-FULL-MODE-21: drum-pitch super-low** — Simpler default root C3=60, drum clips firing at MIDI 36 = 24 semitones below native pitch. Drum-role repair (Volume=0, Snap=Off, Transpose=+24) was already in fast mode; now ported to full mode for parity. (`composer/fast/apply._apply_drum_role_repair` is imported by full mode.)
+- **BUG-FULL-MODE-22: arrangement clip length wrong** — fixed alongside BUG-FULL-MODE-23.
+- **BUG-FULL-MODE-23: 32-tile arrangement** — `create_arrangement_clip` duplicated the session clip every `loop_length` beats, producing a tile-grid arrangement. Switched to `create_native_arrangement_clip` + `add_arrangement_notes` + `set_clip_loop` for native arrangement clip authoring; one clip per section, looped to fill section length.
+
+### Known gaps (deferred to v1.25)
+
+- **`KnowledgePack.atlas_candidates_per_role` is empty stub** — agent still falls through to `search_browser` filename matching instead of consulting the indexed atlas. Ranking + truncation per role needs careful design (1-2 days). Documented as **BUG-FULL-MODE-24** and is the headline feature of v1.25.
+- **Reasoning loop (Scope B)** — full mode currently does best-effort `analyze_mix`/`analyze_loudness`/`analyze_sound_design` calls but doesn't iterate on findings. v1.25 wires an analyze→adjust→re-analyze loop with a budget.
+- **Drum craft + bass craft sophistication passes** — full mode produces correct but generic drum/bass programming. v1.25 lifts these to "poweruser" depth (per-bar variation, sidechain wiring, ghost notes, swing curves, sub/mid/click frequency separation).
+- **`verify_track_audible` MCP tool** — Phase 4 Task 18c, deferred.
+
+### Tool count
+- Net delta: **453 → 459** (+6: compose framework expansion).
+
+### Tests
+- `tests/composer/` — 184 passing across fast / full / develop / framework subdirectories.
+- `tests/test_tools_contract.py` — 459 tools verified.
+
+## v1.23.6 — 2026-04-30
+
+### Fixed
+
+- **`ensure_analyzer_on_master` cold-start disambiguation.** On a fresh Live boot the User Library browser cache is uncached, and `find_and_load_device("LivePilot_Analyzer")` can exceed the 20s recv timeout while BFS-ing the user library tree. The previous catch-block surfaced `status="install_required"` even though the .amxd is sitting at the canonical install path — sending the agent into a reinstall loop. New `_analyzer_amxd_installed_at_user_library()` filesystem check disambiguates: when the .amxd is present at `~/Music/Ableton/User Library/Presets/Audio Effects/Max Audio Effect/`, the tool now returns `status="cache_cold"` with a retry hint instead. Genuine missing-.amxd path still returns `install_required` correctly. (`mcp_server/tools/analyzer.py`)
+- **`set_compressor_sidechain` diagnostic depth.** When `_find_sidechain_surface` returns None on Compressor2 (Live 12.3.6+), the raised error now includes `class=...` + `canonical_parent.class=...` + a widened child-attribute walk (`input_routings`, `routing_inputs` added to the probe). Lets the next live failure leave a tighter trail so the actual Compressor2 LOM shape can be confirmed in one round trip rather than a separate probe session. No behavior change for legacy Compressor (I) or the two known Compressor2 hypotheses. (`remote_script/LivePilot/mixing.py`)
+- **`atlas_demo_story` production_decision class-name leak.** `harmonic-foundation` and `rhythmic-driver` role branches fell back to `primary_cls` when `user_name` was empty — producing useless prose like "InstrumentGroupDevice chosen as harmonic spine." Both branches now use `primary_uname or t_name or primary_cls`, matching the texture-role fallback that was already correct. (`mcp_server/atlas/demo_story.py`)
+- **`atlas_extract_chain` Macro N labeling on M4L devices.** The rack-device path already resolved producer-named macros via `resolve_preset_for_device`, but the M4L (.amxd) device path emitted raw `Macro N`. Now both paths cross-reference the preset sidecar — PitchLoop89's "Spectral Stretch" gets the proper name instead of "Macro 2" so `set_device_parameter` resolves at execution time. (`mcp_server/atlas/extract_chain.py`)
+- **Bundled atlas stats refresh.** `stats.enriched_devices` was stale at `87` (from a v1.21.x scan); the actual `enriched=True` flag count had grown to `135`. Recounted in place. No tool consumes the field with semantically-different behavior, but the stale stat had drifted past the soft-warn threshold's intent. (`mcp_server/atlas/device_atlas.json`)
+
+### Docs / drift
+
+- **`docs/M4L_BRIDGE.md`**: amxd ping reference and bridge-cmd count corrected — was `version: "1.23.1"` and "30 commands" from prior releases; now `1.23.6` and `32`.
+- **`livepilot/skills/livepilot-core/references/genre-vocabularies.md`**: added Synthwave / Retrowave / Outrun entry to match the 15-genre claim in CLAUDE.md/AGENTS.md (file had 14; the YAML packet at `concepts/genres/synthwave.yaml` had been the source-of-truth for v1.18+).
+
+### Tests
+
+- `tests/test_ensure_analyzer_on_master.py` — 2 new tests under `TestColdBrowserCacheDisambiguation` covering the cache-cold branch (`.amxd` present → cache_cold) and the install-required branch (`.amxd` absent → install_required). Existing `test_returns_install_required_when_device_not_in_browser` updated to monkeypatch the new path-check helper so it exercises the genuinely-not-installed path regardless of dev-machine state.
+- Total: **3409 passing**, 1 skipped, 0 failed (up from 3407 in v1.23.5).
+
+### Audit notes
+
+A full read-only audit pass against `BUGS.md` + `BUGS_TESTING_2026-04-30.md` confirmed that 14 of the bugs documented in those files were already fixed in v1.23.4's `bugfixes-2026-04-26` commit batch but never marked closed in the testing doc. No-ops here, but worth noting that the 38-bug list in the testing file is now ~5 genuinely-open items.
+
+## v1.23.5 — 2026-04-30
+
+### Fixed (Remote Script reliability — credit: PR #35 reporter)
+
+Two production-blocking bugs in the Remote Script that ship into the Ableton process. Reported by @juancarlosaxtro-hash in [PR #35](https://github.com/dreamrec/LivePilot/pull/35); reimplemented cleanly here with regression tests because the originally-submitted patch contained Python indentation errors that broke `transport.py` parse.
+
+- **TCP server now replaces stale clients instead of rejecting new connections.** Previously, when the MCP server restarted uncleanly (e.g. user relaunched Claude Desktop), the Remote Script's `recv()` loop didn't notice the disconnect for up to a second. During that window, the legitimate reconnect attempt was rejected with `STATE_ERROR("Another client is already connected")` — often requiring a full Ableton restart to recover. New behavior: when the accept loop sees a new connection while one is "active", it closes the stale socket from the accept loop, joins the old client thread (with 2 s timeout, OUTSIDE the lock so the thread's `finally` block can acquire it), then accepts the new connection. Single-client architecture means a new connection is proof the old one is dead. New `_current_client` field tracks the active socket so the accept loop can kick it; the `_run_client_session` finally only nulls `_current_client` if it still points at the closing client (the accept loop may have already replaced it). (`remote_script/LivePilot/server.py`)
+- **`get_session_info` no longer crashes on Group tracks.** `song.tracks` includes Group tracks, which raise a `RuntimeError` on `arm` / `has_midi_input` / `has_audio_input` access. `hasattr()` returns `True` regardless because Live's LOM doesn't use `AttributeError` — only try/except on the actual access works. Without the guard, any session with a Group track failed the entire session-info call with *"Main and Return Tracks have no 'Arm' state!"* Surgical try/except around the three LOM-fragile properties only; other fields (`name`, `color_index`, `mute`, `solo`) populate normally; the fragile ones return `None` on Group tracks. (`remote_script/LivePilot/transport.py`)
+
+### Tests
+- `tests/test_remote_server_single_client.py` — rewrote `test_second_client_gets_explicit_state_error` → `test_second_client_replaces_stale_connection` for the new kick-stale semantics.
+- `tests/test_remote_transport_group_tracks.py` — new file, 4 tests covering normal-track baseline, mixed Group+normal sessions, all-Group edge case, and non-fragile-field preservation. Hermetic loader stubs the Ableton-only `Live` module + `version_detect` helpers; autouse fixture restores `sys.modules` to prevent test pollution.
+- Total: **3407 passing**, 1 skipped, 0 failed (up from 3403 in v1.23.4).
+
+### CI green check
+- All 9 jobs green on commit `4aec8e6` (run `25174868624`): metadata-drift, js-entrypoint, amxd-freeze-drift, python-tests × {macos, ubuntu, windows} × {3.11, 3.12}.
+
+## v1.23.4 — 2026-04-30
+
+### Fixed (2026-04-30 live-test wave — 38 bugs surfaced, 36 fixed, 2 deferred to v1.23.5)
+- **`als_deep_parse.py` — recursive `iter()` was returning nested rack defaults instead of authored macro values**, so every demo sidecar shipped with all macros at `0`. The fix replaces `device_elem.iter("MacroControls.N")` with a direct-child scan that only reads the rack's own macro controls. Live-verified against `Pioneer Drone` in `drone-lab__earth.als`: macro 1 "Rift Rate" = 1, macro 8 "Volume" = 95.25 (both were 0 before). All 104 demos re-parsed; macro values now match the producer's authored .als state. **This was the highest-impact bug in the wave** — every downstream tool (extract_chain, transplant, demo_story, pack_aware_compose, cross_pack_chain) consumes these macro values, so until this was fixed all phase tools operated on corrupted source data. (BUG-PARSER#1)
+- **`als_deep_parse.py` — scale extraction always returned C Major** because `iter("ScaleInformation")` hit per-clip ScaleInformation elements (which default to C Major) before reaching the project-level LiveSet ScaleInformation. Fixed by using `root.find("LiveSet").find("ScaleInformation")` direct path. Added Live-9/10 fallback for `<Root>` vs `<RootNote>`. Voice Box demo 04 now correctly reports F Minor. (BUG-E4)
+- **`atlas_demo_story` crashed with `TypeError: tuple | set` on any demo containing GroupTracks** (every Drone Lab and Mood Reel demo). One-character fix: `(_AUDIO_EFFECT_GROUP,) | _FX_BUS_CLASSES` → `{_AUDIO_EFFECT_GROUP} | _FX_BUS_CLASSES`. (BUG-E1#1)
+- **`atlas_extract_chain` emitted generic `"Macro N"` parameter names** instead of producer-assigned labels. Live calls to `set_device_parameter(parameter_name="Macro 2")` would silently NOT-FOUND when the rack actually had a name like "Crunch" or "Rift Rate" at that index. Now resolves the matching preset sidecar via the new `mcp_server/atlas/preset_resolver.py` helper and emits the real producer name (e.g. `parameter_name: "Rift Rate"`), with `parameter_index` as a fallback addressing field. Source tag `[SOURCE: als-parse+adg-parse]` when the name was successfully resolved. (BUG-E2#1)
+- **`atlas_extract_chain.load_browser_item` steps were missing `uri` and `track_index`** — non-executable as-emitted. Now embeds a `browser_search_hint: {name_filter, suggested_path}` that the agent passes to `search_browser` to resolve the FileId-keyed runtime URI before calling `load_browser_item`. Same pattern applied to `atlas_pack_aware_compose`. The new shared `preset_resolver` module also provides `emit_load_step()` for any future caller. (BUG-E2#4 + BUG-F1#2)
+- **`atlas_pack_aware_compose` `transpose_semitones` aesthetic override was a silent no-op** — `for step in steps: step = dict(step); ...` mutated a copy that was never written back. Fixed in [cross_pack_chain.py](mcp_server/atlas/cross_pack_chain.py) (the actual locus despite the bug-id naming). Now `for i, step in enumerate(steps): ... ; steps[i] = step`. (BUG-F2#3)
+- **`atlas_extract_chain` emitted `create_audio_track` for `GroupTrack` and `ReturnTrack` source types**, breaking routing topology when the plan was executed. Now emits `create_return_track` for ReturnTrack and `manual_step` (with clear instructions) for GroupTrack since LivePilot has no `create_group_track` tool. (BUG-E2#3 + #7)
+- **`atlas_extract_chain` `parameter_fidelity="approximate"` sorted by `abs(value)` instead of deviation-from-default** — pinned-max macros (127) ranked above intentionally-tweaked mid-range macros (50). Now cross-references the matching preset sidecar's factory default values and sorts by `abs(demo_value - preset_default)`. Falls back to `abs(value)` when no sidecar match. (BUG-E2#5)
+- **`atlas_extract_chain` listed `PluginDevice` in `_NATIVE_INSTRUMENT_CLASSES`** — would have emitted non-executable `insert_device(device_class="PluginDevice")` for any third-party VST/AU. Now routes PluginDevice to `manual_rebuild` action with vendor-name lookup instructions. (BUG-E2#PluginDevice)
+- **`atlas_extract_chain` fuzzy track-name match silently picked the first hit** when multiple tracks contained the substring (e.g. `track_name="plane"` against `drone-lab__emergent-planes` which has 6 tracks containing "Plane"). Now emits `matched_track` echo + `ambiguity_warning` listing the other candidates. (BUG-extract_chain-fuzzy)
+- **`atlas_macro_fingerprint` synonym dict failed on producer-stylized Unicode macro names**. Drone Lab presets use names like `"Nøize Ω"`, `"MØD Rate"`, `"Fil†er Amount"`, `"BLASTS ++"` — the dict had bland canonicals (`"volume"`, `"attack"`, `"tone"`) and never matched. Same-pack same-class lookup returned 0 matches despite 37 candidate sibling presets. Added `_ascii_fold()` with explicit Unicode glyph substitutions (ø→o, †→t, Ω→empty) before NFKD decomposition. Live-verified: same canonical repro now returns 4 matches (was 0); `MØD Rate` correctly canonicalizes to `lfo_rate`. (BUG-D#2)
+- **`atlas_macro_fingerprint.matching_macros` truncated to 1-2 items** even when many macros overlapped, defeating score auditing. Now caps at 5 with a `total_matching_macros: int` count field so callers know the full overlap. (BUG-D#3)
+- **`atlas_macro_fingerprint` docstring promised live-source path that raises `NotImplementedError`**. Updated to disclose that as of v1.23.4 only the corpus-source path is implemented; live-source is stubbed and returns an actionable error. (BUG-D#1)
+- **`atlas_transplant` REMAP `executable_steps` used naive global transpose**, not pitch-class-set transformation. The `_remap_pitch_class` function existed and computed correct per-note offsets but was only used in human-readable detail strings. Demo sidecars don't expose clip note data so per-note `modify_notes` (Option A) wasn't viable. Switched to Option B: emit `set_song_scale` step paired with the existing reasoning artifact, leveraging Live's scale-snap for scale-locked clips. Documented the limitation for non-snap clips. (BUG-C#1)
+- **`atlas_transplant` Phase-D macro-fingerprint suggestions carried wrong `decision` verb** (REMAP instead of REPLACE) — agents iterating the plan and matching `decision == "REMAP"` would conflate scale-degree transforms with preset-swap suggestions. Changed to REPLACE. (BUG-C#3)
+- **`atlas_transplant` accepted invalid `source_namespace` and silently fell through** to a minimal-fallback struct with a generic warning. Added explicit allow-list guard at function entry — returns `{"error": "Unknown source_namespace: '...'", "status": "error"}`. (BUG-C#4)
+- **`atlas_transplant` output `source.entity_id` echoed input form instead of canonical resolved slug** (`drone_lab__earth` stayed underscored even after the lookup resolved against the hyphenated sidecar). Now resolves to canonical hyphen form. (BUG-C#5)
+- **`atlas_transplant._detect_producer_anchor` returned only the first match** in `_PRODUCER_ANCHORS`, so `target_aesthetic="arca metallic"` on a `drone-lab` source silently lost the Arca anchor. Now checks target_aesthetic keywords first (more relevant), then source entity_id, deduplicates, and joins both anchors into the reasoning artifact. (BUG-C#6)
+- **`atlas_pack_aware_compose` Henke/Monolake artist alias mapped to wrong slug** because `_parse_artist_section` slugified `"Robert Henke (Monolake)"` to `"robert_henke_monolake"` while `_ARTIST_ALIASES` pointed `"henke"` and `"monolake"` to `"robert_henke"`. The vocabulary lookup returned empty → pack_anchors never loaded → cohort dilution. Fixed by stripping parenthetical aliases in `_parse_artist_section` before slugifying. Same fix automatically resolves Aphex Twin, OPN, Plastikman, Com Truise, and any other artist with parenthetical alternates. Verified: dub-techno-spectral-drone-bed brief now correctly produces a `[pitchloop89, convolution-reverb, drone-lab]` cohort. (BUG-F1#1)
+- **`atlas_pack_aware_compose` `track_count` silently capped at 12** with no signal that the response was truncated. Extended `_DEFAULT_ROLE_MIX` from 12 to 20 entries, added `requested_vs_returned: {requested, returned, max_supported}` field when truncation happens. (BUG-F1#3)
+- **`atlas_pack_aware_compose` had ~30 latent vocabulary gaps** for cross-workflow themes (footwork, breakcore, juke, jungle, orchestral, etc.) and 9 broken genre aliases pointing to nonexistent vocab keys (`"ambient"` → `"ambient"` when the vocab key was `"ambient_drone"`). Footwork/breakcore briefs no longer fall through to a generic ambient cohort. (BUG-F1#4 + 9 latent broken aliases)
+- **`atlas_pack_aware_compose` eclectic mode for Mica Levi briefs returned `"industrial pastoral"` boilerplate** because Mica Levi was missing from `_ARTIST_ALIASES`, orchestral packs were missing from `_PACK_AESTHETIC_AXES`, and `tension_resolution` was a static template that didn't interpolate the actual cohort. Added Mica Levi + Bibio + Caterina Barbieri + Henderson + Iftah + Reich + Reznor/Ross aliases; added orchestral pack axes; rewrote tension_resolution to interpolate the real cohort. (BUG-F1#5)
+- **`atlas_pack_aware_compose` preset deduplication broke under small cohorts** — 4 of 6 tracks could end up with the same preset because `_select_preset_for_role` early-exited on "strong" fingerprint, ignoring the caller's `used_presets` exclusion intent. Now threads `used_presets` into the function and skips already-used during scoring. Verified: a representative `decayed-pad` brief now produces 6 unique presets across 6 tracks. (BUG-F1#6)
+- **`atlas_pack_aware_compose` wrote `tension_resolution` to BOTH `track_proposal[0]` AND `reasoning_artifact`** (double-write). Removed the track-level write; the reasoning artifact is the source of truth. (BUG-F1#7)
+- **`atlas_cross_pack_chain` numeric value extractor matched digits inside device names** — text "PitchLoop89 with Pitch A +0.05 cents" returned `89` instead of `0.05`. Added negative lookbehind `(?<![A-Za-z\d])` to the regex. (BUG-F2#1)
+- **`atlas_cross_pack_chain` mid-line `→` inside parentheses shattered one step into 3 garbage steps** — Henke workflow text "(voice A → R, voice B → L)" caused the splitter to emit three truncated lines. Replaced bare `re.split` with paren-aware splitter that masks `(...)` blocks before detecting split positions. (BUG-F2#2)
+- **`atlas_cross_pack_chain` verb pattern `"chain "` false-positively matched `"Sidechain"` and `"master-bus chain"`** — text like "Sidechain Compressor on the 808" wrongly classified as `set_track_send`. Tightened to `"chain to "` / `"chain into "`. (BUG-F2#5)
+- **`atlas_cross_pack_chain` numbered-continuation lines retained stale step number in `raw_text`** — output step renumbered as 3 still had `raw_text` starting with `"2. → ..."`. Now appends number-stripped `content` instead of original `line`. (BUG-F2#6)
+- **`atlas_cross_pack_chain.workflow_meta` did not propagate `devices_used`** from the YAML — callers had to re-query the atlas to know what devices a workflow needed. Added the field. (BUG-F2#7)
+- **`atlas_cross_pack_chain` pack-prefixed load lines mis-classified as `manual_step`** — text like `"Inspired by Nature \`tree_tone\` on a sustained Cmaj7 chord"` (pack name shadowing the device-name match) failed `startswith` check on `_KNOWN_DEVICE_FRAGMENTS`. Extended classifier to substring-search the device fragment in the first 80 chars after the prefix, with `_` → space normalization so `tree_tone` matches the `tree tone` fragment. (BUG-F2#4)
+- **`atlas_demo_story` `focus_tracks` filter was exact-match only** — `focus_tracks=["drum","kit"]` against track named `"4-Ship Noise Kit"` returned empty. Now uses fuzzy substring match: `not any(tok.lower() in t_name.lower() for tok in focus_tracks)`. (BUG-E2-focus)
+- **`atlas_demo_story` terse mode stripped the producer-vocabulary anchor** — the terse branch never called `_detect_producer_anchor` even though pack identity is the most useful anchor in a 2-3 sentence summary. Now emits one-line anchor in terse output. (BUG-E3)
+- **`atlas_demo_story` `production_decision` fell back to raw class name** when `user_name` was empty — `"'InstrumentGroupDevice' adds textural density."` Now falls back to track name when user_name is missing. (BUG-E5)
+- **`atlas_demo_story` bad-ID error suggested a shell command** (`"use ls ~/.livepilot/..."`) instead of listing real demo IDs an LLM caller can actually use. Now enumerates `DEMO_PARSES_ROOT` and includes 10 real `available_demos` in the error response. (BUG-E6)
+- **`ensure_analyzer_on_master` cold-start timeout** — first call after Live boot timed out at 15 s on a fresh empty session even when the analyzer was at the expected User Library path. Recorded as a known intermittent (workaround: retry; underlying browser-cache cold-start latency). Tracked but not fixed in v1.23.4. (BUG-T#1)
+
+### Added (architectural — supports the Phase E/F fixes above)
+- **`mcp_server/atlas/preset_resolver.py`** — new shared helper module that maps a demo track's device (class + user_name) to its matching preset sidecar. Returns `{found, match_type, sidecar_path, preset_name, macro_names: {idx: name}, browser_search_hint: {name_filter, suggested_path}, preset_file}`. Powers BUG-E2#1 (Macro N → real names) and BUG-E2#4 + BUG-F1#2 (load_browser_item URI hint). Exposes `resolve_preset_for_device()`, `lookup_macro_name()` convenience getter, and `emit_load_step()` for plan emitters. Tested at 12/12 with synthetic + real-corpus integration tests.
+- **38 net-new tests** across the wave (12 preset_resolver + 19 extract_chain + 7 cross_pack_chain new test classes + supporting fixtures). Total suite: **3313 passing, 1 skipped, 0 failed** (up from 3180 in v1.23.3).
+
+### Fixed (2026-04-30 round 5 — deep verification + 16 surfaced bugs)
+After rounds 1-4 the suite was at 3323 tests passing. Round 5 dispatched 3 parallel sonnet agents for deep verification (corpus-wide crash sweep, cross-tool integration, edge cases + property invariants) — all 6 property invariants passed (`load_browser_item` shape, dry-run flag, scale source provenance, macro addressing, chain depth ≤4, REPLACE steps populated). The crash sweep covered **104 demos × 6 tools** with 0 failures. Integration + edge testing surfaced 16 NEW bugs that 4 fix agents resolved in parallel.
+
+- **`atlas_transplant` PRESERVE `load_browser_item` steps were missing `browser_search_hint`** while `extract_chain` and `pack_aware_compose` had been emitting them since round 4 — inconsistent across tools, breaking the `search_browser → load_browser_item` execution pattern when an agent pulled a transplant plan. Fix routes through `preset_resolver.emit_load_step` with manual fallback. Verified: 6/6 PRESERVE steps on `drone-lab__earth` cinematic transplant now carry hint. (BUG-NEW#1)
+- **`atlas_transplant` REPLACE decisions stripped the `detail` field** from `translation_plan` entries — agents iterating the plan to read `detail.remove_device` / `detail.add_device` always got `None`, even though `executable_steps` had the right delete/insert sequence. The internal decision dict carried `detail`, but the plan-builder only copied `element/decision/rationale/executable_steps`. Single-line fix added `"detail": dec.get("detail")` to the dict-builder. (BUG-INT#3)
+- **Type-coercion family (5 bugs) — direct Python callers crashed on string-typed numeric params.** The MCP transport layer's `_coerce_schema_property` widens int/number params to also accept strings (Pydantic lax-mode coerces at the boundary), but direct callers bypass that. `atlas_macro_fingerprint(top_k="10")` raised `TypeError: slice indices must be integers`. `atlas_pack_aware_compose(track_count="5")` raised `TypeError: '<' not supported between 'int' and 'str'`. `atlas_pack_aware_compose(target_bpm="125.0")`, `atlas_transplant(target_bpm="130.0")`, and `atlas_cross_pack_chain(customize_aesthetic={"target_bpm": "bogus"})` all crashed similarly. Fix added `_coerce_int()` / `_coerce_float()` helpers in `pack_aware_compose.py` and try/except guards at every wrapper-level cast. Bogus strings now silently fall back to defaults instead of crashing. (BUG-EDGE#1, #2, #3, #4, #5)
+- **`transplant()` accepted `target_scale_root=99` (out of pitch-class range) and stored it verbatim**, emitting an invalid `set_song_scale root=99` step. `tools.py` wrapper guard only rejected `< 0`, not `> 11`. Updated guard to `not (0 <= target_scale_root <= 11)` with explicit `-1` sentinel carve-out. Verified: `target_scale_root=99` returns a clear error, `target_scale_root=11` (B) still works. (BUG-EDGE#7)
+- **`transplant()` inner function had no sentinel guard for `target_scale_root=-1`** — direct callers got a phantom REMAP decision and an invalid `set_song_scale root=-1` step. Fixed at function entry: normalize `< 0` to `None` to match the wrapper. (BUG-EDGE#6)
+- **`atlas_cross_pack_chain` `load_browser_item` steps missed `browser_search_hint` when leading-noun lines defeated the device-name regex.** Lines like `"→ Echo with subtle wow/flutter"` and `"→ Reverb with cathedral IR"` were correctly classified as `load_browser_item` (because "echo" / "reverb" are in `_KNOWN_DEVICE_FRAGMENTS`) but `_extract_device_name()` returned None — no `device_name` → no hint. Fix adds a fallback scan of the first 80 chars against `_KNOWN_DEVICE_FRAGMENTS` after the regex misses. New `_FRAGMENT_TO_SUGGESTED_PATH` dict routes native FX fragments to `audio_effects` and synth fragments to `instruments` instead of the broad `sounds` default. Affected workflows: `boc-decayed-pad` (Echo, Reverb), `bibio-diy-bedroom-pop`, `henke-full-granular-chain`. (BUG-INT#1 / BUG-NEW#3)
+- **`atlas_cross_pack_chain` `transpose_semitones` override silently no-op'd on 13/15 workflows** — the override loop only mutated existing `set_device_parameter` steps with parameter_name containing "pitch/note/transpose/tune", but most workflows parse as `manual_step` or `load_browser_item`. The transpose request was silently dropped. Fix appends a `manual_step` row signaling the transpose attempt when no existing steps are mutated. Verified: `boc_decayed_pad` with `transpose=-3` now emits 1 `manual_step`; `dub_techno_spectral_drone_bed` (which DOES have parseable Pitch A param) still mutates values without double-emit. (BUG-NEW#2)
+- **Chain-recursion asymmetry — `atlas_extract_chain` and `atlas_demo_story` weren't walking into `dev.chains[]` even though `atlas_transplant` was** (added in round 2). On `mood-reel__chapter-one-by-thomas-ragsdale` track `3-Saturn Ascends`, `transplant` correctly surfaced Erosion (6 occurrences), but `extract_chain` reported only `[InstrumentGroupDevice, Delay, AudioEffectGroupDevice]` and `demo_story`'s narrative said the same — a producer asking "what's in this rack?" got 3 different answers from 3 tools. New `_collect_inner_chain_classes(dev, depth)` helper in extract_chain.py walks chains up to depth 4 and exposes them via a new `inner_chain_classes` field on each device + a compact `chain_summary` field on the rack's `load_browser_item` / `manual_rebuild` step (e.g. `"Nasal Bass → Pedal → Erosion → Limiter"`). `demo_story.py`'s `_build_chain_summary` was rewritten to recurse with bracket notation: `"InstrumentGroupDevice (Saturn Ascends) [InstrumentVector → Pedal → Erosion → Limiter]"`. Plan size unchanged (no nested execution steps). (BUG-INT#2)
+- **`atlas_extract_chain` empty `track_name` silently picked the first track** because `"" in any_string` is always True in Python — pass-2 of `_find_track_by_name` matched every track. Added entry-point guard returning `{"error": "track_name is required and cannot be empty.", "available_tracks": [...]}`. (BUG-EDGE#8)
+- **`atlas_pack_aware_compose` cap-at-20 truncation wasn't surfaced in `warnings`** — the `requested_vs_returned` field had it, but callers iterating the canonical `warnings` list missed the alert silently. Fix appends a human-readable warning when truncation happens. (BUG-EDGE#9)
+- **`atlas_pack_aware_compose` `pack_cohort` was nested inside `brief_analysis`** but the docstring + CLAUDE.md described it as top-level — `r.get("pack_cohort")` returned None, breaking caller code that followed the docs. Added top-level alias while keeping `brief_analysis.pack_cohort` for backwards compatibility. (BUG-NEW#4)
+
+### Fixed (2026-04-30 round 4 — startup warning + PluginDevice metadata)
+- **Tool-count startup warning fired spuriously on direct tool-module imports.** Importing any tool module (e.g. `mcp_server.atlas.tools`) triggered `server.py` to run its self-test mid-import — at that moment, the importing module's own `@mcp.tool()` decorators hadn't yet fired (Python suspends the original import while server.py loads), so the registry probe under-counted by ~19 tools and the user saw `STARTUP SELF-TEST WARNING — _get_all_tools() returned 420 tools, expects 439` even on a healthy install. Fix: split `_assert_tool_registry_accessible()` into two phases. The "registry probe is at all accessible" guard (`actual > 0` — catches FastMCP internals breakage) stays at module load. The exact-count comparison (`actual == expected`) moved into a new `_assert_expected_tool_count()` called from `main()`, so all tool-module imports have completed regardless of which import path brought server.py in. The contract test (`tests/test_tools_contract.py::test_total_tool_count`) is unchanged and remains the authoritative drift gate. (BUG-T#2)
+- **PluginDevice metadata extraction.** Third-party VST/AU/AAX plugins were previously surfaced as opaque `{class: "PluginDevice", user_name: "Serum"}` in sidecars, leaving `extract_chain`'s `manual_rebuild` step with nothing more than a class name to feed the agent. The .als XML format actually exposes plugin identity in plain XML (only the per-plugin parameter buffer is binary). New `_extract_plugin_metadata()` parses the `<PluginDesc>` block and pulls `{format, name, manufacturer, file_name, unique_id, exposed_param_count}` for VstPluginInfo / Vst3PluginInfo / AuPluginInfo / AaxPluginInfo variants. The factory-pack corpus contains zero PluginDevice instances (factory content can't depend on user-installed plugins), so 8 synthetic-XML fixture tests guard against rot. `extract_chain.py` was updated to surface the plugin field + emit a `browser_search_hint: {name_filter: "<plugin display name>", suggested_path: "plugins"}` so the agent can `search_browser` to find the plugin in Live's plugins/ folder. The note text now reads "'X' is a VST plugin by Valhalla DSP. Use search_browser..." instead of the previous generic placeholder. Param VALUES remain opaque per the .als format limitation — documented in the note. Old sidecars without the `plugin` field continue to work via the user_name fallback. (BUG-PARSER#5)
+
+### Fixed (2026-04-30 round 3 — scale data enrichment)
+- **Live 9/10 `.als` files left scale mode as a numeric index in 44 demo sidecars** (every Building Max Devices tutorial, plus a few cross-pack files). `scale.name` was a digit string like `"0"` or `"10"` instead of a mode name. Added `_LIVE_MODE_INDEX_TO_NAME` mapping (15 modes including the older Whole Tone / Diminished / Pentatonic / Harmonic Minor / Melodic Minor variants) and decode at the bottom of `get_scale()`. Verified: `building-max-devices__after-effects-export` now reports `Major` (was `"0"`); `final-result` reports `Minor Blues` (index 10); `arpeggiator` reports `Dorian` (index 2). Bonus discovery: `lost-and-found__lost-and-found-demo-set-01` now correctly surfaces `Harmonic Minor` (was masked as `"0"`). All 44 affected sidecars resolved. (BUG-PARSER#3)
+- **Mood Reel construction-kit `.als` files store `C Major` at the LiveSet level** even when the producer-meaningful key is encoded in the filename (e.g. `Hope For The Future Fmin 130 bpm.als`). Ableton populated the per-clip ScaleInformation but left the project-level default. Added a filename-key fallback: when the .als-extracted scale is the C Major default AND the filename matches `\b([a-g][#b]?)(maj|min)\b`, the sidecar overrides with the filename-derived key and stamps `scale.source: "filename-fallback"`. When the .als has a non-default scale, it's trusted (`scale.source: "als-extract"`). Verified end-to-end via `atlas_demo_story` and `atlas_transplant`: Hope For The Future now reports `F Minor` (was C Major); Empty Streets reports `F# Minor`; Bright Side reports `G Major`. All 19 affected Mood Reel sidecars corrected. The 36 demos that genuinely have no key (tutorials, drone improvisations) keep `als-extract` C Major — fallback only fires when the filename actually encodes a key. (BUG-PARSER#4)
+
+### Fixed (2026-04-30 round 2 — both deferred parser bugs)
+- **`.adg` parser dropped 4 of 8 named macros on Pioneer Drone** (and similar ratios on other multi-rack presets). Root cause was richer than BUG-PARSER#1: the outer `InstrumentGroupDevice` literally stores generic `"Macro 4/5/6/8"` strings in its own `MacroDisplayNames` elements — the authentic names ("Movement", "Attack", "Release", "Volume") only exist on a nested `DrumGroupDevice`'s `MacroDisplayNames`. Ableton resolves the displayed name at runtime by following the macro binding encoded in each inner rack's `MacroControls.<i>/KeyMidi`: `Channel=16` signals an Ableton rack-macro mapping and `NoteOrController` holds the **outer rack macro index** the inner macro is bound to. The parser now scans nested branch presets for these `Channel=16` bindings and back-fills any "Macro N" slot on the outer rack with the inner rack's named `MacroDisplayNames.<i>`. Live-verified: Pioneer Drone now exposes all 8 names (Rift Rate, Crunch, Pitch, Movement, Attack, Release, Reverb, Volume); spot-checks on Shimmer & Sheen and Tubular Bells likewise resolve every named slot. All 3,813 .adg files re-parsed in 52.3 s. (BUG-PARSER#2)
+- **Demo `.als` sidecars now expose nested rack-chain devices** — the `extract_device_summary` function previously returned a flat dict per device with no `chains` field, so REPLACE rules in `atlas_transplant` couldn't see Vinyl Distortion / Erosion / Redux when they lived inside racks (which is where producers actually put them). New schema (Schema A — nested): each rack device gains `"chains": [{"name": str, "devices": [<recursive>]}]`, with recursion capped at depth 4. The new `_extract_rack_chains()` helper follows `branch → DeviceChain → *DeviceChain → Devices` so it covers every Live chain variant (MidiToAudio, AudioToAudio, MidiToMidi) without hardcoded class names. All 104 .als files re-parsed in 13.0 s. Atlas-side `_extract_source_structure` in [transplant.py](mcp_server/atlas/transplant.py) was extended with `_walk_device_chain()` that recursively flattens the new schema into `device_inventory` — REPLACE rules now fire correctly. **42 demos in the corpus** now expose REPLACE-targetable devices (was 0 before this fix); end-to-end verification on `mood-reel__chapter-one-by-thomas-ragsdale` produces 2 REPLACE decisions (Vinyl Distortion + Erosion → Saturator/remove for `clean orchestral` target). (BUG-C#2)
+- **End-to-end victory:** `atlas_extract_chain(demo_entity_id="drone-lab__earth", track_name="Pioneer Drone", parameter_fidelity="exact")` now produces an 11-step plan where ALL 8 macros carry producer-assigned names AND match the live Ableton ground truth values exactly: Rift Rate=1.0, Crunch=40.0, Pitch=77.0, Movement=10.0, Attack=115.0, Release=115.0, Reverb=64.0, Volume=95.25. Before this session: 2-step plan with no values and no URI. Before this round: 8 values but only 3 producer-assigned names.
+
+### Added (User Corpus + Plugin Knowledge Engine — flagship feature)
+- **User Corpus subsystem (`mcp_server/user_corpus/`)** — 14 new MCP tools that turn LivePilot's reasoning brain from "Ableton-shipped only" into "your actual library". The factory atlas knows 5264 devices across 33 Ableton packs; the user corpus indexes whatever else is on your machine — third-party VST3 / AU / AUv3 / VST2 / AAX / CLAP / LV2 plugins, your `.amxd` Max for Live devices, your `.adg` rack library, your sample folders. The result lives at `~/.livepilot/atlas-overlays/user/<entity_type>/<id>/identity.yaml` and is loaded by every reasoning tool (`atlas_search`, `atlas_chain_suggest`, `atlas_macro_fingerprint`, `atlas_describe_chain`) alongside the factory atlas, with each result tagged `source: factory_atlas | user_overlay:<namespace>` so the agent always knows whether a recommendation came from Ableton stock or your gear.
+- **Plugin Knowledge Engine — 4-phase pipeline** (`mcp_server/user_corpus/plugin_engine/`):
+  - **Phase 1 — DETECT (`detector.py`)** — Walks platform plugin folders (`/Library/Audio/Plug-Ins/{VST3,Components}`, `~/Library/Audio/Plug-Ins/{VST3,Components}`, `~/Library/Application Support/Avid/Audio/Plug-Ins`, etc.) AND runs `auval -a` to enumerate AUv3 / Mac Catalyst plugins that don't live in standard Components folders. The auval path closed a silent ~66-plugin coverage gap on iOS-port-to-Mac plugins (Moog Animoog Z, Model 15, Cem Olcay's MIDI suite, Drambo, FieldScaper, AudioLayer, Audulus 4 — all previously invisible). Captures format, vendor, version, bundle ID, AU 4-char codes resolved via bundle reverse-DNS + copyright-string regex.
+  - **Phase 2 — CANONICALIZE (`tools.py::corpus_canonicalize_plugins`)** — Dedupes by `(canonical_vendor, normalized_name)` and prefers VST3 > AU > AAX/VST2/CLAP/LV2 as the primary format. Vendor canonicalization strips suffix variants ("Valhalla DSP, LLC" / "Valhalladsp" / "Valhalla DSP" all resolve to `valhalla`). Each canonical record carries `formats_available: [VST3, AU, AAX]` for reference but emits **exactly one** `format:<primary>` tag for indexing — eliminates the dual-indexing bug where a single plugin would show up twice in `format:au` AND `format:vst3` searches.
+  - **Phase 2.5 — CLUSTER (`tools.py::corpus_cluster_plugins`)** — Groups canonicalized plugins by vendor for batched research. Vendors with ≥2 plugins (Cem Olcay, ChowDSP, Valhalla, Moog, ElliottGarage) get one shared WebSearch + N synthesis runs; singletons get standalone treatment. Cuts per-plugin token cost by 3-5× on coherent product lines.
+  - **Phase 3 — RESEARCH (`tools.py::corpus_discover_manuals` + `corpus_research_targets`)** — Locates local manual files (PDFs, READMEs, plugin-bundle docs), then emits a structured WebSearch task packet the agent fulfills. The packet specifies queries, expected fields, and citation format so research output is consumable by Phase 4.
+  - **Phase 4 — SYNTHESIZE (`research.py` + `corpus_emit_synthesis_briefs`)** — Emits per-plugin briefs for sonnet-subagent dispatch. Each brief contains synthesis_inputs (manual + research_cache + preset_examples) and the synthesis_schema specifying every required field: `entity_id`, `entity_type: "installed_plugin"`, `name`, `description`, `tags` (with the **exactly-one-format** rule), `artists`, `sonic_fingerprint`, `reach_for`, `avoid`, `key_techniques`, `parameter_glossary`, `comparable_plugins`, `genre_affinity`, `producer_anchors`. The schema explicitly tells the agent what makes a producer-actionable identity vs a generic feature list.
+  - **Trim tool (`tools.py::corpus_trim_plugin_identity`)** — For utility plugins the user explicitly deprioritizes, slims an existing yaml to the overlay-required minimum (entity_id, entity_type, name, description, tags, artists). Used to keep search hits clean — a Pure Data wrapper or internet-radio AU stays indexed but doesn't bloat search context with its full schema.
+- **Scanner ABC + 4 namespaces (`mcp_server/user_corpus/scanners/`)** — Pluggable scanner registry. Built-in scanners: `amxd` (Max for Live devices — patcher-JSON inspection for tag enrichment beyond filename keywords), `preset` (.adg / .aupreset / .vstpreset), `als` (project files), `audio` (sample folders), `plugin_inventory` (the Phase 1 detector wrapped as a scanner). Each scanner emits to its own namespace under `~/.livepilot/atlas-overlays/`: `user/`, `m4l-devices/`, `packs/`, `elektron/`. AppleDouble `._*` files explicitly excluded across all scanners (a real bug that bit 217 .amxd devices in the personal corpus dogfood).
+- **Atlas overlay reasoning wiring (`mcp_server/atlas/overlays.py` + `tools.py`)** — `atlas_search`, `atlas_chain_suggest`, `atlas_macro_fingerprint`, and `atlas_describe_chain` now consult the user overlay alongside the bundled atlas with a 50/50 result-budget split. Each result carries `source` tagging so the agent knows the provenance. New `OverlayIndex` singleton with AND-token search semantics across all 4 namespaces (~800+ entries indexed end-to-end on a typical machine). Loader is idempotent and lazy — `load_overlays()` mutates the singleton in place, so reload is safe.
+- **Tokenizer fix for hyphenated producer-vocabulary queries (`overlays.py::_tokenize`)** — Producer-style queries use natural-language phrasing ("Kraftwerk-style bass", "OTT-style multiband", "J Dilla SP-404 vibe") that the previous whitespace-only splitter rejected because hyphenated tokens never substring-matched indexed fields. Fixed: tokenize on whitespace + hyphens + apostrophes + slashes; drop stop-words (`style`, `vibe`, `tone`, `mood`, `era`, `school`, `like`, `kind`, `feel`, …); drop tokens shorter than 3 chars except domain-preserved short tokens (`fm`, `eq`, `808`, `303`, `dx`, etc.). End-to-end verification: "Kraftwerk-style bass" → `[kraftwerk, bass]` → `moog-model-d`; "OTT-style multiband" → `[ott, multiband]` → `brambos-woott`; "hysteresis tape" → `chow-chowtapemodel`.
+- **`livepilot/skills/livepilot-corpus-builder/` skill** — Agent skill that drives the 4-phase pipeline interactively. Walks the user through path confirmation, scanner selection, AI-annotation opt-in. Documents the canonicalize → cluster → research → synthesize dispatch pattern, the Wave A vs singleton-batch routing, and the post-process trim step for deprioritized plugins.
+- **`docs/USER_CORPUS_GUIDE.md` + `docs/PLUGIN_KNOWLEDGE_ENGINE.md`** — Full walk-through documentation. The corpus guide covers the user-facing pipeline (detect → canonicalize → cluster → research → synthesize) with example commands. The engine doc covers the architectural complement: how the engine indexes "what the plugins ARE" (sonic identity) vs the file-level corpus indexing "what's on disk" (file inventory).
+- **Tool count: 439 → 453** (14 new `corpus_*` tools).
+
+### Added (original v1.23.4 entries)
+- **`atlas_pack_aware_compose` + `atlas_cross_pack_chain`** — Pack-Atlas Phase F. Two orchestration tools that wire the corpus into the LivePilot composer and execute multi-pack workflows. `atlas_pack_aware_compose` bootstraps a project with pack-coherent track selection from an aesthetic brief — parses artist/genre vocabularies, builds a pack cohort, selects real presets via macro-fingerprint similarity, and returns a full executable plan. Supports `pack_diversity="eclectic"` mode for deliberate aesthetic-conflict compositions with `tension_resolution` reasoning artifact. `atlas_cross_pack_chain` executes any of the 15 cross-pack workflow recipes step-by-step — parses signal_flow (numbered multi-line, list-of-strings, or list-of-dicts) into load_browser_item / insert_device / set_device_parameter / fire_clip / set_track_send actions; supports aesthetic overrides (`target_scale`, `target_bpm`, `transpose_semitones`); all execution is dry-run (result: "dry-run"). Both tools integrate Phases C+D+E: macro-fingerprint for preset selection, extract_chain step structure for executable plans, transplant aesthetic-replace logic for overrides. New files: `mcp_server/atlas/pack_aware_compose.py`, `mcp_server/atlas/cross_pack_chain.py`. Tool count: 437 → 439.
+- **`atlas_demo_story` + `atlas_extract_chain`** — Pack-Atlas Phase E. Two complementary tools that turn the 104 demo .als sidecars into actionable artifacts. `atlas_demo_story` synthesizes a track-by-track narrative + production-sequence inference + suggested learning path from a demo sidecar. `atlas_extract_chain` surgically rebuilds a specific demo track's device chain as a dry-run execution plan (load_browser_item + insert_device + set_device_parameter steps), with three parameter-fidelity modes: exact, approximate, structure-only. Both tools read from local JSON sidecars — no Live connection required. New files: `mcp_server/atlas/demo_story.py`, `mcp_server/atlas/extract_chain.py`. Tool count: 435 → 437.
+- **`atlas_transplant`** — Pack-Atlas Phase C. Source-to-target structural translation: adapts a demo project, preset chain, or workflow recipe from one musical context (BPM, scale, aesthetic) to another. Four decision types: PRESERVE (pitch intervals, macro ratios), SCALE (rhythmic density × BPM ratio with sanity clamp at ratio > 2.0), REMAP (scale-locked notes via pitch-class-set transformation, 7-mode table), REPLACE (aesthetic-incompatible devices — e.g. Vinyl Distortion → Saturator for cinematic target). Returns structured plan with executable `load_browser_item`, `set_device_parameter`, `set_clip_pitch`, `set_tempo` steps. Producer-vocabulary anchors in `reasoning_artifact` for known pack/aesthetic combinations. Integrates Phase D macro-fingerprint matcher for preset-source paths. New file: `mcp_server/atlas/transplant.py`. Performance: <0.4s p95. Tool count: 434 → 435.
+- **`atlas_macro_fingerprint`** — Pack-Atlas Phase D. "More like this" search across all 3,813 preset sidecars by macro-fingerprint similarity. Source can be any corpus preset (pack slug + sidecar path). Scoring: 0.6 × macro-name-overlap-ratio (synonym-aware — 30-key synonym dict, top corpus vocabulary) + 0.4 × (1 − mean value distance). Returns top-K matches with per-match rationale prose and `[SOURCE: adg-parse]` citation. New file: `mcp_server/atlas/macro_fingerprint.py`. Performance: <0.3s p95 full corpus scan (3,813 sidecars, 33 packs). Live-device source path stubbed with `NotImplementedError` (`TODO: Phase D follow-up`). Tool count: 433 → 434.
+
+## v1.23.3 — 2026-04-25
+
+### Fixed
+- **`classify_simpler_slices` now classifies slices when `file_path` is omitted (the v1.12 follow-up, finally closed).** The tool's docstring promotes "Always run this before programming drum patterns on a sliced break", but the file_path lookup had been a no-op since v1.11 — wrapped in `try/except` with the comment *"Bridge command may not exist yet"* and a fallback error message *"v1.12 follow-up"*. End-to-end verification against Ableton 12.4 + a Splice sliced break ("ff_mch_122_drum_loop_first_perc.wav"): all 23 slices get correct `label` (KICK/SNARE/HAT/ghost) + spectral breakdown, no manual `file_path` argument needed.
+- **Pivot from M4L bridge to Remote Script TCP** for the file-path lookup. The bridge round-trip surfaced a chunked-response correlation issue under live testing (the second successive `bridge.send_command` returned the *previous* command's payload). The Remote Script handler reads `device.sample.file_path` directly via Live's Python LOM — no UDP packets, no chunk reassembly, no ambiguity. Implementation:
+  - `remote_script/LivePilot/simpler_sample.py` — adds `@register("get_simpler_file_path")` handler. Resolves the SimplerDevice (with Drum Rack chain support via optional `chain_index` / `nested_device_index`), reads `device.sample.file_path`, returns `{file_path, track_index, device_index, name, ...}`.
+  - `mcp_server/runtime/remote_commands.py` — registers `get_simpler_file_path` in `REMOTE_COMMANDS` (TCP path, primary). The pre-existing entry in `BRIDGE_COMMANDS` stays for forward-compat — `execution_router.classify_step` puts REMOTE_COMMANDS first, so plans route TCP, but the bridge case is still callable as a fallback.
+  - `mcp_server/tools/analyzer.py::classify_simpler_slices` — Remote Script TCP call is primary; M4L bridge `bridge.send_command("get_simpler_file_path", …)` is the fallback path. Surfaces the Remote Script's specific error verbatim (e.g. "Simpler.sample.file_path is empty — sample may be embedded") instead of the generic v1.12 message.
+  - `m4l_device/livepilot_bridge.js` — `case "get_simpler_file_path"` + `cmd_get_simpler_file_path()` remain in the .amxd freeze for the fallback path.
+- **ff29381 (carried forward)**: `insert_rack_chain` returns `chain_index` so `add_drum_rack_pad` no longer clobbers chain 0 on the second pad. Live-verified against an empty Drum Rack on Ableton 12.4 — three sequential `insert_rack_chain` calls (`chain_index=0`, then `1`, then `0` with `chain_count=3` after position-0 insert).
+
+### Improved
+- **CI freshness gate is now source-of-truth-aligned.** The `amxd-freeze-drift` job in `.github/workflows/ci.yml` previously grepped for `"version": "X.Y.Z"` (the runtime ping JSON form), which only landed in the .amxd via post-export binary patching. Since the v1.20-era refactor to `"version": VERSION` (variable reference), every release needed manual byte-patching to satisfy this gate. Now greps for `var VERSION = "X.Y.Z"` — the source-of-truth declaration in `bridge.js` that always survives a Max freeze. No more binary-patching hack required for plain version bumps.
+
+### Bridge surface
+- 31 → 32 cases (`get_simpler_file_path` added — used as forward-compat fallback only; primary path is Remote Script TCP).
+- ⚠️ Re-freeze required for the .amxd. New freeze at `m4l_device/LivePilot_Analyzer.amxd` (md5 changed) — distributed to `~/Music/Ableton/User Library/Presets/Audio Effects/Max Audio Effect/` and `~/Documents/Max 9/Library/`. Workflow memory `feedback_amxd_edit_via_maxpat.md` updated to clarify the project-folder JS (`~/Documents/Max 9/Max for Live Devices/<DeviceName> Project/code/livepilot_bridge.js`) is the authoritative path Max freezes from — NOT the user search path `~/Documents/Max 9/Code/`.
+
+### Remote Script
+- 191 → 193 handlers. `+1` for `get_simpler_file_path` (this release). The other +1 came from a prior session's reload-handler registration count.
+
+### Tests
+- `test_bugfixes_2026_04_25.py` (locks the `chain_index` contract from ff29381) — passes.
+- `test_analyzer_tools.py::test_classify_simpler_slices_returns_error_when_no_file_path` — updated to reflect the v1.23.3 error contract: when both Remote Script and bridge fall back, the Remote Script's specific error (e.g. "Simpler.sample.file_path is empty") is surfaced verbatim.
+- Full suite: 3180 passed, 1 skipped, 0 failed.
+
+### Live-test verification log (Ableton 12.4)
+- `classify_simpler_slices(track=4, device=0)` on a 23-slice WAV drum break with no `file_path` argument → returns full classification (KICK/HAT/ghost labels + spectral % per slice). ✓
+- `classify_simpler_slices` with explicit `file_path` argument → bypasses lookup, classifies normally. ✓
+- `insert_rack_chain` end-to-end on empty Drum Rack → `chain_index` derivation correct in all 3 branches (append-on-empty, append-on-N, position-0-on-N). ✓
+
+## v1.23.2 — 2026-04-25
+
+### Fixed
+- M4L bridge `.amxd` ping version now matches the release version. v1.23.1 shipped with the frozen `LivePilot_Analyzer.amxd` still embedding `"version": "1.23.0"` (the m4l_device files weren't bumped during the v1.23.1 patch), which tripped the `amxd-freeze-drift` CI guard introduced after past releases lost to the same drift. In-place binary patch at offsets 32653 + 6691677 (same byte count, file size unchanged at 6,754,576 bytes), plus source bumps in `livepilot_bridge.js` (`var VERSION`) and `LivePilot_Analyzer.maxpat` (UI label) so the next freeze starts in sync.
+
+### Notes
+- Bridge functionality is unchanged from v1.23.1. This is a metadata-only patch: end users who looked at the bridge UI in v1.23.1 saw "1.23.0" — that's now corrected.
+- All distribution channels (npm, GitHub release MCPB, marketplace mirror) are re-published from this commit.
+
+## v1.23.1 — 2026-04-25
+
+### Fixed
+- `extension_atlas_search` multi-word queries returned 0 hits because the search did literal-substring matching. `"sophie ponyboy"` failed to match `"SOPHIE — Ponyboy kick"` because of the em-dash separator. Now: query is tokenized on whitespace, each token must match somewhere (AND semantics), per-token scores sum for ranking. Single-token queries collapse to the original behavior — fully backwards-compatible.
+
+### Tests
+- 3 new tests covering multi-token AND, em-dash separator handling, per-token score aggregation.
+
+## v1.23.0 — 2026-04-25
+
+### Added
+- **User-local atlas overlay mechanism** for extending the atlas with namespaced YAML content from `~/.livepilot/atlas-overlays/<namespace>/` (custom hardware libraries, signature chains, technique recipes). Survives npm updates. Generalizes the v1.22.0 user-scan pattern from "atlas data" to "any user-local namespace."
+- 3 new MCP tools (430 → 433):
+  - `extension_atlas_search(query, namespace?, entity_type?, limit?)` — weighted substring search across overlay entries
+  - `extension_atlas_get(namespace, entity_id)` — fetch a single overlay entry with full body (including `requires_firmware` if present)
+  - `extension_atlas_list(namespace?)` — enumerate namespaces + entity_type counts
+- New file: `mcp_server/atlas/overlays.py` — `OverlayEntry` dataclass, `OverlayIndex` class, `load_overlays()`, lazy path resolver, module-level singleton.
+- New doc: `docs/EXTENSION_API.md` — public API contract for extension authors.
+
+### Behavior
+- Atlas overlays load at server boot from `~/.livepilot/atlas-overlays/`. Non-fatal — server continues if missing or malformed.
+- Loader uses `yaml.safe_load` only (rejects Python tags). Per-file parse failures log a WARN and skip the file; per-entry validation failures log a WARN and skip the entry; duplicate `(namespace, entity_type, entity_id)` last-loaded wins with a WARN.
+- For `entity_type: signature_chain`, `tags` and `artists` are required (search ranker depends on them). Other entity types treat these as optional.
+- `entity_id` and `entity_type` are str-coerced to defend against YAML scalar values like `entity_id: 42`.
+
+### Notes for extension authors
+- The contract (`OverlayEntry` field names, `extension_atlas_*` tool API) is stable from v1.23.0 forward.
+- Tool-name collisions: FastMCP enforces first-registered-wins. Bundled tools always beat extensions.
+- Phase 2 (user-local Python extensions via `register(mcp)`) lands in a future minor version.
+
+Spec: `docs/superpowers/specs/2026-04-25-user-local-extensions-design.md` (gitignored, design-time artifact)
+Plan: `docs/superpowers/plans/2026-04-25-phase-1a-atlas-overlays-plan.md` (gitignored, implementation tracker)
+
+## 1.22.1 — Bundled enrichment coverage gate (April 25 2026)
+
+Closes the one item carried from v1.22.0's atlas-separation work: a
+visibility + soft-gate for the drift between the atlas file's
+self-reported enrichment count and the YAML files on disk.
+
+### What changed
+
+Two enrichment numbers now surface in `sync_metadata --check`:
+
+- **`enriched=N`** (existing) — YAML profiles authored in `mcp_server/atlas/enrichments/`. Measures "what's available for merge."
+- **`bundled_enriched=N`** (new) — `stats.enriched_devices` from the shipped `mcp_server/atlas/device_atlas.json`. Measures "what the last scan_full_library run actually applied at build time."
+
+These measure different things. YAML count is authoring effort; bundled
+count is runtime coverage as of the atlas's last regeneration. They
+drift naturally (someone adds a YAML without re-scanning) — but until
+v1.22.1 the drift was invisible to CI.
+
+### Soft gate
+
+Warns (doesn't fail) on two conditions:
+
+1. **`bundled_enriched == 0`** with YAMLs on disk — scanner never ran
+   or failed completely. Most likely the repo's bundled atlas got
+   accidentally emptied or mis-committed.
+2. **`bundled_enriched / yaml_count < 50%`** — scanner truncated or had
+   severe pack-coverage failures. Current shipped atlas is 87/120 = 72%
+   coverage (healthy — the 33 orphan gap is the miditool-domain YAMLs
+   that Live's browser scanner can't see).
+
+Why soft: the relationship `yaml >= bundled` is only true in
+single-pack-scan scenarios. Multi-category duplication (native +
+max_for_live + user_library for the same device_id) can push
+`bundled > yaml`. Strict equality would produce false alarms. The soft
+gate catches the two real failure modes while staying silent on healthy
+cases.
+
+### Output format
+
+```
+Source of truth: version=1.22.1, tools=430, domains=53, bridge_cmds=31,
+                 enriched=120, bundled_enriched=87, genres=4, moves=44,
+                 analyzer_tools=38, atlas_devices=5264
+```
+
+Warnings (if any) print above the fail/pass line with a ⚠️ header,
+separate from the issue list. The exit code is unchanged — warnings
+don't fail CI.
+
+### Tests
+
+7 new TDD tests in `tests/test_claim_consistency.py`. Full suite: 3143
+pass (3136 prior + 7 new), 1 skipped.
+
+### Why this is a patch, not a feature
+
+Pure CI-gate tightening. Zero user-visible runtime behavior change;
+the only observable delta is one additional field in the banner plus
+the possibility of a soft-warning line during `sync_metadata --check`.
+No new tools, no atlas behavior change. The v1.22.0 user/bundled split
+is the feature release; v1.22.1 is its mechanical follow-through.
+
+## 1.22.0 — User atlas separation: ~/.livepilot/atlas/ (April 25 2026)
+
+First v1.22 release. Splits the device atlas into two files that serve
+different roles — a long-standing ambiguity that finally bit hard enough
+to be worth fixing at minor-version scope.
+
+### What changed
+
+**New: `~/.livepilot/atlas/device_atlas.json`** — the **user atlas**.
+Written by `scan_full_library` on your machine. Reflects YOUR installed
+packs, User Library, and plugins. Lives in the user-data directory
+(same convention as `~/.livepilot/memory/`) so `npm install livepilot`
+upgrades can't blow it away.
+
+**Unchanged: `mcp_server/atlas/device_atlas.json`** — the **bundled
+baseline**. Ships with the package (still 5264 devices, 120 enriched
+— stock Ableton 12 Suite inventory). Gives fresh installs a functional
+atlas before any personalized scan has run.
+
+**Resolution** at load time: user atlas wins if present, else bundled
+baseline falls through. Writes **always** go to the user path; the
+bundled path is read-only from the scanner's perspective.
+
+### Why this matters
+
+Prior to v1.22.0, the single `mcp_server/atlas/device_atlas.json` file
+served three conflicting roles — repo seed, personal scan cache, and
+runtime index. Three bugs resulted:
+
+1. **`npm install livepilot` wiped personal scans.** Every package
+   update overwrote the installed atlas with the bundled baseline. Users
+   who had carefully scanned their library (30-90 seconds per scan) lost
+   that work on every upgrade with no warning.
+2. **Dev installs polluted the repo.** Contributors running
+   LivePilot from a git checkout would scan their library (to test atlas
+   tools against live Ableton) and accidentally commit their personal
+   scan — pack names, user-library previews — to the public repo. This
+   happened once in the v1.21.x cycle and was the proximate trigger for
+   v1.22.
+3. **The "enriched" count ambiguity.** A single atlas file couldn't
+   honestly answer "how many devices are enriched?" — the right number
+   differed depending on whether you meant the bundled baseline (87 per
+   the scanner's last truncated pass), YAML files authored on disk (120),
+   or runtime coverage including native/M4L duplicates (137+ on a
+   fully-scanned install). The user/bundled split clarifies this by
+   letting each file carry its own honest count.
+
+### Migration for existing users
+
+Users with a personalized scan in `mcp_server/atlas/device_atlas.json`
+(most dev-install contributors) can migrate in one command:
+
+```bash
+mkdir -p ~/.livepilot/atlas
+cp "$(python3 -c 'import mcp_server.atlas; print(mcp_server.atlas.BUNDLED_ATLAS_PATH)')" \
+   ~/.livepilot/atlas/device_atlas.json
+# Then optionally restore the bundled baseline to its shipped state:
+git -C $(python3 -c 'import mcp_server.atlas, pathlib; print(pathlib.Path(mcp_server.atlas.__file__).parents[2])') \
+    checkout mcp_server/atlas/device_atlas.json
+```
+
+Users on the npm-installed path (no personalized scan yet) need nothing
+— the next `scan_full_library` call will write to the new user path
+automatically.
+
+### Code changes
+
+- `mcp_server/atlas/__init__.py` — new module-level constants
+  `BUNDLED_ATLAS_PATH`, `USER_ATLAS_DIR`, `USER_ATLAS_PATH`, and
+  function `_resolve_atlas_path()`. Existing `ATLAS_PATH` kept as a
+  backward-compat alias pointing at the resolved value.
+- `mcp_server/atlas/tools.py::scan_full_library` — writes to
+  `USER_ATLAS_PATH` and creates the user-data directory on demand.
+  Enrichments still read from the bundled package (they're authored
+  in-repo under `mcp_server/atlas/enrichments/`).
+
+### Tests
+
+8 new TDD regression tests in `tests/test_atlas_user_override.py`:
+
+- `test_bundled_path_is_in_package_dir`
+- `test_user_path_is_in_home_dir`
+- `test_resolver_returns_user_path_when_present`
+- `test_resolver_falls_back_to_bundled_when_user_atlas_missing`
+- `test_atlas_manager_loads_from_user_path_when_present`
+- `test_atlas_manager_falls_back_to_bundled_when_user_atlas_missing`
+- `test_scan_full_library_writes_to_user_path`
+- `test_user_atlas_dir_created_if_missing`
+
+Full suite: 3136 pass (3128 prior + 8 new), 1 skipped.
+
+### Documentation
+
+- `docs/manual/getting-started.md` — new "Step 5 (optional): Personalize
+  the device atlas" section.
+- `docs/manual/dev-install.md` — new "3a. User atlas vs bundled atlas"
+  subsection, critical for contributors.
+- `docs/manual/device-atlas.md` — header callout on the two-file split.
+- `CLAUDE.md` + `README.md` — short pointers to the new resolver.
+
+### Carried to future releases
+
+The atlas schema-canonicalization originally deferred from the v1.21.2
+audit is now **partially closed**: the user/bundled split makes the
+"which number counts as enriched?" question honest per-file, but the
+sync_metadata gate for `stats.enriched_devices` vs YAML file count
+hasn't been added. Deferred to a future patch because it's orthogonal
+to the user-atlas split.
+
+## 1.21.4 — v1.21.2 audit carry-over: slashed-compound filler + dev-install runbook (April 25 2026)
+
+Ships two items the v1.21.2 audit #2 deferred to v1.22 but that turned
+out to be safer to close in a patch cycle than to carry forward:
+
+1. **`check_prose_claim` regex widen for slashed/chained compound fillers** —
+   `"38 spectral/analyzer tools"` drift across 3 docs silently passed
+   `sync_metadata --check` because the filler group required trailing
+   whitespace. Now caught.
+2. **Dev-install runbook** (`docs/manual/dev-install.md`) — documented
+   path for contributors to run LivePilot from a local checkout without
+   publishing to npm. Previously every contributor had to reverse-engineer
+   this from `bin/livepilot.js` + `mcp_server/__main__.py`.
+
+No API changes. No user-observable behavior change at runtime. Four new
+TDD regression tests for the regex widening; ~180 lines of new
+documentation. `sync_metadata --check` now catches an entire class of
+compound-form drift that would otherwise have shipped untracked.
+
+### 1. `sync_metadata` slashed/chained compound filler
+
+All 4 regex patterns in `scripts/sync_metadata.py` (`check_tool_count`,
+`check_prose_claim`, `fix_tool_count`, `_fix_count`) had an optional
+filler group that required trailing whitespace —
+`[A-Za-z]+\s+` — and matched at most once (`?` quantifier). Slashed
+compounds like `"spectral/analyzer"` were rejected because `/` is not
+whitespace; chained compounds like `"spectral/MCP tools"` (two filler
+segments) were rejected because of the single-match quantifier.
+
+v1.21.4 widens the filler to two branches, iterable 0+ times:
+
+| Branch | Pattern | Matches |
+|---|---|---|
+| (a) Space-joined, uppercase-anchored | `[A-Z][A-Za-z\-]*\s+` | `"MCP "` in `"430 MCP Tools"` |
+| (b) Slash-joined, any-case | `[A-Za-z][A-Za-z\-]*/` | `"spectral/"` in `"38 spectral/analyzer tools"` |
+
+The uppercase anchor on branch (a) is preserved deliberately — without
+it, lowercase English articles ("the tool") would false-positive on
+prose like "released in 2020 the tool was first previewed." The slash
+on branch (b) is itself an unambiguous compound marker that doesn't
+appear in normal English, so any-case there is safe. The `*` quantifier
+lets branches chain: `"300 spectral/MCP tools"` now parses as
+`(b)"spectral/"` + `(a)"MCP "` + `"tools"`.
+
+For `check_prose_claim` + its paired `_fix_count`, the filler is a
+simpler single-branch `[A-Za-z][A-Za-z\-]*(?:/|\s+)` — these don't need
+the uppercase anchor (prose-claim nouns predate the v1.21.4 cycle and
+already allowed lowercase-start fillers).
+
+**Concrete effect**: `sync_metadata --check` now flags drift in all 3
+real surfaces that previously escaped:
+
+- `README.md` — `"38 spectral/analyzer tools"` × 2
+- `docs/manual/getting-started.md` — `"38 spectral/analyzer tools"` × 1
+- `livepilot/skills/livepilot-release/SKILL.md` — `"38 spectral/analyzer tools"` × 1
+
+(Today these say "38" and the count is 38, so no drift reported — but
+the next time the analyzer module gains or loses a `@mcp.tool`, CI will
+fail loudly instead of silently drifting.)
+
+Tests added to `tests/test_claim_consistency.py` (4):
+
+- `test_prose_claim_catches_slashed_compound` — drift detection
+- `test_fix_count_rewrites_slashed_compound` — `--fix` preserves the adjective
+- `test_tool_count_catches_slashed_compound` — chained filler (`"300 spectral/MCP tools"`)
+- `test_tool_count_no_false_positive_on_year_prose` — uppercase anchor guard
+
+### 2. Dev-install runbook
+
+New file `docs/manual/dev-install.md` (~180 lines) documents the
+bare-python local-checkout workflow for contributors:
+
+1. **venv setup** — `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
+2. **Local Remote Script install** — `node bin/livepilot.js --install` (NOT `npx livepilot --install`, which resolves to the registry and silently discards local edits)
+3. **MCP client config pointing at `python -m mcp_server`** — per-client examples for Claude Desktop, Claude Code, Cursor/VS Code
+4. **Iterate loop** — client restart for `mcp_server/` edits; `node bin/livepilot.js --install` + `reload_handlers` tool for `remote_script/` edits
+5. **Test suite** — `python -m pytest tests/ -q` (3128 tests as of v1.21.4)
+6. **`sync_metadata` drift check** — `python scripts/sync_metadata.py --check` / `--fix`
+7. **Going back to published** — remove the dev MCP entry or stop using it
+
+Plus a troubleshooting section for the 4 most common first-run failures:
+`ModuleNotFoundError: No module named 'mcp_server'`, `Another client is
+already connected` on port 9878, stale `__pycache__` shadowing edits, and
+module-level constants not reloading via `reload_handlers` (full Ableton
+restart required).
+
+Cross-links added:
+
+- `docs/manual/getting-started.md` — callout at top routing contributors to dev-install before they commit to the npm path
+- `docs/manual/index.md` — new "Contributing" section in the Chapters TOC
+- `CLAUDE.md` — pointer in the Project section
+
+### Carried forward to v1.22
+
+Still deferred from the v1.21.2 audit:
+
+- Atlas `.enriched` schema canonicalization (`stats.enriched_devices = 87`
+  vs 120 YAML files vs 135 historical claim — pick one and derive the
+  others at build time; add a sync_metadata gate matching JSON stats to
+  YAML file count)
+
+## 1.21.3 — Third audit-response: manual-docs drift + sync_metadata file-list widening + unicode-escape regex fix (April 24 2026)
+
+Fourth same-day patch in 48 hours, third audit-response in 24 hours.
+Audit #3 surfaced that v1.21.2's `sync_metadata` scope expansion had
+added new check TYPES but didn't widen the FILE LISTS — so docs/manual
+pages kept drifting (1305 devices, 135 enriched, 52 domains) while
+`sync_metadata --check` passed. This patch widens the file lists AND
+fixes a latent regex bug that v1.21.2's new "device" check would have
+triggered with data-corrupting consequences.
+
+No API changes. No test additions beyond what `sync_metadata` newly
+enforces. No new features.
+
+### P2 — Manual-doc atlas/domain drift (audit finding)
+
+Three manual pages shipped with stale counts through v1.21.2 because
+they weren't in the `sync_metadata` file lists for `enriched` /
+`domain` / the new `device` check:
+
+| File | Stale claim | Corrected to |
+|---|---|---|
+| `docs/manual/device-atlas.md` | 1305 devices / 135 enriched / 641 pack-indexed | 5264 / 120 / (claim dropped) |
+| `docs/manual/index.md` | 1305 devices | 5264 |
+| `docs/manual/tool-reference.md` | 1305 devices / 135 enriched / 52 domains | 5264 / 120 / 53 |
+
+The 5 numeric substitutions (device count, enriched count, domain count)
+were auto-closed by `sync_metadata --fix` once the file lists were
+widened. The `641 pack-indexed` claim was manually dropped (the fixer
+substitutes numbers, doesn't delete claims) — the shipped atlas has an
+empty `.packs` list, so any specific pack-indexed number would be
+meaningless anyway.
+
+### Critical — Latent regex bug in `check_prose_claim` and `_fix_count`
+
+Adding the `"device"` noun to `PROSE_CLAIM_FILES` exposed a regex
+vulnerability that had existed since v1.15-era. `check_prose_claim`'s
+pattern was:
+
+```python
+r"(\d+)[-\s]+(?:[A-Za-z]+\s+)?{noun}s?\b"
+```
+
+No word-boundary assertion at the start. In `manifest.json`, the em-dash
+is stored as the JSON escape `\u2014`. Raw characters are
+`\`, `u`, `2`, `0`, `1`, `4` — so the literal text "2014" appears
+next to a space, next to "device atlas". The regex matched:
+
+```
+...\u2014 device atlas...
+       ^^^^^^^^^^^^^^^
+       (captures "2014", next optional word is empty, then "device")
+```
+
+Reported as `manifest.json: has '2014 device', expected '5264 device'`.
+If `sync_metadata --fix` had run, it would have rewritten `\u2014`
+(em-dash) to `\u5264` (CJK ideograph `剤`). The JSON would become
+visually corrupted and linguistically nonsensical.
+
+**Prior versions got away with this** because no earlier PROSE_CLAIM
+noun could align adjacent to the 4-char "2014":
+  - "tool" starts with `t` — no match
+  - "bridge command" starts with `b` — no match
+  - "enriched" starts with `e` — no match
+  - "semantic move" / "analyzer tool" / "genre default" — none start with `d`
+
+The new `"device"` noun (starts with `d`) was the first to align.
+v1.21.2's extension would have shipped a corrupting `--fix` if anyone
+had run it immediately.
+
+Fix: leading `\b` assertion on all 4 regex patterns in sync_metadata
+(`check_tool_count`, `check_prose_claim`, `fix_tool_count`,
+`_fix_count`). Word-boundary before `\d+` means the digit must start
+at a non-word-to-word transition — which excludes digits adjacent to
+other word chars (like the `u` in `\u2014`).
+
+Verified: post-fix, `check_prose_claim(noun="device")` reports only
+the intended `5264 devices` in `manifest.json` — the `2014` ghost is
+gone. All existing checks (tool count, bridge command, enriched, etc.)
+continue to match correctly because their valid matches are always
+preceded by non-word chars (space, parenthesis, start-of-string, etc.).
+
+### `sync_metadata.py` expansion — new scope + 3 new file-list entries
+
+Added:
+  * **`get_atlas_device_count()`** + `PROSE_CLAIM_FILES["device"]`
+    (threshold=1000) — enforces atlas device-count claims match
+    `stats.total_devices`. Deferred from v1.21.2 because generic
+    noun="device" was thought too broad; threshold=1000 filters
+    historical "5 devices" mentions entirely. Enabled here based on
+    audit #3 finding.
+  * **`PROSE_CLAIM_FILES["enriched"]`** file list widened: added
+    `docs/manual/device-atlas.md`, `docs/manual/tool-reference.md`.
+    These had stale "135 enriched" while README said "120".
+  * **`DOMAIN_COUNT_FILES`** file list widened: added
+    `docs/manual/tool-reference.md`. Its "52 domains" had drifted
+    while the rest of the repo was at 53.
+
+New `sync_metadata --check` banner reports:
+`version=1.21.3, tools=430, domains=53, bridge_cmds=31, enriched=120,
+genres=4, moves=44, analyzer_tools=38, atlas_devices=5264`.
+
+### Deferred to v1.22
+
+- **`check_prose_claim` regex slash-prefix broadening** — still needs
+  doing (would let "spectral/analyzer tools" match the "analyzer tool"
+  check). Not landed in this patch because it would touch every
+  existing noun and warrants its own regression test pass.
+- **Atlas `.enriched` schema decision** — three definitions (87 stats,
+  120 YAML files, 135 flag count). v1.21.3 standardized on 120 across
+  all descriptions via widened `enriched` check, but the schema
+  question is still open.
+- **`dev-install` path** — still open.
+
+### Scope stats
+
+- 1 code fix (`sync_metadata.py` regex `\b` insertion on 4 patterns —
+  prevents future unicode-escape corruption)
+- 1 code expansion (`sync_metadata.py` — new `device` check type +
+  file-list widening on 2 existing checks)
+- 3 doc corrections auto-closed by `sync_metadata --fix` (9 numeric
+  substitutions across 3 manual files) + 1 manual prose-drop (641
+  pack-indexed in device-atlas.md)
+- 15 version-string sites + `.amxd` binary patch (2 bytes) + `.maxpat`
+  source label + `package-lock.json` (2 fields) bumped 1.21.2 → 1.21.3
+- Test suite: 3124 passed, 1 skipped (unchanged — no-regression patch)
+
+### Credits
+
+Third external audit by the repo owner. Fourth same-day patch since
+v1.20.1. Audit-to-ship pattern stable at ~2h per round.
+
+---
+
+## 1.21.2 — Second audit-response: atlas reconciliation + manual hygiene + sync_metadata expansion (April 24 2026)
+
+Second same-day audit-response patch. After v1.21.1 shipped, the repo
+owner ran another audit and surfaced one code bug (`AtlasManager`
+reported `version="unknown"` because the atlas JSON has `.version` at
+top level, not under `.meta.version`) plus four documentation drifts
+(atlas claims in 11 description fields, stale "32" analyzer counts in
+3 locations, reversibility overclaim in the manual, `.maxpat` source
+displaying `v1.17.5`), and the meta-observation that `sync_metadata.py`
+had been blind to the entire category of drift that keeps surfacing
+in audit rounds.
+
+This patch closes all five findings AND expands `sync_metadata`'s
+scope so future drift of the same classes fails CI instead of requiring
+another manual audit.
+
+### P2 — `AtlasManager.version` now reads top-level `.version`
+
+Pre-fix (`mcp_server/atlas/__init__.py:21`):
+
+```python
+self._meta = data.get("meta", {})
+# ...
+@property
+def version(self) -> str:
+    return self._meta.get("version", "unknown")
+```
+
+The shipped `device_atlas.json` has `.version = "2.0.0"` at top level,
+not nested under `.meta.version`. So `self._meta` was always `{}` and
+`.version` always returned `"unknown"`. Fixed by reading both locations
+with top-level winning; `.meta.version` preserved as fallback for any
+internal/dev atlas using the older schema. After fix:
+`AtlasManager.version` returns `"2.0.0"` on the shipped atlas.
+
+### P2 — Atlas description claims: 1305 devices → 5264, drop "641 pack-indexed"
+
+The "1305 devices" claim was false in every public surface (actual
+shipped JSON has `stats.total_devices = 5264`). The "641 pack-indexed"
+claim was meaningless — the shipped atlas has an empty `.packs` list;
+device-side pack count via `.devices[*].pack` field is 50 across 13
+unique pack names (not 641 or 655).
+
+Updated 11 surfaces: `README.md` (5 hits), `AGENTS.md`, `CLAUDE.md`,
+`package.json`, `server.json`, `manifest.json` (2 hits), `marketplace.json`,
+`Codex-plugin/plugin.json`, `claude-plugin/plugin.json`,
+`livepilot-core/SKILL.md`, `livepilot-core/references/overview.md` (2 hits).
+
+"120 enriched" kept — defensible as the YAML enrichment file count
+(120 files on disk). The `stats.enriched_devices` value (87) and the
+`.enriched=true` flag count (135) are two other valid definitions; the
+three-way divergence is a schema question for v1.22+ scope, not a
+drift fix here.
+
+### P2 — Manual analyzer-tool count 32 → 38
+
+`docs/manual/getting-started.md:256` and `livepilot/skills/livepilot-release/SKILL.md`
+(3 lines) still said "32 spectral/analyzer tools" despite the actual
+`@mcp.tool` count in `analyzer.py` being 38. Corrected.
+
+### P2 — `.maxpat` source label v1.17.5 → v1.21.2
+
+`m4l_device/LivePilot_Analyzer.maxpat:1611` had a stale visible version
+label `"text": "v1.17.5"`. The compiled `.amxd` had been binary-patched
+to the correct version across releases, but the source patch Max uses
+when someone opens/rebuilds the device never got updated. Fixed.
+
+### P3 — Manual reversibility language hedge
+
+`docs/manual/index.md:31` said "All 430 tools... reversible with undo"
+— the README was hedged in v1.21.1 but the manual missed. Corrected
+with matching language: Live-session mutations route through Ableton's
+undo stack; side effects outside the Live project (Splice downloads,
+memory/ledger writes, installer actions, atlas scans, filesystem writes)
+persist beyond undo.
+
+### `sync_metadata.py` expansion — converts this drift class into CI failures
+
+Added to close the audit-memory gap that made v1.21.0, v1.21.1, and
+now v1.21.2 each need a manual sweep:
+
+- **`check_lockfile_version(version)`** — asserts `package-lock.json`
+  root `.version` matches `package.json`. Would have caught the
+  lockfile-stuck-at-1.17.5 drift at CI time from pre-v1.18 onwards.
+- **`PROSE_CLAIM_FILES["semantic move"]`** — enforces every registered
+  "N semantic moves" claim matches `registry.count()` (currently 44).
+  Would have caught v1.21.0's "43 semantic moves" drift at CI time.
+- **`PROSE_CLAIM_FILES["analyzer tool"]`** — enforces "N analyzer tools"
+  claims match `@mcp.tool` count in `analyzer.py` (currently 38).
+  Catches plain-form drift; "spectral/analyzer tools" slashed variants
+  bypass the current `check_prose_claim` regex's optional-word prefix
+  (noted in an inline comment — left for a future patch to broaden).
+
+`sync_metadata --check` banner now reports 2 new counts:
+`moves=44, analyzer_tools=38` alongside the previous 6.
+
+### Deferred to v1.22
+
+- **`sync_metadata.py` atlas-stats check** — catching drift in
+  "5264 devices" or "87 enriched" claims requires either a noun-specific
+  regex (generic "device" is too broad — false-positives on every
+  historical "5 devices" mention) or a different check strategy.
+  Worth doing but nontrivial.
+- **`check_prose_claim` regex broadening** to catch slashed compounds
+  like "spectral/analyzer tools". Current regex's `(?:[A-Za-z]+\s+)?`
+  prefix misses `spectral/` because the slash breaks the character class.
+- **Atlas JSON schema decision** — whether `stats.enriched_devices`,
+  `.enriched=true` flag count, or YAML file count is THE canonical
+  "enriched" number. Picking one + renaming fields ends the three-way
+  ambiguity.
+
+### Credits
+
+Second external audit by the repo owner, performed ~30 min after
+v1.21.1 shipped. Same-day patch #2 ships ~2 hours after audit receipt
+(matches the v1.20.1 / v1.21.1 same-day-hotfix precedent — this is the
+third such same-day patch in 48 hours).
+
+### Scope stats
+
+- 1 code fix (`mcp_server/atlas/__init__.py` — `AtlasManager` reads
+  top-level `.version`)
+- 1 code expansion (`scripts/sync_metadata.py` — 3 new checks:
+  move_count, analyzer_tool_count, lockfile_version)
+- 4 doc corrections (atlas claims across 11 files + analyzer count in
+  4 files + reversibility hedge + .maxpat label)
+- 15 version-string sites + `.amxd` binary patch (2 bytes) +
+  package-lock.json (2 fields) bumped 1.21.1 → 1.21.2
+- Test suite: 3124 passed, 1 skipped (unchanged — this is a
+  no-regression patch; the AtlasManager fix makes a previously-
+  untested code path produce the right answer).
+
+---
+
+## 1.21.1 — Audit-response patch: experiment-commit safety + doc hygiene + lockfile (April 24 2026)
+
+Small patch release responding to an external audit of v1.21.0 performed
+the same day it shipped. The audit surfaced one real safety bug
+(commit_experiment status allowlist was an exclusion list when the
+intent was an inclusion list) plus several doc-consistency drifts.
+No new features. No API changes beyond the tightened commit_experiment
+contract. v1.21.0 callers already doing the right thing
+(run_experiment → commit the ranked winner) continue to work unchanged.
+
+### P1 — commit_experiment only accepts `status='evaluated'`
+
+Pre-fix (v1.21.0 and all prior versions with commit_experiment), the
+status check was an EXCLUSION list:
+
+```python
+if target.status in ("rejected", "analytical", "failed"):
+    return {"error": ...}
+```
+
+Blocks 3 statuses; implicitly allows the other 6 — including `pending`,
+`running`, `discarded`, and `interesting_but_failed`. Those branches
+can't be ranked by `compare_experiments()`, but `commit_experiment`
+would accept them as long as a compiled plan was attached. The code's
+own inline comment already described the correct contract ("only
+status='evaluated' branches are ranking candidates"); the implementation
+had the wrong polarity. The fix flips it to an INCLUSION check:
+
+```python
+if target.status != "evaluated":
+    return {"error": ...}
+```
+
+Error message updated to enumerate all 9 possible statuses and explain
+which state each represents (pending/running = not yet evaluated;
+rejected/analytical/failed = classifier exclusions; committed =
+already committed; discarded = explicitly thrown out;
+interesting_but_failed = exploration-audit only).
+
+Why this matters: v1.21.0's `commit_experiment` ledger writer records
+every commit into `SessionLedger` where anti-repetition filters read
+it. Without the tighter status check, a caller bypassing the ranking
+layer could pollute the ledger with entries the system explicitly
+classified as non-winners — degrading anti-repetition signal quality.
+
+**Regression tests added (4)** in `tests/test_commit_experiment_ledger.py`:
+`test_commit_on_pending_branch_rejects`,
+`test_commit_on_running_branch_rejects`,
+`test_commit_on_discarded_branch_rejects`,
+`test_commit_on_interesting_but_failed_branch_rejects`. All FAILED
+pre-fix (reproducing the audit's finding), all PASS post-fix.
+
+### P1 — package-lock.json bumped 1.17.5 → 1.21.1
+
+Lockfile's root `.version` and `.packages[""].version` had been stale
+at 1.17.5 since before v1.18. `npm publish` doesn't read these fields
+(it reads package.json), so the npm registry was always correct — but
+the repo-local lockfile misled local `npm install` workflows and any
+release-check tooling that compared package.json vs lockfile. Fixed by
+surgical replace on the 2 stale strings; no dependency tree
+regeneration (keeps dep versions identical to v1.21.0).
+
+### P2 — Analyzer tool count: 32/33 → 38 (actual)
+
+README.md previously said "32 spectral/analyzer tools" in one place
+and "38 analyzer tools" in another — inconsistent within the same file.
+`docs/M4L_BRIDGE.md` said "33 MCP tools in the analyzer domain" in two
+places. Actual `@mcp.tool` count in `mcp_server/tools/analyzer.py` is
+**38** (grep-verified). All stale 32/33 refs corrected to 38.
+
+### P2 — Reversibility language hedge
+
+README's header NOTE block said "Everything is reversible with undo,"
+which is too strong. Live-session mutations (clips, devices, mixer,
+arrangement) do route through Ableton's undo stack and are reversible
+— but Splice downloads, memory/ledger writes, installer actions, atlas
+scans, and filesystem writes persist beyond undo. Hedged the language
+to reflect this.
+
+### Deferred to v1.22
+
+Audit-surfaced items that aren't patch-release material:
+
+- **Atlas statistics reconciliation.** Docs claim "1305 devices / 120
+  enriched / 641 pack-indexed" across 9 description fields, but the
+  shipped `device_atlas.json` has 5264 devices and 135 entries with
+  `.enriched` truthy. The "1305" number appears to be a long-stale
+  cargo-culted count. Requires deciding whether `.devices` contains
+  duplicates, what the canonical "enriched" definition is, and
+  whether to restructure atlas JSON or fix the readers that look for
+  `.meta.version`. v1.22 scope.
+- **`sync_metadata` expansion** to check package-lock.json project
+  version, semantic-move count via `registry.count()`, and
+  analyzer-tool count via grep on `analyzer.py`. Would convert this
+  entire class of drift into CI failures.
+- **Dev-install path** for local contributors hitting missing
+  `soundfile` / `scipy` / `pretty_midi` / `pytest_asyncio` deps during
+  bare-python local runs. CI has these installed via requirements.txt.
+
+### Credits
+
+External audit performed same day v1.21.0 shipped. Findings
+file-linked and reproducible. Response time: ~2 hours from audit
+receipt to v1.21.1 patch shipping.
+
+### Scope stats
+
+- 1 code fix (`mcp_server/experiment/tools.py` — commit_experiment status check)
+- 4 new regression tests (all initially FAILING pre-fix to reproduce
+  the audit, all PASSING post-fix)
+- 3 doc corrections (README.md × 2, docs/M4L_BRIDGE.md × 2, plus the
+  reversibility hedge)
+- 15 version-string sites + `.amxd` binary patch (2 bytes) +
+  package-lock.json (2 version fields)
+- Test suite: 3120 → 3124 pass (+4). Zero regressions.
+
+---
+
+## 1.21.0 — Consolidation: experiment ledger + preset library + record-readiness + reader audit (April 24 2026)
+
+Consolidation release closing five items from the v1.20 plan §12 non-goals
+that were tractable in a 2-session scope. Adds 1 new semantic move + 1
+major-tool auto-ledger-write + minimal preset-library infrastructure +
+a store-purpose audit that turns the v1.20 director-SKILL fix into a
+codebase-wide invariant, all gated behind a test-first wire-format
+parity extension that caught 1 pre-v1.20 drift bug and closed the
+audit window.
+
+Registry: 43 → 44 moves. Test suite: 3043 → 3118 pass (+75 across all
+chunks). Wire-format parity suite: 10 → 44 scenarios. Zero regressions.
+
+### New semantic moves (1)
+
+- **`configure_record_readiness`** (performance family, low risk, protects
+  `signal_integrity=0.7`)
+  - seed_args: `{track_index, armed, exclusive?}`
+  - Non-exclusive: single step `set_track_arm(track_index, arm=armed)` — note
+    the wire-format key is `arm`, not `armed` (the MCP tool accepts `armed`
+    as an ergonomic kwarg but renames to `arm` before send_command; the
+    remote_command backend bypasses that rename).
+  - Exclusive (`exclusive=True` + `armed=True`): N+1 step plan —
+    `set_track_arm(arm=False)` for every other regular track, then
+    `set_track_arm(target, arm=True)` for the target. Emulates Ableton's
+    exclusive-arm mode manually because `song.exclusive_arm` has no
+    Python setter in Live 12.4 (pre-existing v1.20.3 Remote Script bug
+    surfaced during v1.21 live-test pre-flight — see plan correction #6).
+    Requires `session_info.tracks` (automatically built by
+    `apply_semantic_move`).
+  - Rejects `exclusive=True + armed=False` (contradictory), missing `armed`
+    seed_arg, and negative `track_index` (return tracks can't be armed
+    per Ableton's handler at `remote_script/LivePilot/tracks.py:261`).
+  - Closes the one tech_debt entry seeded during v1.20 live test 6.
+
+### Experiment-engine ledger writer
+
+- **`commit_experiment`** now writes to `SessionLedger` after a successful
+  commit, mirroring v1.20's `apply_semantic_move` pattern (commit `0b3489b`).
+  Anti-repetition filters downstream now see experiment commits the same
+  way they see direct semantic-move applies.
+  - `engine` tag reflects branch SOURCE (not escalation success): `"composer"`
+    when `target.seed.source == "composer"`, else `"experiment"`. A composer-
+    sourced branch that fell back to scaffold execution is still
+    `engine=composer` — the escalation-success detail lives in
+    `target.evaluation["composer_escalation"]`.
+  - `move_class` via `_infer_move_family(target)`: `seed.family` when set,
+    else inspect first compiled_plan step's tool via `_TOOL_TO_FAMILY`
+    lookup, else default `"mix"`.
+  - `actions` = one entry per ok row in `commit_result["execution_log"]`
+    (the router's actual execution record — captures the post-escalation
+    plan when composer escalation fired).
+  - Response gains `ledger_entry_id` field (same pattern as
+    `apply_semantic_move`). Best-effort — a ledger-write exception is logged
+    and swallowed so the commit never fails on a bookkeeping path.
+
+### Minimal affordance preset library
+
+- New path `mcp_server/affordances/` with loader (`presets.py`), schema
+  validator (`_schema.py`), and 3 seed YAML files:
+  - `reverb.yaml` — preset `dub-cathedral` (Basic Channel-adjacent huge
+    space; Decay 0.85, Room 0.95, Dry/Wet 0.40, Predelay 0.45, Diffusion 0.80)
+  - `delay.yaml` — preset `ping-pong-dub` (dotted 8th, feedback 0.45,
+    HP+LP filtered)
+  - `auto-filter.yaml` — preset `slow-sweep` (LP type, bar-long LFO,
+    moderate resonance)
+- `configure_device` compiler gained optional `preset` + `device_slug`
+  seed_args (additive — v1.20 callers unaffected). Merge: preset resolves
+  first, explicit `param_overrides` win on per-key conflict (last-write-wins).
+  v1.21 requires explicit `device_slug` when `preset` is used; v1.22
+  adds class_name → slug auto-inference.
+- `livepilot-creative-director/references/phase-6-execution.md` §Affordance-
+  preset resolution rewritten to document the live import path and the
+  three dispatch patterns (preset reference, preset + explicit override,
+  fallback to Python resolve).
+
+### Wire-format parity retroactive gate
+
+- `tests/test_compiler_wire_format_parity.py` extended from 10 to 44
+  scenarios (10 v1.20 + 33 pre-v1.20 + 1 new `configure_record_readiness`).
+  Gate surfaced **1 pre-v1.20 drift pattern** affecting 7 moves:
+  `create_chaos_modulator`, `create_feedback_resonator`,
+  `create_wavefolder_effect`, `create_bitcrusher_effect`,
+  `create_karplus_string`, `create_stochastic_texture`, `create_fdn_reverb`
+  all shipped with a `find_and_load_device` plan_template emitting
+  `{"query": "Wonder X"}` but no `track_index`. The `remote_command`
+  backend bypasses MCP normalization, so Ableton's handler threw
+  `KeyError` on `params["track_index"]` — broken at runtime since
+  pre-v1.20, caught now.
+- Fix: `device_creation_compilers.py::_compile_device_creation` threads
+  `track_index` from `seed_args` into `find_and_load_device` steps.
+  Plan templates updated from `{"query": ...}` to `{"device_name": ...}`
+  across all 7 Device Forge moves.
+- Variant-B' consideration (>3 drift bugs → pause v1.21, ship patch):
+  all 7 failures were one pattern in one file, fixable in one commit.
+  Path B (inline fix as part of Task 1.1.5a) taken — single-pattern
+  single-file fixes are exactly what Task 1.1.5a was written for.
+  See `docs/plans/v1.21-impl-status.md` §3 for the decision log.
+
+### Store-purpose reader audit
+
+- Every file in `mcp_server/` that imports `SessionLedger` or calls
+  `memory_list` / `get_session_memory` now carries a
+  `# store_purpose: <purpose>` comment naming its intent.
+- Allowed purposes (closed set): `writer`, `anti_repetition`,
+  `audit_readonly`, `technique_library`, `session_observations`,
+  `escape_hatch_log`, `mcp_tool_definition`.
+- **`tests/test_ledger_readers.py`** new (5 test cases): enforces the
+  annotation contract at CI, AND guards against any file annotated
+  `anti_repetition` also calling `memory_list` — which would be the
+  latent v1.20 store-confusion bug (director SKILL originally pointed
+  at `memory_list` for recency; `memory_list` reads the persistent
+  technique library, not the action ledger).
+- Audit was clean across the entire `mcp_server` tree — no anti-repetition
+  caller was found reading the wrong store. The audit is purely
+  documentation contracts enforced at CI.
+
+### Plan corrections applied during execution (6, logged in impl-status doc)
+
+Documented for future release planners in `docs/plans/v1.21-impl-status.md`:
+
+1. **Baseline drift** — v1.20.2 and v1.20.3 shipped between plan-write and
+   execution; all version-string literals in the plan needed `1.20.1 →
+   1.20.3` remapping.
+2. **Wire-format drift in device_creation** — plan_templates emitted
+   `{"query": ...}`; handler requires `{"track_index", "device_name"}`.
+3. **`set_track_arm` wire format** — plan §3.1 used `{"armed": ...}`;
+   handler reads `params["arm"]`. MCP tool renames `armed → arm` before
+   send_command; remote_command backend bypasses the rename.
+4. **`set_exclusive_arm` shape** — plan §3.1 assumed a per-track signature
+   `(track_index=...)`; handler is a global mode toggle taking
+   `{"enabled": bool}`.
+5. **Return-track arm rejection** — plan's test expected negative
+   `track_index` to succeed; handler raises `ValueError: "Cannot arm a
+   return track"`. Corrected test pins compile-time rejection.
+6. **`set_exclusive_arm` is broken in Live 12.4 LOM** — live-test pre-flight
+   (2026-04-24) surfaced that `song.exclusive_arm` is a property WITHOUT a
+   Python setter in Live 12.4's Remote Script API. The v1.20.3 handler's
+   direct assignment `song.exclusive_arm = bool(...)` errors with
+   "property of 'Song' object has no setter". v1.21's
+   `configure_record_readiness` exclusive-mode now emulates the behavior
+   manually (disarm-all-others + arm-target loop) — correctness is
+   identical, works in any Live version. The broken v1.20.3
+   `set_exclusive_arm` handler is LEFT AS-IS for potential future fix
+   (when/if Ableton re-exposes the setter, or someone finds a LOM method
+   alternative); it's tracked as an independent bug in the Remote Script.
+
+### Non-goals (deferred)
+
+- **Hard cutover of the escape hatch.** v1.22+ target, conditional on
+  zero `tech_debt` log entries accumulating in one month of production.
+- **Standard / Deep preset catalog.** v1.22+. Minimal library from v1.21
+  proves the loader; catalog fills in after real-usage signal.
+- **class_name → slug auto-inference** for the preset library. v1.22+.
+- **Pre-v1.20 move compiler refactors** beyond the 1 drift fix. v1.22+.
+- **New move families beyond the canonical 7.** The performance family
+  already exists; `configure_record_readiness` joins it.
+- **Taste-graph integration for preset ranking.** v1.22+ once the catalog
+  exists.
+
+### Scope stats
+
+- 7 atomic commits on `v1.21.0-dev` (fix + gate + 4 feature + refactor + release)
+- 28 files changed, +1933 / -63 lines
+- 3 new test files (commit_experiment_ledger, performance_moves,
+  affordance_presets, ledger_readers) + 1 doc (impl-status)
+- 1 new package (`mcp_server/affordances/`) + 3 YAML seed files
+- 15 version-string sites bumped + `.amxd` binary patch (2 bytes)
+- 10 files annotated with `# store_purpose:`
+
+---
+
+## 1.20.3 — Automated analyzer pre-flight (April 24 2026)
+
+Micro-release closing one class of operator error that broke the v1.20.1
+five-project live-test campaign: the LLM operator had a clear memory
+instruction to load `LivePilot_Analyzer` on master at the start of a
+fresh Ableton session but missed it in 5 of 5 projects — producing
+basic mixes instead of the intended mix-polish outcomes because every
+analyzer-gated move (`tighten_low_end`, `sculpt_midrange`,
+`balance_stereo_image`, etc.) silently degraded. Fixed forward with a
+new idempotent pre-flight tool + Director skill wiring.
+
+### Added
+
+**New tool: `ensure_analyzer_on_master`** (`mcp_server/tools/analyzer.py`).
+Idempotent pre-flight that loads `LivePilot_Analyzer.amxd` on master
+when missing, no-ops when already loaded. Returns one of:
+- `already_loaded` (with `is_last_on_master`, `duplicate_count`)
+- `loaded` (first-time load from Ableton browser)
+- `install_required` (device not in browser — actionable hint points at
+  `install_m4l_device`)
+- `failed` (any other error)
+
+Post-load report surfaces the CLAUDE.md invariant "LivePilot_Analyzer
+must be LAST on master" via `is_last_on_master: bool` and warns when
+violated. Duplicate-count warning covers the edge case of multiple
+analyzers on the master chain.
+
+Safe to call every turn — subsequent calls short-circuit via one
+`get_master_track` read. Tool count: 429 → 430. 6 new contract tests
+covering already-loaded, missing-loads, install-required,
+duplicate-handling, is-last warning, and two-call idempotence.
+
+### Changed
+
+**Director Phase 1** (`livepilot-creative-director/SKILL.md`). Added
+`ensure_analyzer_on_master` at the top of the "Ground" reads as a
+REQUIRED call, ahead of `get_session_info`. Wording explicitly connects
+the step to the failure it prevents so future agents don't rationalize
+skipping it: "Skipping it is how the v1.20.1 live-test campaign
+produced basic mixes — the analyzer-gated moves degrade silently when
+there's no master spectrum to read."
+
+### Notes
+
+No breaking changes. Calling code that assumed the analyzer was loaded
+continues to work; the new tool adds an explicit pre-flight path.
+`install_m4l_device` contract unchanged.
+
+---
+
+## 1.20.2 — 5 bugs + 1 race condition from the live-test campaign (April 24 2026)
+
+Patch release fixing every issue surfaced during the v1.20.1 five-project
+live-test campaign documented at `~/Desktop/DREAM AI/demo Project/REPORT.md`.
+Each fix landed as its own atomic commit with TDD contract tests. Full
+test suite: 2985 → 3037 pass (+52 new tests), zero regressions.
+
+### Fixes
+
+**🐛 #1 — Device Forge: all 7 `create_*` moves ship broken (CRITICAL).**
+Each move's `plan_template` emitted `generate_m4l_effect` WITHOUT the
+required `gen_code` argument, so every move failed with `missing 1
+required positional argument: 'gen_code'` in explore mode. The 7
+GenExpr templates already existed in `mcp_server/device_forge/
+templates.py` (lorenz_attractor, wavefolder, bitcrusher, etc.) but
+weren't wired. Fix: `device_creation_compilers._MOVE_TO_TEMPLATE`
+routes each move_id to its template and the compiler injects `gen_code`
+at compile time. (commit `61abbeb`)
+
+**🐛 #2 — Sample family: `{sample_file_path}` template placeholder leaked
+to compiled plans.** `_resolve_sample_path` returned a literal
+`"{sample_file_path}"` string when the kernel had no path set —
+falling through to `load_sample_to_simpler` with a non-existent file.
+Fix: resolver now reads `seed_args["file_path"]` (v1.20 convention),
+falls back to legacy `kernel["sample_file_path"]` (wonder_mode
+setter), returns `None` on miss. Each of the 6 sample moves rejects
+with a non-executable plan + actionable warning when path is None.
+(commit `26de33c`)
+
+**🐛 #3 — Analyzer-gated moves hard-fail their mutation steps.**
+`tighten_low_end` and `make_kick_bass_lock` emitted
+`get_master_spectrum` as a pre-read. When the analyzer wasn't loaded
+on master, step 0 failed and `execute_plan_steps_async`
+`stop_on_failure=True` halted the plan BEFORE the mutation steps
+(bass volume change) ran. Fix: general `CompiledStep.optional: bool`
+field + router skip-and-continue on optional failures; affected
+compilers tag their analyzer pre-reads as `optional=True`. The
+mechanism is reusable for any future soft-gated diagnostic step.
+(commit `5f9f0ae`)
+
+**🐛 #4 — `batch_set_parameters` silently snaps quantized enum params.**
+Beat Repeat's `Gate=0.3` and `Variation=0.8` became `Gate=0` / `Variation=0`
+— valid snaps for quantized enum params, but the response gave callers
+no signal that their intent was discarded. Fix: `batch_set_parameters`
+post-processes Ableton's response, comparing requested vs returned
+values with 1e-5 epsilon; appends a `snapped_params` list when
+mismatches occur, each carrying `{name, requested, actual,
+display_value, value_string}`. Empty list = nothing snapped.
+(commit `b472976`)
+
+**🐛 #5 — `create_midi_track` can create duplicate-name tracks silently.**
+When `set_track_name(2, "Pad")` runs and then `create_midi_track(index=2,
+name="Pad")` shifts the existing track to index 4 while retaining its
+name, the session ends up with two "Pad" tracks. Downstream
+`find_tracks_by_role` matches both and mix moves apply twice. Fix:
+`create_midi_track` and `create_audio_track` now pre-query session
+for tracks with the requested name and stamp the response with
+`name_collision: bool` + `existing_tracks_with_same_name: list[int]`.
+Doesn't block creation — callers decide whether to rename or accept.
+(commit `69bc545`)
+
+**🔁 Race condition — "Connection closed by Ableton" on UI transitions.**
+Observed 3× during the campaign: after `Cmd+N` (new live set), the
+next MCP call would drop with `Connection closed by Ableton`.
+Ableton's Remote Script briefly rejects commands during UI state
+transitions. Fix: `connection.send_command` now retries once with
+400ms backoff on that specific error, reconnecting between attempts.
+Timeouts still raise immediately (mutation-duplicate risk). Retry
+budget capped at 1 — second failure raises cleanly. (commit `cf019d5`)
+
+### Scope of the campaign
+
+See `~/Desktop/DREAM AI/demo Project/` for the 5 `.als` files, `PLAN.md`,
+and `REPORT.md` that produced this backlog:
+- `01 basic-channel-dub.als` — dub techno @ 130
+- `02 dilla-swing-drums.als` — hip-hop @ 90 with MIDI-native swing
+- `03 opn-wonder-texture.als` — ambient @ 70 (Device Forge failure noted)
+- `04 aphex-destruction.als` — IDM @ 155 (Beat Repeat snap noted)
+- `05 mix-polish.als` — house @ 125 (analyzer-gate failure noted)
+
+### CI status
+
+All 9 CI jobs expected green: python-tests × {ubuntu, macos, windows} ×
+{3.11, 3.12}, metadata-drift, amxd-freeze-drift, js-entrypoint.
+
+### Non-goals
+
+No new moves in v1.20.2 — every change is a fix to existing surfaces.
+v1.21 remains the consolidation release (see `docs/plans/v1.21-structural-plan.md`).
+
+## 1.20.1 — CI hardening: Windows UTF-8 encoding + .amxd ping drift (April 24 2026)
+
+Patch release fixing CI regressions that v1.20.0 shipped with (caught
+by the actual CI run post-tag). No runtime behavior changes — tests
+pass on every platform, and the .amxd ping now matches the repo
+version. Zero new tests (both fixes are mechanical), zero regressions.
+
+### Fixes
+
+- **Windows-only `UnicodeDecodeError` in `tests/test_creative_director.py`.**
+  27 bare `Path.read_text()` calls used the locale default encoding.
+  On Windows that's cp1252, which chokes on the em-dashes (—), arrows
+  (→), and smart quotes v1.20 added to `SKILL.md` and the new
+  `phase-6-execution.md` reference. All 27 calls now pass
+  `encoding="utf-8"` explicitly. Cross-platform hygiene, applies
+  beyond the trigger case — any future markdown additions with
+  non-ASCII chars are now safe on Windows.
+
+- **`LivePilot_Analyzer.amxd` ping reported v1.17.5 for 9 releases.**
+  The CI `amxd-freeze-drift` job has been red since v1.18.0 because
+  nobody re-froze the .amxd in Max Editor after the JS source bumps.
+  Users of v1.18.0-v1.20.0 got `{ok: true, version: "1.17.5"}` from
+  the bridge ping regardless of the installed version. Per
+  `feedback_amxd_safe_binary_patch` memory, same-length version
+  strings can be patched in-place without Max re-export. Both
+  occurrences in the binary updated to 1.20.1 (file size unchanged);
+  the JS source `livepilot_bridge.js` VERSION constant also bumped
+  so future clean freezes stay consistent.
+
+### CI status after this release
+
+| Job | Pre-v1.20.1 | v1.20.1 |
+|---|---|---|
+| python-tests (ubuntu, macos) × {3.11, 3.12} | ✓ | ✓ |
+| python-tests (windows) × {3.11, 3.12} | ✗ UnicodeDecodeError | ✓ |
+| metadata-drift | ✓ | ✓ |
+| amxd-freeze-drift | ✗ stuck at 1.17.5 | ✓ |
+| js-entrypoint | ✓ | ✓ |
+
+## 1.20.0 — Item C phased cutover: 10 new semantic moves + Director Phase 6 rewrite (April 24 2026)
+
+Implements the plan in `docs/plans/v1.20-structural-plan.md`. Ships 10
+new semantic moves across four family-themed commits, rewrites the
+creative director's Phase 6 to make `apply_semantic_move` the default
+execution surface with a documented + tracked escape hatch, and hardens
+three systemic issues surfaced during live pressure testing. Registry:
+33 → 43 moves across the same 7 canonical families. Full test suite:
+2858 → 2985 pass (+127, zero regressions).
+
+### New semantic moves (10 total)
+
+**Routing family (`mcp_server/semantic_moves/routing_moves.py`):**
+- `build_send_chain` (device_creation, medium risk) — load an ordered
+  chain of devices onto a return track; the Basic Channel / dub-techno
+  / ambient send-architecture primitive. `protect: low_end=0.6`.
+- `configure_send_architecture` (mix, low risk) — set send levels
+  across multiple source tracks in one move.
+- `set_track_routing` (mix, medium risk) — rewire a track's output
+  routing, e.g. "Sends Only" for bus architectures.
+
+**Device-mutation family:**
+- `configure_device` (sound_design, low risk) — bulk-configure N
+  parameters on an existing device in a single undoable move. Takes
+  `param_overrides: dict` (preset library deferred to v1.21).
+- `remove_device` (sound_design, medium risk, protects
+  `signal_integrity=0.9`) — destructive removal with a required
+  `reason` string auto-logged to session memory for audit.
+
+**Content family:**
+- `load_chord_source` (sound_design, low risk) — create+voice+name a
+  MIDI chord clip in one move; feeds `build_send_chain` return chains.
+- `create_drum_rack_pad` (device_creation, low risk) — add one pad to
+  a Drum Rack, Dilla-style kit-at-a-time.
+
+**Metadata family:**
+- `configure_groove` (arrangement, low risk) — the Dilla-swing
+  primitive; assigns a groove + optionally tunes its timing_amount.
+- `set_scene_metadata` (arrangement, low risk) — conditional
+  name/color/tempo in one move.
+- `set_track_metadata` (mix, low risk) — bundled rename + color, since
+  the two are always paired in Phase 6 usage.
+
+### Director SKILL — Phase 6 rewrite
+
+- **Decision table (authoritative):** each uncovered-pattern row now
+  points at a specific v1.20 move (e.g. "Set multiple params on a
+  device" → `configure_device`). 10 NEW rows marked explicitly.
+- **Default execution surface**: `apply_semantic_move` +
+  `commit_experiment`, replacing the pre-v1.20 "raw tools + manual
+  `add_session_memory(move_executed)` marker" pattern.
+- **Escape hatch policy** (v1.20 transitional state): when no move
+  covers the pattern, raw-tool execution is permitted only with the
+  three-call discipline — the raw call, an `add_session_memory(
+  category="move_executed")` marker, AND an `add_session_memory(
+  category="tech_debt")` log naming the uncovered pattern. Both
+  categories are mandatory; they serve different consumers (ledger
+  vs release planning).
+- **New reference doc** `phase-6-execution.md` (349 lines) — full
+  contract (seed_args, compiled steps, risk/protect, typical caller)
+  for each of the 10 moves, plus a worked escape-hatch example.
+
+### Architectural extension (commit 1)
+
+`apply_semantic_move(args: dict)` and `preview_semantic_move(args: dict)`
+now accept user seed parameters that flow into the compiler's kernel as
+`kernel["seed_args"]`. Pre-v1.20 moves are unaffected (they read only
+from `session_info`); the new routing/content/metadata moves read from
+`seed_args` for user targets like `return_track_index`, `device_chain`,
+`notes`, `track_index`, etc.
+
+### Live-test hardening (bugs caught during the 6 pressure-test gate)
+
+**Wire-format compiler fix.** `configure_device` and `set_track_routing`
+initially emitted MCP-tool-input keys (`parameter_name`,
+`output_routing_type`) which the MCP tool layer would normalize — but
+compiled plans use the `remote_command` backend that goes directly to
+`ableton.send_command()`, bypassing the MCP tool entirely. Ableton's
+Remote Script reads wire-format keys (`name_or_index`, `output_type`)
+exclusively. Fix: both compilers emit wire format. New regression suite
+`tests/test_compiler_wire_format_parity.py` — 10 parametrized cases,
+one per v1.20 move, asserting every compiled step's params match the
+Remote Script handler's actual key inventory.
+
+**Automatic ledger write.** `apply_semantic_move` in explore mode now
+writes a LedgerEntry to `SessionLedger` (family, intent, per-step
+actions, provisional `kept=True`, `score = success_fraction`). Returns
+a `ledger_entry_id` in the response so callers can correlate with
+post-hoc `evaluate_move` evaluation. Pre-v1.20 docs pointed
+anti-repetition at `memory_list` which actually reads the persistent
+technique library — wrong store. Director SKILL now points at
+`get_action_ledger_summary`. `commit_experiment` auto-ledger is v1.21
+scope.
+
+**Session memory categories.** `_VALID_CATEGORIES` in
+`mcp_server/memory/session_memory.py` now includes the three v1.20
+director Phase 6 categories: `move_executed`, `tech_debt`, and
+`override`. Pre-v1.20 categories preserved (backward compat);
+arbitrary strings still rejected. 7 new contract tests.
+
+### New tests (+127 across the release)
+
+- `tests/test_registry_uniqueness.py` (4) — guard against dict-insertion
+  collisions; baseline move count.
+- `tests/test_apply_semantic_move_args.py` (13) — seed_args threading +
+  ledger-write contract for each mode.
+- `tests/test_routing_moves.py` (21) — per-move + cross-family.
+- `tests/test_device_mutation_moves.py` (15).
+- `tests/test_content_moves.py` (14).
+- `tests/test_metadata_moves.py` (15).
+- `tests/test_director_move_coverage.py` (8) — SKILL ↔ registry drift
+  detection; phase-6-execution.md contract coverage.
+- `tests/test_compiler_wire_format_parity.py` (10) — wire-format
+  invariant across all 10 v1.20 moves.
+- `tests/test_v1_20_session_memory_categories.py` (7) — allowlist
+  contract.
+- Various in-place additions (execution_router / mcp_dispatch
+  classifier entries for `add_session_memory` and `add_drum_rack_pad`;
+  test_device_creation_moves invariant generalized to admit
+  device-loading moves alongside Device Forge moves).
+
+### Live pressure-test results (the 6 plan §5 scenarios, all passing)
+
+1. `build_send_chain` on Return A with Echo + Auto Filter + Hybrid
+   Reverb — 4 steps, 4 successes.
+2. `configure_device` on the Reverb with dub-cathedral overrides
+   (Decay 25.5s, Room Size 339.89, Dry/Wet 40%, Predelay 8.19ms,
+   Diffusion 77%) — 5 params set in one batch_set_parameters call.
+3. `configure_send_architecture` on track 0 → Send A at 0.4 — single
+   step, success.
+4. `load_chord_source` on track 0 slot 0 with a C minor 7 voicing —
+   create_clip + add_notes + set_clip_name, 3/3 success.
+5. 4 moves in sequence → `get_action_ledger_summary` returns 4 entries
+   (engine=semantic_moves, mix+arrangement families), zero `tech_debt`
+   entries — automatic ledger write confirmed end-to-end.
+6. Escape hatch: raw `set_track_arm(track=2, armed=true)` + both
+   mandatory `add_session_memory` markers; `get_session_memory(
+   category="tech_debt")` returns the log entry as expected.
+
+### Scope / non-goals
+
+Not in v1.20, explicitly deferred:
+- Hard cutover (closing the escape hatch). v1.21 target, conditional
+  on zero `tech_debt` entries over one month of production use.
+- Preset YAML library for `configure_device`. The move's
+  `param_overrides` dict already accepts a pre-resolved preset; the
+  library is the layer that produces those dicts.
+- `commit_experiment` automatic ledger write. Tracked as tech-debt.
+- Rewriting the existing 33 moves to a new shape. v1.22+.
+- Director Phase 6 compiler that picks moves automatically from user
+  intent. Current Phase 6 is user/director-selected; auto-selection
+  is a separate feature.
+
+## 1.19.1 — v1.19.0 polish (April 24 2026)
+
+Patch release addressing the three "Known gaps" documented at the
+end of the v1.19.0 CHANGELOG entry. All three were cosmetic or
+observability issues — no correctness changes. 3 new tests + 1
+pre-existing test tolerance widened. Test suite 2854 → 2858 pass.
+
+### Fixes
+
+- **#1 `baseline_transport` not exposed via `compare_experiments`.**
+  The field was populated internally on `ExperimentSet` (verified
+  by unit tests) but `compare_experiments`' MCP response omitted
+  it — operators had no surface-level path to verify the
+  between-branch drift fix was actually firing. Now present on
+  every response (`None` when the experiment hasn't run yet, so
+  clients can rely on key presence and check
+  `result["baseline_transport"] is None` without `in` guards).
+
+- **#2 Tempo warning midpoint rounds to int while range is exact.**
+  Pre-v1.19.1 `compile_hybrid_brief` with disjoint tempo ranges
+  reported warning text "midpoint 108 BPM" while the returned
+  range was 105-110 (centered on 107.5). Two rounding
+  conventions — human-facing text rounded to `:0f`, machine-facing
+  range kept the exact float. Fix: `:g` format in the warning
+  produces the shortest accurate representation (107.5 stays
+  "107.5"; 128.0 renders as "128") so both surfaces agree.
+
+- **#3 `weights` display full float precision.**
+  Uniform 3-packet hybrids rendered weights as
+  `0.3333333333333333` — noisy output that contrasted with
+  `evaluation_bias.target_dimensions` values already being
+  rounded to 4 decimal places. Weights are now rounded to 4 dp
+  in the response dict (`[0.3333, 0.3333, 0.3333]`). Internal
+  computation still uses full precision; only the output is
+  rounded.
+
+### Tests added
+
+- `test_compare_experiments_surfaces_baseline_transport` — round-trip
+  seed a distinctive baseline on ExperimentSet, assert
+  `compare_experiments` surfaces all fields (is_playing, song_time,
+  track_states, captured_at_ms).
+- `test_compare_experiments_baseline_none_when_not_captured` — fresh
+  experiment has `baseline_transport: None` in the response rather
+  than an omitted key.
+- `test_tempo_warning_midpoint_matches_range_center` — regex-parse
+  the warning text and assert its numeric midpoint matches the
+  returned range's center within 0.01 BPM.
+- `test_weights_rounded_to_4dp` — uniform 3-packet weights must be
+  representable at 4 dp precision (`round(w, 4) == w`).
+
+Test suite: 2858 pass, 1 skipped. Zero regressions. `sync_metadata
+--check` clean.
+
+## 1.19.0 — Experiment baseline + hybrid packet compilation (April 24 2026)
+
+Minor version bump. Ships two of the three open items documented in
+`docs/plans/v1.19-structural-plan.md`. Item C (full architectural
+routing of director Phase 6 through `apply_semantic_move`) is
+deferred to v1.20 per the plan's blast-radius rationale.
+
+Both items shipped under strict TDD: 52 new unit tests, zero
+regressions across the 2854-test suite. Both items live-tested in
+production (real Ableton session, Live 12.4.0, 13 live-test
+scenarios green).
+
+### Item A — Experiment baseline transport snapshot/restore
+
+Live-verified in v1.18.0 Test 8: running a 3-branch experiment
+sequentially produced inconsistent `before_snapshot` values
+because playback position, mute/solo/arm, and playing-clip state
+drifted across branches. `undo()` reverts command history but
+doesn't guarantee transport state is identical when each branch's
+`before_snapshot` fires. Track_meters[0].level values of 0.764 /
+0.000 / 0.873 across three branches rendered the before/after
+comparisons meaningless.
+
+Fix — snapshot-and-restore pattern, experiment-level:
+
+- NEW `mcp_server/experiment/baseline.py` — `BaselineTransportState`
+  dataclass + `capture_baseline(ableton)` +
+  `restore_baseline(ableton, baseline, stabilize_ms=300)`.
+  Captures `is_playing`, `song_time`, and per-track
+  `mute`/`solo`/`arm` via a single `get_session_info` round-trip.
+  Restore issues `stop_playback` → per-track
+  `set_track_mute`/`set_track_solo`/`set_track_arm` → 300 ms
+  stabilize sleep. Per-track failures are logged, not fatal (a
+  single flaky track never aborts restore for the rest).
+- `ExperimentSet` gains a `baseline_transport: Optional[BaselineTransportState]`
+  field. `to_dict()` surfaces it when populated.
+- `engine.prepare_for_next_branch(ableton, baseline, stabilize_ms)`
+  — thin wrapper called by `run_experiment` between branches.
+  No-op when baseline is None (first branch).
+- `run_experiment` captures the baseline once before the branch
+  loop starts, stashes it on the experiment, and calls
+  `prepare_for_next_branch` before every branch after the first.
+  Capture failure logs + degrades to None (pre-v1.19 behavior).
+
+**Stabilize window defaults to 300 ms** — midpoint of plan §2's
+200-500 ms empirical range. Per-branch overhead stayed at
+~1.04 s amortized under live 5-branch testing (well under the
+plan's 2-second-per-branch success criterion target).
+
+**Live evidence of state preservation:** 5-branch test with two
+mutations on track 0 "Dub Chord" (pan -0.35 by `widen_stereo`,
+then volume 0.4 by `darken_without_losing_width`) returned the
+track to identical pre-experiment state (arm=true, mute=false,
+solo=false) after every branch cycle.
+
+Known limitations (accepted per plan §2):
+- Automation drift is not frozen — deeper refactor out of scope.
+- Send values + device parameters mutated outside a branch's own
+  steps fall back to `undo()` alone — no explicit restore.
+- Transport position is NOT re-seeked; `song_time` is captured
+  but unused (stopping is enough).
+
+21 unit tests added: capture (transport fields, empty tracks,
+missing-field defaults, epoch-ms timestamp), restore (command
+sequence, per-track mute/solo/arm restoration, stabilize sleep
+with monkey-patched time.sleep, flaky-track resilience,
+return-track arm skip), `ExperimentSet.baseline_transport`
+(default None, to_dict surfacing/omission), engine helper
+(None no-op, delegation), tool-level wiring (`run_experiment`
+populates baseline once + idempotent on second run).
+
+### Item B — Hybrid concept packet compilation
+
+Pre-v1.19 the director handled "Basic Channel meets Dilla swing"
+via LLM ad-hoc reasoning — no explicit rule for contradictions
+(e.g., Gas deprioritizes rhythmic, Dilla emphasizes rhythmic;
+what survives the hybrid?). v1.18.0 Test 7 verified plausible
+output but entirely improvisational, with no guarantee either
+source packet's `avoid` list or tempo constraints would persist.
+
+Fix — explicit merge algorithm with canonical rules per plan §3:
+
+- NEW `mcp_server/creative_director/hybrid.py` —
+  `compile_hybrid_brief(packet_ids, weights=None)` loads concept
+  packets from `livepilot/skills/livepilot-core/references/concepts/`
+  and applies merge rules:
+    * `sonic_identity` / `avoid` / `reach_for.*` / `*_idioms` /
+      `sample_roles` / `dimensions_in_scope`: UNION, deduplicated,
+      first-packet order preserved.
+    * `dimensions_deprioritized` / `move_family_bias.deprioritize`:
+      INTERSECTION — only deprioritize if ALL packets agree.
+      Safer default: one packet's ignored dimension shouldn't
+      starve another packet's wanted one.
+    * `move_family_bias.favor`: INTERSECTION when non-empty
+      (hybrid focuses where both agree), UNION fallback with
+      warning when empty.
+    * `evaluation_bias.target_dimensions`: WEIGHTED AVERAGE
+      (default uniform; override via `weights`).
+    * `evaluation_bias.protect`: MAX per dimension (stricter
+      floor wins).
+    * `novelty_budget_default`: MAX (hybrid asks skew
+      exploratory).
+    * `tempo_hint`: NEAREST-OVERLAP — intersect overlapping
+      ranges, else midpoint + `disjoint: true` flag + warning.
+
+- NEW MCP tool `compile_hybrid_brief` in
+  `mcp_server/creative_director/tools.py` (tool count 428 → 429).
+  Accepts packet IDs as filename stems (`"basic-channel"`),
+  aliases (`"dilla"`), or packet `id` values
+  (`"dub_techno__basic_channel"`). Returns ValueError as an
+  error-dict response (doesn't raise).
+
+- NEW reference doc
+  `livepilot/skills/livepilot-creative-director/references/hybrid-compilation.md`
+  — canonical merge-rule table, output shape, interop notes,
+  guidance for handling the `warnings` list.
+
+- Director SKILL.md Phase 1 — explicit guidance to call
+  `compile_hybrid_brief` when the user names 2+ references,
+  with a mandate to surface any `warnings` entries (don't
+  silently average disjoint tempos).
+
+- Output exposes merged `avoid` also as `anti_patterns` alias
+  for drop-in compat with `check_brief_compliance` (v1.18.3).
+  Live interop test: Basic Channel × J Dilla hybrid correctly
+  flagged a Hi Gain boost via `check_brief_compliance`.
+
+31 unit tests added: packet loading (stem / alias / id /
+underscore-to-hyphen normalization / missing), input validation
+(min 2 packets / missing packet / weights length mismatch),
+UNION rules (avoid / sonic_identity / reach_for /
+dimensions_in_scope), INTERSECTION rules (deprioritized
+dimensions / `move_family_bias.deprioritize` /
+`move_family_bias.favor` non-empty case / UNION fallback with
+warning), WEIGHTED AVERAGE (default + custom weights), MAX rules
+(protect / novelty_budget), tempo_hint (overlap intersection /
+disjoint midpoint with warning), 3+ packet composition, output
+metadata (`type` / `source_packets` / hybrid name /
+`locked_dimensions=[]` / warnings list), and interoperability
+(hybrid brief passed through `check_brief_compliance`).
+
+### Live test coverage (13 scenarios)
+
+Item B: BC × Dilla (disjoint tempos) · BC × Villalobos
+(overlapping tempos, NO disjoint flag) · alias + spaced-name
+resolution · invalid packet error · 3-packet hybrid
+(BC + Dilla + Villalobos) · weighted average 75/25 · genre ×
+artist (ambient × basinski, tempo=0 case) · full hybrid brief
+→ `check_brief_compliance` interop (quantize_clip flagged).
+
+Item A: 3-branch experiment (all snapshots populated, ranking
+produced) · 5-branch experiment (1.04s/branch amortized
+overhead) · state preservation under 2 mutations on track 0
+(Dub Chord) across 5-branch cycle · `discard_experiment` cleanup.
+
+### Known gaps deferred to v1.19.1
+
+- `experiment.baseline_transport` populated internally but not
+  surfaced through `compare_experiments` response. 3-line fix
+  for operator visibility; not a correctness issue.
+- `warnings` message rounds tempo midpoint to int display (128
+  BPM) while range returned is exact (125-130, centered 127.5).
+  Two rounding conventions. Cosmetic.
+- `weights` in response show full float precision
+  (`0.3333333333333333`) instead of rounding to 4 dp like
+  `target_dimensions` already does. Cosmetic.
+
+### Still open for v1.20 (Item C from the plan)
+
+- Route director's Phase 6 execution through `apply_semantic_move`
+  / `create_experiment + commit_experiment` so the action ledger
+  populates automatically and anti-repetition becomes reliable.
+  Doc-level fix shipped in v1.18.1; architectural fix deferred
+  to v1.20 per plan §5 blast-radius rationale. Requires 5-10
+  new semantic_moves to cover current Phase 6 patterns
+  (return-chain builds, multi-param device presets, chord
+  source loading, send routing, etc.).
+
+Test suite: 2854 pass, 1 skipped (from 2792 pre-v1.19). Zero
+regressions. sync_metadata --check clean.
+
+## 1.18.3 — Brief compliance runtime check (#7 + #8) (April 24 2026)
+
+Third v1.18.x patch. Bundles two Known Issues items (#7 + #8) that
+shared the same "check tool args against brief constraints" machinery.
+
+### Fix
+
+- **#7 Packet `avoid` list runtime enforcement.**
+- **#8 `locked_dimensions` runtime enforcement.**
+
+Both were advisory-only pre-v1.18.3: the director SKILL.md documented
+the hard-filter rules but no runtime machinery verified compliance.
+This release ships a **stateless pure check function** in a new
+`mcp_server/creative_director` module, exposed as the MCP tool
+`check_brief_compliance(brief, tool_name, tool_args)`.
+
+**Usage**: director's Phase 6 calls the tool before each risky
+execution (EQ parameters, filter settings, new scene creation, clip
+note editing, send routing, etc.). The tool returns
+`{"ok": bool, "violations": [...]}`. Violations are reports, not
+automatic blocks — the director surfaces them to the user and offers
+three paths: adjust, override-for-this-turn, or pick a different tool.
+
+**Detection strategy — best-effort heuristic**, not semantic
+understanding:
+
+- anti_pattern matching via keyword tokens + parameter-name heuristics
+  (e.g., pattern "bright top-end" + Hi Gain positive value → fires)
+- locked_dimension matching via tool → dimension map
+  (e.g., structural lock + create_scene → fires)
+
+### Infrastructure
+
+- NEW module `mcp_server/creative_director/` with compliance.py +
+  tools.py
+- NEW MCP tool `check_brief_compliance` (tool count 427 → 428,
+  domain count 52 → 53)
+- Director SKILL.md Phase 6 now documents the check + the
+  three-path violation-response protocol
+- Full session-state active-brief storage is deferred to v1.19;
+  v1.18.3 is stateless (caller passes brief each time)
+
+### Tests added
+
+- `test_compliance_check_detects_anti_pattern_violation` (BC packet
+  + Hi Gain boost → violation)
+- `test_compliance_check_detects_locked_dimension_violation`
+  (structural lock + create_scene → violation)
+- `test_compliance_check_passes_compliant_call` (no false positives)
+- `test_compliance_check_empty_brief_permissive` (fresh session
+  safety)
+
+Test suite: 2792 pass, 1 skipped. Zero regressions.
+
+### Still open for v1.19 (3 items)
+
+- Experiment state continuity between branches (architectural —
+  transport-state locking needed)
+- Hybrid-packet compilation algorithm (union/intersection logic for
+  multi-packet refs like "Basic Channel meets Dilla")
+- Full architectural fix for #3 (route director Phase 6 through
+  `apply_semantic_move` / `commit_experiment` — replaces the
+  doc-level fix shipped in v1.18.1)
+
+These are v1.19 scope — each needs new architectural decisions and
+infrastructure unsuitable for patch releases.
+
+## 1.18.2 — Wonder cold-start + tie-break + genre catalog closure (April 24 2026)
+
+Second patch in the v1.18.x series. Three items from the v1.18.0/v1.18.1
+Known Issues list resolved. Test suite grew to 2785 pass, xfail marker
+removed (formerly 1, now 0).
+
+### Fixes
+
+- **#10 Wonder Mode zero-variant degradation on empty session context.**
+  `enter_wonder_mode` on an empty/sparse session was returning 3
+  IDENTICAL `analytical_only` variants all with intent "Analytical
+  suggestion for: <request>". Live-verified during v1.18.0 Test 4
+  ("I'm stuck" on a 4-track empty session). Fix: introduced
+  `_COLD_START_SEEDS` in `mcp_server/wonder_mode/engine.py` — three
+  distinct starting-point suggestions covering different families
+  (`device_creation × rhythmic` + `sound_design × harmonic` +
+  `mix × architecture-first`). When `executable_count == 0`, the
+  padding loop uses `build_cold_start_variant()` which pulls from
+  the seed set by index, producing genuinely distinct variants with
+  specific actionable `what_changed` / `why_it_matters` text.
+  Partial-match case (1-2 executable) still uses the generic
+  fallback to avoid mixing real moves with architecture-first seeds.
+
+- **#11 Experiment ranking tie-break coarseness.**
+  `ExperimentSet.ranked_branches()` was a single-key sort by score,
+  producing unstable rankings at score ties. Live-verified in v1.18.0
+  Test 8 — 3-branch experiment with `add_space` + `add_warmth` +
+  `widen_stereo` all scored 0.6 with no clear winner. Fix: composite
+  sort key via new `_branch_rank_key()` helper, in priority order:
+  (1) `-score` (primary, higher wins), (2) `-novelty_rank` (higher
+  novelty wins score ties — creative asks reward variation),
+  (3) `risk_rank` (lower risk wins secondary ties — safety default),
+  (4) `step_count` (simpler plans win tertiary ties),
+  (5) `branch_id` (deterministic final tiebreak for reproducibility).
+
+- **Concept packet catalog closure.** 13 new genre YAMLs
+  (drone, downtempo, lo_fi, boom_bap, footwork, techno,
+  detroit_techno, synthwave, deep_house, disco, soul, dub, hyperpop)
+  + 15 too-generic/narrow refs removed from 12 artist packets
+  (electronic ×5, electronica, bass_music, cinematic, acid_techno,
+  french_house, nu_disco, soulful_house, vaporwave, juke, jungle).
+  The xfailing `test_all_artist_genre_refs_resolve_strictly` test
+  is now a required green pass. The concept surface has full graph
+  closure — every artist→genre cross-reference resolves to an actual
+  genre YAML's `id` field.
+
+### Tests added / changed
+
+- `test_wonder_cold_start_has_distinct_variants` (new — guards
+  against regression to the 3-identical-generics degradation)
+- `test_experiment_tie_break_prefers_higher_novelty` (new — unexpected
+  > strong > safe at equal scores)
+- `test_experiment_tie_break_is_deterministic` (new — ranking stable
+  across input order)
+- `test_all_artist_genre_refs_resolve_strictly` (was xfailing, now
+  passing — xfail marker removed)
+- `test_concept_packets_count` (floor updated 14 → 27 genres)
+
+### Still open for v1.18.3 / v1.19
+
+5 items remain from the original v1.18.0 Known Issues list:
+
+- **#7 Packet `avoid` list runtime enforcement** (still advisory —
+  pre-flight check against tool args needed)
+- **#8 `locked_dimensions` runtime enforcement** (same pattern as #7)
+- **Experiment state continuity between branches** (before-snapshot
+  drift)
+- **Hybrid-packet compilation algorithm** (union/intersection logic
+  for "Basic Channel meets Dilla")
+- **Full architectural fix for #3** (route director Phase 6 through
+  semantic_move commits — big redesign, v1.19 scope)
+
+These all need new infrastructure or architectural decisions
+unsuitable for a patch release.
+
+## 1.18.1 — Director HIGH-severity patches (April 23 2026)
+
+Patch release addressing 4 of the 12 known issues documented in v1.18.0.
+All three HIGH-severity bugs are fixed, plus 6 medium-severity items
+(data cleanups and doc clarifications). All fixes landed with
+regression-guard tests. 2779 project tests pass + 1 xfail (pre-existing).
+
+### High-severity fixes
+
+- **#1 `create_experiment` auto-proposal returned single-char move_ids.**
+  Python unpacking bug at `mcp_server/experiment/tools.py:267` —
+  `[m[0] for m, _ in scored]` indexed the first character of each
+  move_id string. Fix: `[move_id for move_id, _ in scored[:limit]]`.
+  Pre-fix, calling the director's Flow B with no explicit seeds/move_ids
+  would always fail at run_experiment with `"Move t not found"`.
+
+- **#2 `propose_composer_branches` ignored concept-packet arrangement
+  idioms.** Dub-techno prompts (referencing Basic Channel, Gas, etc.)
+  were collapsed to the generic techno template (Intro→Build→Drop→
+  Breakdown→Drop 2→Outro with 6 standard layers). Fix: "dub techno"
+  is now its own canonical genre in `GENRE_DEFAULTS` and
+  `SECTION_TEMPLATES`, with a continuous-evolution scaffold
+  (Dawn→Pulse→Chord→Depth→Withdraw→Return, 3-5 layers, energy 0.4).
+  Removed the `dub techno → techno` alias that was causing the
+  collapse; added `dub-techno` (hyphenated) as an alias to the new
+  canonical.
+
+- **#3 Director raw-tool-call path bypassed the action ledger.**
+  Min-effective doc fix: Phase 6 of `livepilot-creative-director`
+  now mandates `add_session_memory(category="move_executed", ...)`
+  after raw-tool execution batches, so anti-repetition detection on
+  subsequent creative turns isn't blind. Added a state-inference
+  fallback table in `anti-repetition-rules.md` for when the ledger
+  is still empty (infer recent family from loaded devices, non-default
+  mixer state, clip slot contents). Full architectural fix (route all
+  Phase 6 execution through `apply_semantic_move`/`commit_experiment`)
+  is deferred to v1.19.
+
+### Medium-severity fixes
+
+- **#4 Ping Pong Delay ghost packet.** `affordances/devices/ping-pong-delay.yaml`
+  previously described a standalone device that doesn't exist in
+  Live 12 (`search_browser` returned empty). Rewritten as an explicit
+  mode-alias for Echo with `Channel Mode = 1`. `echo.yaml` now prominently
+  documents the Channel Mode enum (0=Stereo, 1=Ping Pong, 2=Mid/Side).
+
+- **#5 Auto Filter affordance used legacy 20-135 Hz ranges.** Modern
+  `AutoFilter2` class (Live 12 default) uses 0-1 normalized for
+  Frequency, Resonance, and LFO Amount. Live-verified mapping (raw
+  0.45 → display 448 Hz) is now documented in the YAML. Legacy/modern
+  distinction clarified in the notes.
+
+- **#9 `propose_composer_branches` silent count degradation.** Explicit
+  `count=3` at `freshness<0.7` was silently returning 2 seeds because
+  `layer_contrast` was gated behind `freshness>=0.7`. Fix: explicit
+  `count>=3` now raises freshness internally to 0.7 to admit all
+  strategies. Default `count=2` (no override) still respects the
+  freshness gate — preserves the "freshness shapes default strategy
+  count" contract and the existing tests that assert it.
+
+- **#12 Low-novelty-budget escape hatch for 3-plan diversity rule.**
+  `move-family-diversity-rule.md` gained a dedicated section: when
+  `novelty_budget < 0.35` (user prompts like "keep the vibe, just
+  cleaner"), 1-2 family plans is acceptable and honest. Prevents the
+  rule from fighting cleanup requests.
+
+### Bonus fixes
+
+- **`batch_set_parameters` schema gotcha documented.** Core SKILL.md
+  Rule 15 now shows the correct dict-of-dicts shape:
+  `{"ParamName": {"value": v}}`. Live verification surfaced this during
+  v1.18.0 pressure testing.
+
+- **Convolution Reverb phantom `ir_length` already fixed in v1.18.0
+  commit 9** — regression test now guards against reintroduction.
+
+### Tests added
+
+- `test_create_experiment_auto_proposal_no_m0_bug` (source-pattern
+  regression guard)
+- `test_create_experiment_auto_proposal_functional` (mirror-logic
+  integration check)
+- `test_composer_dub_techno_prompt_avoids_drop_scaffold` (no Drop/Drop 2
+  on Basic Channel prompts)
+- `test_propose_composer_branches_honors_explicit_count` (count=3
+  returns 3 regardless of freshness)
+- `test_medium_freshness_count_3_unlocks_all_strategies` (renamed from
+  test encoding the pre-fix bug as desired behavior)
+- `test_medium_freshness_default_count_gives_two` (preserves
+  default-count-respects-freshness contract)
+- `test_ping_pong_delay_is_documented_as_echo_mode`
+- `test_auto_filter_ranges_are_normalized_for_modern_class`
+- `test_low_novelty_escape_hatch_documented`
+- `test_batch_set_parameters_schema_documented`
+- `test_director_phase6_records_ledger_marker`
+- `test_anti_repetition_has_state_inference_fallback`
+
+### Still open for v1.18.2 / v1.19
+
+8 items remain from the v1.18.0 Known Issues list:
+
+- **#7 Packet `avoid` list runtime enforcement** (currently advisory —
+  pre-flight check against tool args needed)
+- **#8 `locked_dimensions` runtime enforcement** (same pattern as #7)
+- **#10 Wonder Mode zero-variant degradation on empty session context**
+- **#11 Evaluation tie-break coarseness** (3-way ties at score 0.6)
+- **Experiment state continuity between branches** (before-snapshot
+  drift)
+- **Hybrid-packet compilation algorithm** (union/intersection logic
+  for "Basic Channel meets Dilla")
+- **~20 missing genre YAMLs** (downtempo, boom_bap, lo_fi, synthwave,
+  techno, etc.) — xfail test tracks this
+- **Full architectural fix for #3** (route director Phase 6 through
+  semantic_move commits, replacing the doc-level fix shipped here)
+
+These are each scoped for focused follow-up sessions — they need new
+infrastructure or architectural decisions not suitable for a patch
+release.
+
+## 1.18.0 — Creative Director + concept packets + device affordances (April 23 2026)
+
+A structural feature release. Addresses the "agent doesn't variate
+enough, feels stuck in the same repetitive patterns" failure mode by
+adding an enforcement layer on top of the existing tool surface.
+**Zero new Python. Zero new MCP tools.** The entire feature is skill
+documentation, structured YAML data, and prompt-level contracts.
+
+### Added
+
+- **`livepilot-creative-director` skill** — new top-level skill that
+  routes creative intent through mandatory divergence before any
+  commit. Eight-phase contract: ground → compile brief → generate 3
+  plans with distinct `move.family` → cover 4 dimensions → preview
+  or rank → select + execute → evaluate → record. Critics (analyze_mix,
+  evaluate_move) DEFER until Phase 7 — firing them earlier pre-converges
+  the answer. Includes four reference files:
+  - `creative-brief-template.md` — YAML schema + 4 filled examples,
+    novelty_budget table with 6 user-framing buckets
+  - `move-family-diversity-rule.md` — canonical 6 families + family-vs-
+    dimension split + collision-avoidance rules
+  - `anti-repetition-rules.md` — recency threshold table (0-2/10
+    neutral, 3-4/10 least-weighted, ≥5/10 EXCLUDED) + borderline-
+    stuckness band (0.4-0.5 surfaces user option)
+  - `the-four-move-rule.md` — structural + rhythmic + timbral + spatial
+    dimension coverage with narrow-idiom exceptions for dub-techno /
+    ambient / beat-focused packets
+
+- **Structured concept packets** (42 YAMLs under
+  `livepilot/skills/livepilot-core/references/concepts/`) — 28 artist
+  packets + 14 genre packets. Each packet carries `sonic_identity`,
+  `reach_for`, `avoid` (HARD filter), `evaluation_bias.target_dimensions`
+  + `protect` floors, `move_family_bias.favor` + `deprioritize`,
+  `dimensions_in_scope` + `dimensions_deprioritized`, and
+  `novelty_budget_default`. Narrative `artist-vocabularies.md` and
+  `genre-vocabularies.md` stay as human-facing overviews; YAMLs are
+  the machine source-of-truth.
+
+- **Device affordance metadata** (20 YAMLs under
+  `livepilot/skills/livepilot-core/references/affordances/`) — per-
+  device affordance packets for Echo, Auto Filter, Convolution Reverb,
+  Hybrid Reverb, Ping Pong Delay, Drift, Corpus, Granulator III,
+  Simpler, Wavetable, Operator, Poli, Saturator, Compressor, Glue
+  Compressor, Utility, EQ Eight, Chorus-Ensemble, Shifter, Vinyl
+  Distortion. Each covers `musical_roles`, `strong_for` / `risky_for`,
+  `subtle` / `moderate` / `aggressive` parameter ranges, `pairings`
+  (with before/after/parallel order), `anti_pairings`, `remeasure`
+  queue, and `dimensional_impact` mapping to the four-move-rule.
+
+- **Evaluation artistic dimensions** — `livepilot-evaluation/SKILL.md`
+  extended with Family B dimensions (style_fit, distinctiveness,
+  motif_coherence, section_contrast, restraint, surprise_without_breakage)
+  in addition to Family A (punch, weight, etc). Both required for
+  creative-director turns.
+
+- **Creative-success verdict taxonomy** — 5 verdicts assigned at
+  evaluation Step 8b: `safe_win`, `bold_win`, `interesting_failure`,
+  `identity_break`, `generic_fallback`. Drives promotion decisions.
+
+- **Verdict-gated reflection promotion rubric** — `memory-guide.md`
+  extended with a promotion matrix that keeps memory from converging
+  on safe_win-adjacent moves. `bold_win` promotes immediately;
+  `safe_win` conditional on user-keep-for-2-turns; `interesting_failure`
+  curiosity-store only; `identity_break` and `generic_fallback` record
+  anti-preferences instead.
+
+- **Schema test harness** — `tests/test_creative_director.py` (27
+  passing, 1 xfail tracking missing genre YAMLs). Verifies skill file
+  structure, packet counts, canonical family/dimension enforcement,
+  cross-reference resolution, and cross-skill integration (director ↔
+  evaluation ↔ memory-guide).
+
+### Changed
+
+- `livepilot-core/SKILL.md`: fixed semantic_moves family count (5→6,
+  `device_creation` was missing from the docs). Added director routing
+  pointer in the V2 Engine Skills table and Flow B preamble.
+- `livepilot-wonder/SKILL.md`: added creative-director as a trigger
+  (not only stuck-rescue); split honesty rule to actively widen across
+  families BEFORE accepting <3 variants on first-pass creative calls.
+- `livepilot-producer/AGENT.md`: director added to subagent skills
+  index with "load FIRST on open-ended creative intent" note.
+- `artist-vocabularies.md` + `genre-vocabularies.md`: cross-reference
+  callouts pointing to the new YAML packets.
+- `m4l_device/LivePilot_Analyzer.amxd` + `.maxpat` + `livepilot_bridge.js`:
+  versioning text added to analyzer UI for live identification across
+  instances.
+
+### Pressure-testing
+
+The director was developed under TDD-for-skills discipline: three
+subagent pressure-scenarios run in two rounds, with verdict-driven
+fixes between rounds. Round 1 surfaced 9 issues, Round 2 verified
+each was fixed and surfaced 3 more (higher-order patterns only visible
+after first-order bugs were gone). PR 3 affordance work caught 3
+schema-level bugs (`atlas_uri` semantic mismatch, phantom
+`ir_length`, parameter-name canonicalization gap) before ship.
+
+### Known gaps
+
+- ~20 narrative-only genres (downtempo, boom_bap, lo_fi, synthwave,
+  techno, detroit_techno, soul, footwork, deep_house, french_house,
+  disco, electronic, electronica, cinematic, hyperpop, drone,
+  bass_music, soulful_house, acid_techno, nu_disco, juke) referenced
+  by artist packets but not yet YAML-ified. Tracked via
+  `test_all_artist_genre_refs_resolve_strictly` xfail.
+
+### Known issues from pre-ship live verification (v1.18.1 patch targets)
+
+12 issues surfaced while running director end-to-end against a real
+Ableton session before pushing v1.18.0. Shipping as-is rather than
+blocking the release; patching in a focused follow-up. Severity is
+this author's subjective production-impact rating.
+
+**High severity — users will hit these in the first 30 seconds:**
+
+1. **`create_experiment` auto-proposal is broken.** When called without
+   explicit `seeds` or `move_ids`, the keyword-overlap selector
+   generates single-character `move_id` values (`"t"`, `"w"`, `"m"`)
+   that fail with `"Move t not found"` at run time. All three branches
+   fail. Workaround: director MUST pass explicit `move_ids=[...]` —
+   auto-proposal path is unusable. (`mcp_server/experiment/engine.py`
+   auto-propose logic.)
+2. **`propose_composer_branches` ignores concept packets.** A prompt
+   referencing Basic Channel produced generic EDM scaffold
+   (`Intro → Build → Drop → Breakdown → Drop 2 → Outro` + 6 standard
+   layers) instead of BC's continuous-evolution dub-techno form.
+   Composer falls back to genre-family defaults and doesn't consult
+   `concepts/artists/*.yaml` or `concepts/genres/*.yaml` arrangement_idioms.
+3. **Director Plan A bypasses the action ledger.** When the director
+   executes via raw tool calls (`load_browser_item`, `set_device_parameter`,
+   etc.) instead of `apply_semantic_move` / `create_experiment +
+   commit_experiment`, `get_last_move` returns empty and anti-repetition
+   goes blind. Either make semantic_move commits mandatory for director
+   plan execution, or add a session-state inference fallback that reads
+   device/track deltas directly.
+
+**Medium severity — edges and enforcement gaps:**
+
+4. **Affordance YAML — Ping Pong Delay is a ghost packet.**
+   `affordances/devices/ping-pong-delay.yaml` describes a standalone
+   device that doesn't exist in Live 12 (empty `search_browser` result).
+   Ping-pong is a MODE of `Echo` (`Channel Mode = 1`). Merge the
+   affordance into `echo.yaml` or delete the file.
+5. **Affordance YAML — Auto Filter ranges are legacy.** Modern
+   `AutoFilter2` class uses 0-1 normalized for Frequency (display
+   `"448 Hz"` at raw `0.45`), NOT the 20-135 legacy range the affordance
+   YAML documents. Either update the affordance to reflect
+   AutoFilter2 OR ship separate legacy/modern variants.
+6. **Affordance YAML — `ir_length` phantom on Convolution Reverb.**
+   Already fixed in commit 9 by renaming to `decay_time`, but worth
+   flagging that this class of field-vs-actual drift needs a
+   systematic check (script that compares affordance parameter names
+   to `get_device_parameters` output for each device).
+7. **Packet `avoid` list is advisory, not runtime-enforced.** Director
+   SKILL.md documents the hard-filter rule but there's no code path
+   that compares user requests or tool args against the active packet's
+   `avoid` list before executing. Ask for "bump the high-end" under an
+   active BC packet and nothing blocks the EQ boost.
+8. **`locked_dimensions` respect is declarative only.** Same class as
+   (7) — director compiles a brief with explicit locks but no runtime
+   pre-flight check blocks tool calls that touch locked dimensions.
+9. **`propose_composer_branches` silent `count` degradation.** Requesting
+   3 branches at `freshness < 0.7` returns 2 (only canonical +
+   energy_shift). User-visible surface returns fewer than requested
+   without flagging.
+10. **Wonder Mode degrades to zero executable variants on empty/sparse
+    session context.** Tested with `enter_wonder_mode("I'm stuck")` on
+    a mostly-empty session — returned 3 identical analytical-only
+    variants with `"No matching executable moves found"`. Needs a
+    cold-start path that proposes starting-point seeds from memory
+    or concept packets rather than requiring existing session content.
+11. **Evaluation tie-break is coarse.** 3-branch experiment with
+    different semantic moves (add_space, add_warmth, widen_stereo)
+    all scored identical 0.6. No clear winner emerges. Classifier
+    needs finer resolution OR explicit tie-break by novelty/taste.
+12. **Low-novelty-budget escape hatch missing from 3-plan rule.**
+    `"keep the vibe, just cleaner"` → `novelty_budget = 0.30`. The
+    3-distinct-families rule fights against narrow cleanup requests.
+    Need explicit clause: "if `novelty_budget < 0.35`, 1-2 mix-family
+    plans is acceptable and honest."
+
+**Also worth fixing:**
+
+- `batch_set_parameters` schema — requires `{"Name": {"value": v}}`,
+  not `{"Name": v}`. Docs didn't make this obvious.
+- State continuity between experiment branches — before-snapshot
+  track levels drifted between branches (0.76 → 0 → 0.87). Each
+  branch sees a different baseline. Needs transport-state locking.
+- Hybrid-reference compilation algorithm — multi-packet asks
+  ("Basic Channel meets Dilla swing") work via LLM ad-hoc reasoning,
+  not via explicit union/intersection logic. Define the rule.
+
+All 15 items are tracked for a v1.18.1 patch. The core v1.18.0
+machinery (8-phase director contract, concept packets, affordances,
+evaluation dimensions, verdict taxonomy) works correctly when plans
+are constructed with explicit `move_ids` — which is the documented
+primary path.
+
+### Live Ableton session result
+
+Test scenario: build a Basic Channel dub chain on a return track, then
+source (Meld Juno Square chord stab) with sends. Chain built cleanly.
+User feedback on initial Plan A: "super basic" (default presets lack
+character). Swapped Drift default → `Poly Juno Square.adv` preset.
+Improved character. Flow A of the director (build a single plan, verify,
+iterate) is production-viable today. Flow B (divergence via experiment)
+has the 3 high-severity issues above.
+
+### Process note
+
+This release was authored in a single session as a series of 6 PRs
+(Creative Director skill → Concept packets → Affordances → Evaluation
+dimensions → Reflection rubric → Test harness), each pressure-tested
+before moving to the next. Outside-reviewer design plan is at
+`docs/plans/livepilot_creativity_plan.md`.
+
+---
+
+## 1.17.5 — Classify error-only commit payloads as failures (April 23 2026)
+
+### Fixed
+
+- **`_classify_commit_result` now catches error-only commit payloads**
+  (`mcp_server/tools/_agent_os_engine/iteration.py`): Codex review on
+  PR #27 caught a gap I shipped in v1.17.3. My docstring listed
+  `{"error": ...}` as a known failure signal, but the implementation
+  never checked for a top-level `error` key. `commit_branch_async` in
+  `mcp_server/experiment/engine.py` returns error-only dicts in 5+
+  paths (`Branch {id} not found`, `Branch has no compiled plan`,
+  `Experiment {id} not found`). These fell through to
+  `"committed"` because they had no explicit `committed: false` /
+  `ok: false` / `status: "failed"` / `steps_ok: 0` signal. Classic
+  truth-gap: the iteration loop could claim success while the commit
+  applied zero steps.
+
+  Fix: if `result.get("error")` is truthy AND `result.get("committed")`
+  is not explicitly `True`, return `"commit_failed"`. The explicit-
+  committed caveat handles the edge case where a payload reports
+  success with a warning in the `error` field.
+
+### Tests
+
+4 new TDD tests in `tests/test_iterate_toward_goal.py`:
+- `{"error": "Experiment not found"}` → `commit_failed`
+- `{"error": "Branch not found"}` (real commit_branch_async shape) →
+  `commit_failed`, with the payload surfaced on `commit_result`
+- Same discipline on the `on_timeout="commit_best"` path
+- Edge case: `{"committed": True, "error": "warning...",
+  steps_ok: 3}` still returns `committed` (explicit success overrides)
+
+2726 → 2730 passing.
+
+### Process note
+
+The fix that shipped in v1.17.3 was itself caught by a subsequent
+review. Writing a docstring listing a failure signal and forgetting
+to implement the check is the classic TDD violation the discipline
+exists to prevent. Codex's automated review acted as the missing
+failing-test-first pass.
+
+## 1.17.4 — Shape cleanup + memory probe (April 23 2026)
+
+### Fixed
+
+- **`get_session_kernel` now probes the memory store** instead of
+  hardcoding `memory_ok=True` (`mcp_server/runtime/tools.py`). If the
+  underlying technique store raises on `list_techniques` (disk full,
+  corrupted index, permissions error), the kernel previously still
+  reported memory as available to orchestration planners. Same
+  truth-gap class as the v1.17.3 web/flucoma fix — should have been
+  caught by the same review pass. Now probed the same way
+  `get_capability_state` does, wrapped in try/except.
+- **`capability_state` flat shape** in session kernel
+  (`mcp_server/runtime/tools.py`): `state.to_dict()` wraps its output as
+  `{"capability_state": {...}}` — that's the right shape for the
+  standalone `get_capability_state` tool, but when stored on the kernel
+  it produced the ugly double-nested
+  `kernel["capability_state"]["capability_state"]["domains"]`. v1.17.3
+  probe tests worked around it with defensive
+  `outer.get("capability_state", outer)`. Fix: unwrap the outer key
+  once before passing to `build_session_kernel`. Consumer path is
+  now `kernel["capability_state"]["domains"]` directly. Standalone
+  `get_capability_state` return shape unchanged.
+
+### Tests
+
+- 4 new TDD tests in `tests/test_runtime_capability_probes.py`:
+  - memory probe raises → kernel reports memory unavailable
+  - memory probe succeeds → kernel reports available
+  - kernel's capability_state has no nested `capability_state` key
+  - end-to-end flat access without defensive fallbacks
+- Consumer updates:
+  - `test_session_kernel.py:203` — removed extra level
+  - `test_runtime_capability_probes.py` (4 places) — removed
+    defensive `outer.get('capability_state', outer)` pattern now that
+    the shape is known-flat
+
+2722 → 2726 passing.
+
+### Known follow-up
+
+Audit while writing this release flagged a third bug in
+`mcp_server/runtime/safety_kernel.py:244`: the safety kernel reads
+`capability_state.get("mode", "normal")` but the actual shape uses
+`overall_mode`, not `mode`. The `.get(..., "normal")` default silently
+falls back, so `read_only` mode gating never kicks in. Separate fix,
+out of scope for this release.
+
+## 1.17.3 — Truth-gap remediation, for real (April 23 2026)
+
+### Fixed
+
+- **`iterate_toward_goal` now inspects `commit_fn` return value** (P1,
+  `mcp_server/tools/_agent_os_engine/iteration.py`): prior to this release
+  the iteration loop awaited the commit callback and dropped the return
+  value on the floor, then unconditionally returned `status="committed"`.
+  If the underlying `commit_branch_async` applied zero steps or partially
+  succeeded, the iteration result claimed success — the exact bug pattern
+  the release was meant to fix elsewhere. New `_classify_commit_result()`
+  helper maps known payload shapes to three statuses: `"committed"` (clean),
+  `"committed_with_errors"` (steps_ok > 0 AND steps_failed > 0), and
+  `"commit_failed"` (committed=False, ok=False, status="failed", or
+  steps_ok == 0). Both sync and async cores now zero out
+  `committed_experiment_id`/`committed_branch_id` when the commit truly
+  failed, and surface the raw commit payload on `IterationResult.commit_result`.
+- **Preview Studio commit-before-execute ordering** (P1,
+  `mcp_server/preview_studio/tools.py`): `commit_preview_variant()` called
+  `engine.commit_variant()` BEFORE `execute_plan_steps_async` ran. That
+  flipped `preview_set.status = "committed"` and `committed_variant_id`
+  up front, so when every execution step failed the response correctly
+  said `committed: false / status: "failed"` but the stored state still
+  said the opposite. Wonder lifecycle advance also fired regardless.
+  Reorder: execute first, then flip state only when `steps_ok > 0`.
+  Zero-success path now returns honestly and leaves `preview_set` and
+  WonderSession untouched. Partial-success stays a legitimate commit
+  with `status="committed_with_errors"`.
+- **`get_session_kernel` propagates web + flucoma probe results** (P2,
+  `mcp_server/runtime/tools.py`): the kernel builder called
+  `build_capability_state(...)` with only session/analyzer/memory params,
+  so `web_ok` and `flucoma_ok` silently defaulted to `False`. Meanwhile
+  `get_capability_state()` correctly probed both. Planners that read
+  the kernel (the documented orchestration entrypoint) stayed on
+  degraded paths even when probes would have reported available. Fix:
+  call `_probe_web()` + `_probe_flucoma()` inside `get_session_kernel`
+  and pass through.
+
+### Added
+
+- **10 new tests** covering the three truth-gap classes:
+  - `test_iterate_toward_goal.py`: 4 tests for commit inspection
+    (failed commit, partial commit, timeout commit_best, back-compat
+    clean success).
+  - `test_preview_studio_truth_gap.py`: 3 tests for
+    executable-variant-fails paths (all-steps-fail preserves state,
+    Wonder not advanced, partial-success honest commit).
+  - `test_runtime_capability_probes.py`: 3 tests for kernel
+    propagation (web probe → kernel, flucoma probe → kernel,
+    both-unavailable back-compat).
+- **`IterationResult.commit_result`** — the raw commit_fn payload,
+  surfaced on the returned dict whenever a commit was attempted.
+  Callers can inspect `result["commit_result"]["steps_failed"]`,
+  `result["commit_result"]["error"]`, etc.
+
+This release closes what the post-v1.17.2 review correctly flagged:
+the feature we shipped to "close the evaluation loop" had a truth-gap
+at the innermost step. 2712 → 2722 tests pass.
+
+## 1.17.2 — iterate_toward_goal + preview-studio truth-gap (April 23 2026)
+
+### Added
+
+- **`iterate_toward_goal` MCP tool** (`mcp_server/tools/agent_os.py`,
+  `mcp_server/tools/_agent_os_engine/iteration.py`): closes the outer
+  evaluation loop. Given a compiled `GoalVector` and a list of candidate
+  move sets, runs up to N experiments sequentially. Each iteration
+  creates an experiment, runs all branches (with per-branch
+  apply-snapshot-undo already handled by the existing experiment engine),
+  scores the top branch against the goal, and either commits (score ≥
+  threshold) or discards and tries the next candidate set. On timeout,
+  commits the best-so-far (`on_timeout="commit_best"`, default) or
+  commits nothing (`on_timeout="discard_on_timeout"`). Per-branch undo
+  stays inside `run_experiment` — this loop never issues a raw undo.
+  Tool count: 426 → 427.
+
+  Engine ships as both a pure-sync `iterate_toward_goal_engine` (for
+  tests with in-memory fakes) and `iterate_toward_goal_engine_async`
+  (for the live MCP wrapper with coroutine callbacks); the sync entry
+  auto-detects coroutine callbacks and dispatches accordingly. Covered
+  by 11 tests in `tests/test_iterate_toward_goal.py` spanning happy
+  path, exhaustion + commit-best, exhaustion + discard, no candidates,
+  no-winner iterations, max_iterations capping, async coroutine
+  callbacks, and MCP registration.
+
+  This is the P0 item from the v1.17.1 review gap-analysis between
+  "tool orchestration" and "agentic optimization" — the create /
+  run / compare / commit primitives existed but nothing drove them
+  toward a scalar goal. `iterate_toward_goal` is that driver.
+
+### Fixed
+
+- **Preview Studio truth-gap** (`mcp_server/preview_studio/engine.py`,
+  `mcp_server/preview_studio/tools.py`): two compounding bugs made the
+  system lie about committed state.
+  1. `compare_variants()` scored every variant without filtering for
+     `status="blocked"` or missing `compiled_plan`. A blocked /
+     analytical-only variant could win the recommendation even with a
+     higher taste_fit than the only executable option. Fix: partition
+     variants into executable vs analytical, score only the executable
+     list, surface the analytical bucket on a new `analytical_candidates`
+     field for introspection. `recommended` stays a bare string (or
+     `None` when no executable variant exists) so no API shape breaks.
+  2. `commit_preview_variant()` called `engine.commit_variant()` — which
+     flips `preview_set.status = "committed"` and discards every sibling
+     variant — BEFORE checking whether the chosen variant had a compiled
+     plan. Analytical-only picks therefore got recorded as committed
+     with `committed=False` in the response and the preview set's
+     in-memory state said the opposite. Wonder lifecycle also advanced
+     to `resolved`. Fix: short-circuit analytical/blocked picks at the
+     top of the handler, return `{committed: False, reason:
+     "analytical_only" | "blocked", ...}`, leave `preview_set.status`
+     untouched, and gate Wonder lifecycle hooks behind the executable
+     branch. New regressions in `tests/test_preview_studio_truth_gap.py`
+     lock all four scenarios (A1-A4 from the remediation plan).
+- **Runtime capability probes stop lying about `web` and `flucoma`**
+  (`mcp_server/runtime/tools.py`, `mcp_server/runtime/capability_state.py`):
+  `get_capability_state` previously hardcoded `web_ok=False` and never
+  emitted a `flucoma` domain at all, causing `route_request` to pick
+  degraded research/perception paths on machines where those
+  capabilities were actually available. `_probe_web()` now runs a
+  500 ms HEAD request to `https://api.github.com` using stdlib
+  `urllib.request` (no new dependency); `_probe_flucoma()` uses
+  `importlib.util.find_spec("flucoma")` with safe exception swallowing.
+  The `flucoma` domain is now emitted unconditionally so consumers can
+  distinguish "probed and missing" from "not probed yet".
+- **`build_song_brain` flags degraded responses**
+  (`mcp_server/song_brain/tools.py`): When `get_session_info` fails,
+  the tool injected `{tempo: 120.0, track_count: 0}` and returned a
+  polished SongBrain with no indication the inputs were synthesized.
+  The fallback is preserved for backward compatibility but the
+  response now carries a top-level `degradation` payload
+  (`{is_degraded, reasons, substituted_fields}`) so callers can branch
+  on synthesized vs real data.
+- **`create_preview_set` flags the empty-kernel fallback**
+  (`mcp_server/preview_studio/engine.py`,
+  `mcp_server/preview_studio/models.py`): When the caller omits a real
+  session kernel, `create_preview_set` synthesizes an empty-but-valid
+  shape so compilers degrade to no-op steps. `PreviewSet` now carries a
+  `degradation` field that is marked
+  `is_degraded=True, reasons=["empty_kernel_fallback"]` whenever that
+  substitution fires, so downstream consumers can tell a synthesized
+  compile from a kernel-backed one.
+
+### Added
+
+- **`DegradationInfo` dataclass** (`mcp_server/runtime/degradation.py`):
+  New shared payload that engines attach to their responses whenever
+  they substitute fallback data. Three fields:
+  `is_degraded: bool`, `reasons: list[str]`, `substituted_fields: list[str]`.
+  Intentionally minimal and import-safe so any engine can adopt it
+  without circular-import risk. Wired into `song_brain` and
+  `preview_studio`; other engines will adopt it as audits surface more
+  silent-fallback paths.
+- **`flucoma` capability domain** now emitted by
+  `build_capability_state` alongside `session_access`, `analyzer`,
+  `memory`, `web`, and `research`. Matches the existing
+  `CapabilityDomain` schema.
+
+### Changed
+
+- **`capability-modes.md` reference doc rewritten to match the actual
+  response shape** (`livepilot/skills/livepilot-evaluation/references/capability-modes.md`).
+  The old example JSON described a flat
+  `{mode, analyzer_connected, bridge_version, spectral_cache_age_ms, flucoma_available, session_connected}`
+  shape that hasn't matched `get_capability_state` for releases. The
+  new section documents the nested `capability_state.domains.<name>`
+  structure, explicit per-domain and per-field definitions, and
+  explicitly scopes the `web` domain as *"server-side outbound HTTP
+  capability; does NOT imply curated research corpora are installed"*.
+
+### Tests
+
+- `tests/test_preview_studio_truth_gap.py` — 5 tests locking the four
+  A1-A4 scenarios from the remediation plan.
+- `tests/test_runtime_capability_probes.py` — 6 tests covering the
+  web probe (true/false/exception-swallow) and the flucoma probe
+  (emitted-when-importable, emitted-when-missing, find_spec-backed).
+- `tests/test_degradation_signalling.py` — 8 tests covering the
+  `DegradationInfo` dataclass defaults, `song_brain` degradation on
+  session failure, and `preview_studio` degradation on empty-kernel
+  fallback.
+
+## 1.17.1 — Splice auto-reconnect + Codex installer fix (April 23 2026)
+
+Two bug fixes discovered in a parallel worktree hours after v1.17.0
+shipped. Non-breaking, test-locked, ships as a patch.
+
+### Fixed
+
+- **Splice client auto-reconnect** (`mcp_server/sample_engine/tools.py`):
+  Every Splice MCP tool now reconnects the shared gRPC client on demand
+  via a new `_ensure_splice_client_connected()` helper. Before this fix,
+  if the Splice desktop app launched AFTER the MCP server (common when
+  users start the MCP via Claude Code before booting Splice), every
+  Splice tool stayed stuck in a disconnected state until the WHOLE MCP
+  server was restarted. The fix re-checks on every tool invocation, so
+  the first successful Splice-desktop boot auto-recovers the client
+  transparently. Tools affected: `get_splice_credits`,
+  `splice_catalog_hunt`, `search_samples` (when routing through Splice),
+  plus every other Splice tool that reads from the shared context.
+  3 new regression tests in `tests/test_splice_reconnect_tools.py` lock
+  the reconnect behavior.
+- **Codex plugin installer writes `.mcp.json`** (`installer/codex.js`):
+  The installer was copying plugin files into the Codex plugins
+  directory but omitting the `.mcp.json` config that tells Codex how
+  to launch the MCP server. Codex users had to manually create the
+  file or run the command with additional flags. Now
+  `writeLocalMcpConfig(destDir)` writes the correct
+  `{mcpServers: {livepilot: {command, args}}}` shape during install.
+  1 new regression test in `tests/test_codex_plugin_installer.py`
+  asserts the file content.
+
+### Verified
+
+155/155 tests green. `sync_metadata.py --check`: all metadata in sync
+at version=1.17.1, tools=426, domains=52, bridge_cmds=30, enriched=120.
+
+### Distribution
+
+Same channels as v1.17.0 — GitHub release + npm + `.mcpb` + plugin
+cache. Tool count and domain count unchanged; this is purely a
+reliability patch.
+
+
+## 1.17.0 — 2026-04-22 handoff close-out (April 22 2026, late)
+
+Closes every item in the 2026-04-22 handoff document: Splice's
+Describe-a-Sound + Variations go LIVE via captured GraphQL
+endpoints, the M4L Analyzer gains a 9th spectrum band (sub_low
+20-60 Hz), track-level arrangement automation lands via a
+two-phase session-record workaround, the atlas gains a
+by_pack index + `atlas_pack_info` MCP tool, the device atlas
+adds 13 enrichments including a Drum Rack container entry, and
+Tier C of the pack-knowledge reference expands from 7 clusters
+to 14 individually-documented packs.
+
+**Tool count**: 422 → 426 (+5 new, −1 retired):
+- `+` `atlas_pack_info` — inspect a pack's device list + enrichment coverage
+- `+` `atlas_describe_chain` — free-text describe-a-chain, mirror of
+  `splice_describe_sound` for the device library. "A granular pad like
+  Tim Hecker" → device chain proposal via artist + genre vocabulary
+  matching
+- `+` `atlas_techniques_for_device` — reverse-lookup: what techniques
+  reference this device? Reads an auto-generated index of 146 technique
+  cross-references across 58 devices
+- `+` `set_arrangement_automation_via_session_record` — T5 workaround,
+  two-phase protocol with tempo-scaled sleep
+- `+` `splice_http_diagnose` — per-endpoint verified-status reporter
+- `−` `splice_search_with_sound` — retired (user handles
+  audio-reference search directly in Splice's UI; capture recipe
+  preserved at `docs/2026-04-22-splice-https-capture-recipe.md`)
+
+**Domain count**: unchanged at 52.
+**Enrichment YAMLs**: 107 → 120 (+13).
+**Atlas pack coverage**: 0 → 641 devices indexed (614 Core Library
+via auto-heuristic + 27 explicit-pack YAML declarations).
+**Signature-technique coverage**: 32 → 47 enrichment files have the
+`signature_techniques` field (+15 files × 3 techniques each = +45
+technique entries from native-synth backfill). Coverage rose from
+27% → 39% of enrichments.
+**Tests**: 2644 → 2696+ (+52 new regression guards).
+
+### Live-verified end-to-end
+
+Against a running Ableton 12.4 + Splice desktop 5.4.9 session on
+2026-04-22:
+
+- `get_master_spectrum()` → 9 keys with `sub_low` first, real-audio
+  energy distribution (`sub_low=0.0003 sub=0.0008 low=0.0064 …`)
+- `atlas_pack_info("Drone Lab")` → Harmonic Drone Generator in
+  both Sounds and M4L variants with URIs
+- `splice_describe_sound("warm dub techno chord stab", limit=5)` →
+  5 real samples out of 4100 total hits (Dub Techno 2 pluck, NEONIC
+  atmos, Visions chord, Organic Elements 2, Underground Techno),
+  with Splice's ML rephrasing `rephrased_query_string: "dub techno,
+  chords, stabs, warm"`
+
+### Splice HTTPS bridge — endpoint capture
+
+Captured via mitmproxy against Splice desktop v5.4.9 (unpinned TLS,
+intercepts cleanly once CA is trusted). Two GraphQL operations
+wired:
+
+- **`SamplesSearch`** at `surfaces-graphql.splice.com/graphql` —
+  describe + keyword search in one operation, flagged via
+  `semantic=1` + `rephrase=true`. 5938-char query embedded as
+  `mcp_server/splice_client/graphql_queries/samples_search.graphql`
+- **`AssetSimilarSoundsQuery`** at the same endpoint — Splice's
+  "Variations" / "Similar Sounds" feature. Input is a sample
+  `uuid` + `isLegacy` bool; returns up to 10 recommendations.
+  886-char query embedded as
+  `mcp_server/splice_client/graphql_queries/asset_similar_sounds.graphql`
+- Auth: `Authorization: Bearer <JWT>` via local gRPC `GetSession`
+  RPC — no stored credentials, token rotates with the running
+  Splice desktop app
+- User-Agent: LivePilot default (override via env var if
+  Cloudflare blocks — mimic pattern: `Splice Baelish/darwin/
+  arm64/arm64 5.4.9/<hash>/stable`)
+- Response normalizer `_flatten_sample_item()` is shared between
+  both operations so samples from describe + variations flatten
+  to identical dicts — 14 new unit tests lock this invariant
+- Per-endpoint `describe_verified` / `variation_verified` flags
+  replace the coarse `is_user_configured` gate
+
+### Changed
+
+- `splice_generate_variation` signature changed: `(file_hash,
+  target_key, target_bpm, count)` → `(uuid, is_legacy)`. The
+  operation is a recommender lookup, not AI audio synthesis, so
+  target-key / target-bpm / count aren't API-supported. The
+  underlying GraphQL returns up to 10 similar samples with the
+  same flat shape as `splice_describe_sound` results.
+- `splice_describe_sound` — status flipped from "scaffolded" to
+  "LIVE". Adds new `rephrase: bool = True` parameter surfacing
+  Splice's `rephrased_query_string` in the response.
+
+### Added
+
+**Sub_low spectrum band** (T3 from handoff):
+- M4L Analyzer `fffb~` filter bank: 8 bands → 9 bands. New band
+  center frequencies: `35 85 175 350 700 1400 2800 5600 12000`
+  (Hz), with `sub_low` (20-60 Hz) prepended to separate kick
+  fundamental from DC rumble
+- `mcp_server/m4l_bridge.py`: `BAND_NAMES_8` + `BAND_NAMES_9`
+  auto-selected based on payload length — older frozen .amxd
+  builds (pre-v1.17) still work without re-freeze
+- `LivePilot_Analyzer.amxd` re-frozen from modified
+  `LivePilot_Analyzer.maxpat` source, 6751650 bytes, synced to
+  repo / Max 9 Library cache / Ableton User Library
+- `docs/2026-04-22-sub-low-band-max-workflow.md` — runbook for
+  future band-count changes (Max editor walkthrough)
+
+**Track-level arrangement automation workaround** (T5 from handoff):
+- New MCP tool `set_arrangement_automation_via_session_record` —
+  async two-phase protocol that creates a session clip with the
+  automation, arms the track, records into arrangement at a
+  target beat, cleans up
+- Two new remote-script handlers:
+  `arrangement_automation_via_session_record_start` returns the
+  live `song.tempo` so the MCP layer can compute the sleep
+  duration, `_complete` stops record + locates the new
+  arrangement clip
+- MCP layer sleeps `duration_beats × 60/tempo + 0.5s` with a
+  600s ceiling and graceful exception handling — incomplete
+  sleep still tries to complete so tracks don't stay armed
+- 17 new contract tests (two-phase ordering, tempo scaling,
+  ceiling, default-tempo fallback, start-failure short-circuit)
+
+**Atlas `by_pack` index + `atlas_pack_info` tool** (T4):
+- New `_by_pack` index on `AtlasManager`, populated from
+  enrichment YAML `pack:` fields plus a Core Library
+  auto-heuristic for native instruments/effects without an
+  explicit pack declaration
+- New `pack_info(name)` and `list_packs()` methods
+- New MCP tool `atlas_pack_info(pack_name)` — `""` returns the
+  full pack list with device counts, otherwise returns
+  `{pack, device_count, enriched_count, devices[...]}` for one
+  pack. Case-insensitive name lookup
+- `genre_affinity` (enriched field) now feeds the `_by_genre`
+  index alongside the raw `genres` field, so
+  `microhouse`/`deep_minimal`/`dub_techno` tags added to YAMLs
+  post-v1.11 finally surface in genre lookups
+
+**Drum Rack atlas enrichment + 12 audio-effects YAMLs** (T1/T2):
+- New `instruments/drum_rack.yaml` — treats Drum Rack as a
+  meta-type container with per-pad key_parameters, 3 starter
+  recipes, 8 gotchas (including MIDI pitch conventions, chain
+  volume vs pad volume)
+- 12 new audio-effects enrichments: `utility`, `corpus`,
+  `vocoder`, `tuner`, `spectrum`, `amp`, `cabinet`, `resonators`,
+  `looper`, `envelope_follower`, `audio_effect_rack`,
+  `external_audio_effect`. Takes `audio_effects/` count from 40
+  → 52
+- Simpler + Sampler enrichments gain 3 new gotchas (Snap=OFF
+  silence bug, -12 dB default, slice base pitch = 36+N)
+- `pack` field added to `_ENRICHMENT_FIELDS` allowlist — was
+  silently dropped from atlas JSON before; now drives the
+  `by_pack` index
+
+**Pack-knowledge reference** (T7):
+- `livepilot/skills/livepilot-core/references/pack-knowledge.md`
+  Tier C expanded from 7 merged clusters (~62 lines) to 14
+  individually-documented packs (Build and Drop, Drive and Glow,
+  Punch and Tilt, Skitter and Step, Trap Drums, Beat Tools, Drum
+  Essentials, SONiVOX Orchestral Brass/Strings/Woodwinds, Grand
+  Piano, Synth Essentials, Session Drums Club + Studio, Core
+  Library) with consistent Essence/Scores/Top/Use/Avoid structure
+
+**Deepened shallow enrichments** (T8):
+- Added `pairs_well_with` + expanded `gotchas` +
+  `signature_techniques` for: `snipper`, `bell_tower`,
+  `performer`, `vector_map`, `filler`
+
+### Concept surface — knowledge the LLM can reason over
+
+Late-v1.17 audit found LivePilot's concept-vs-recipe ratio was already
+healthy (sample-philosophy.md, sound-design-deep.md, per-device
+`signature_techniques`, aesthetic-tagged `character_tags`), but two gaps
+were worth closing before the release: native-synth enrichments heavy
+on `starter_recipes` but thin on `signature_techniques`, and no
+structured artist/genre → device-vocabulary bridge.
+
+Added:
+
+- **`livepilot/skills/livepilot-core/references/artist-vocabularies.md`** —
+  ~25 producers (Villalobos, Hawtin/Plastikman, Basic Channel, Gas,
+  Basinski, Stars of the Lid, Hecker, Aphex, Autechre, OPN, Arca,
+  Dilla, Premier, Madlib, Burial, Mala, Jeff Mills, Moodymann, Daft
+  Punk, Rashad, Photek, Com Truise, Boards of Canada, etc.) with
+  four-field structured entries (sonic fingerprint / reach for /
+  avoid / key techniques). Each entry cross-references
+  `signature_techniques` in per-device YAML or technique names in
+  `sample-techniques.md` / `sound-design-deep.md` — no duplication,
+  just a translation layer from producer names to LivePilot devices
+- **`livepilot/skills/livepilot-core/references/genre-vocabularies.md`** —
+  15 genres (microhouse, dub_techno, deep_minimal, minimal_techno,
+  ambient, idm, modern_classical, hip_hop, trap, dubstep, house,
+  dnb, garage, experimental, synthwave) with tempo / kick / bass /
+  percussion / harmonic / texture / reach-for / avoid structure.
+  Read-before-tool-selection reference for genre-driven workflows
+- **Native-synth `signature_techniques` backfill** — 15 YAMLs that
+  had starter_recipes but no aesthetic-level guidance now have 3
+  techniques each, tagged to known producers (Hawtin subtractive pad,
+  303 acid bass, Reese bass for DnB, J Dilla micro-timed kit, Villalobos
+  sub-bass layer, Basinski tape degradation, Tim Hecker grain cloud,
+  etc.). Files updated: analog, operator, wavetable, drift, collision,
+  tension, electric, simpler, sampler, bass, poli, emit, meld,
+  vector_fm, vector_grain
+- **`mcp_server/atlas/device_techniques_index.json`** — auto-generated
+  reverse-index of 146 device→technique cross-references across 58
+  devices, mined from per-device `signature_techniques` +
+  `sample-techniques.md` + `sound-design-deep.md`
+
+### Docs
+
+- `docs/2026-04-22-release-verification.md` — end-to-end
+  verification report with live-verified evidence per task
+- `docs/2026-04-22-splice-https-capture-recipe.md` — mitmproxy
+  runbook for capturing additional Splice GraphQL operations
+- `docs/2026-04-22-live-api-probe-arrangement-automation.md` —
+  design rationale for the T5 two-phase split
+- `docs/2026-04-22-sub-low-band-max-workflow.md` — Max
+  editor runbook for future filter-bank edits
+- `docs/manual/index.md` — rewrote domain map from source-of-truth
+  per-domain counts (was drifting 30+ entries). Added 7 missing
+  domains (scales, grooves, take_lanes, follow_actions, miditool,
+  diagnostics, synthesis_brain)
+- `docs/manual/tool-reference.md` — new sections for Device Atlas,
+  Sample Engine & Splice, Diagnostics; added v1.17 tools
+  (`atlas_pack_info`, `set_arrangement_automation_via_session_record`,
+  `splice_http_diagnose`, `splice_describe_sound` LIVE,
+  `splice_generate_variation` LIVE); added `add_drum_rack_pad` +
+  `verify_device_alive` + `verify_all_devices_health` that were
+  missing since v1.16
+- `docs/manual/tool-catalog.md` — replaced hand-curated drifting
+  version with single auto-generated file (run
+  `python3 scripts/generate_tool_catalog.py > docs/manual/tool-catalog.md`).
+  Retired `docs/manual/tool-catalog-generated.md` (duplicate
+  with -generated suffix)
+- **Deleted**: `docs/TOOL_REFERENCE.md` (v1.7-era, 317 tools /
+  43 domains — misleadingly stale)
+- **Archived**: `docs/manual/release-smoke-board.md` → `docs/archive/release-smoke-board-v1.10-era.md`
+
+### Internal
+
+- `mcp_server/splice_client/graphql_queries/` — new directory,
+  holds captured `.graphql` query strings, loaded lazily via
+  `_load_graphql_query()` with caching
+- `docs/research/splice-api-capture/` — gitignored local archive
+  of 4 operation captures (request + response pairs):
+  `SamplesSearch`, `SoundsSearchAutocomplete`,
+  `RefreshSamplePreview`, `AssetSimilarSoundsQuery`
+- 5 additional GraphQL operations captured but not wired —
+  candidates for future tools: `DesktopPackSearch`,
+  `SampleAssetSidebarQuery`, `BrowseCarousels`,
+  `CreditsStoreQuery`, `UserService`
+
+### Known non-blockers
+
+- Splice Search-with-Sound (audio-file reference search) is
+  retired — feature not exposed in Splice desktop v5.4.9's UI,
+  user handles it manually. Recipe preserved if a future Splice
+  build re-exposes it.
+- T5 live end-to-end verification in a real Ableton session
+  deferred — contract tests (17) lock the protocol; first real
+  invocation will confirm Live LOM assumptions (classic
+  v1.16.0 → v1.16.1 pattern — any surprises fix in one edit).
+- `splice_http_diagnose` token-availability probe reported a
+  false negative pre-1.17 (walked the wrong context path); fixed
+  to use `ctx.lifespan_context["splice_client"]` + actually call
+  `fetch_session_token`.
+
+
+## 1.16.1 — Post-publish live-verification bug sweep (April 22 2026)
+
+Three rounds of live verification after 1.16.0 shipped caught five
+runtime bugs that unit tests missed. All unit-test-clean paths that
+failed on first live invocation against a running Splice desktop +
+Ableton 12.4 are now both fixed and guarded by source-grep regression
+tests. Plus one new tool and two observations addressed.
+
+**Tool count**: 421 → 422 (+1: `verify_all_devices_health` —
+session-wide silent-track detector).
+**Domain count**: unchanged at 52.
+**Tests**: 2627 → 2644 (+17 new regression guards). No regressions.
+
+### Live-verified bugs fixed
+
+- `add_drum_rack_pad` crashed with `ImportError` on first invocation
+  — inline `from .._analyzer_engine.sample import ...` resolved to
+  `mcp_server._analyzer_engine` (nonexistent; the real package is
+  `mcp_server.tools._analyzer_engine`). The helper is already imported
+  at module scope on line 29; inline form removed.
+- `splice_preview_sample` returned "No preview URL available" for
+  un-downloaded catalog samples. `SampleInfo` RPC only carries
+  `PreviewURL` for downloaded/purchased items. Now falls back to
+  `SearchSamples(FileHash=...)` which always has catalog metadata.
+- `splice_pack_info` crashed with
+  `AttributeError: 'AppStub' object has no attribute 'SamplePackInfo'`.
+  The `SamplePackInfoRequest/Response` messages exist in the proto
+  descriptor but no RPC on the `App` service binds them. Rewrote to
+  paginate `ListSamplePacks` + client-side UUID match. Limitation
+  documented: only finds packs the user has engaged with.
+- `splice_pack_info` on an OWNED pack with an extended-format UUID
+  (43 chars, e.g. `...887a0dd7f26bf5a3951`) failed because the first
+  fix aggressively truncated to `[:36]`, discarding legitimate bytes.
+  Correct behavior: Splice uses both UUID formats; build a `targets`
+  set of the submitted form AND its canonical truncation, match each
+  server-returned UUID in both forms.
+- Startup warning `STARTUP SELF-TEST WARNING — returned 385 tools,
+  expects 422`. `_get_all_tools()` took the first non-empty probe,
+  which could be a stale `_tool_manager._tools` view lagging behind
+  the authoritative `_local_provider._components`. Now takes the
+  largest view across all probes.
+- Startup `RuntimeWarning: coroutine 'FastMCP.list_tools' was never
+  awaited` on every server import. The `list_tools` probe wrapped an
+  async coroutine in `list()` without awaiting. Removed with an
+  explanatory comment.
+
+### Added
+
+- `verify_all_devices_health(test_midi_note=60, skip_audio_tracks=True,
+  skip_empty_tracks=True, threshold=0.005)` — session-wide silent-
+  track detector. Fires a test note on every eligible track and reports
+  alive / dead / skipped with per-track peak-level evidence.
+- `~/.livepilot/splice.json` config key `plan_kind_override` — pin
+  the Splice plan_kind when the gRPC classifier lands on a safe
+  default (e.g. `sounds_plan_id=6` with empty `features` map is
+  classified as SOUNDS_PLUS but may actually be any of several tiers).
+  Values: `ableton_live`, `sounds_plus`, `creator`, `creator_plus`,
+  `free`. `get_splice_credits` response now includes
+  `plan_kind_override: <value|null>`.
+
+### Internal
+
+- M4L bridge source (`livepilot_bridge.js`) ping version drift
+  `1.14.1 → 1.16.1` (source had been stale; binary had already been
+  patched in a prior release).
+- `SpliceGRPCClient.get_pack_info` return signature changed from
+  `Optional[SplicePack]` to `tuple[Optional[SplicePack], Optional[str]]`.
+  Callers now receive a structured error message when the lookup
+  fails, instead of `None` swallowing the cause.
+
+## 1.16.0 — Minimal-techno session bug batch + Splice plan model (April 22 2026)
+
+Hardens the 1.15.0 beta into a full release. Resolves 18 of the 19 bugs
+catalogued in `docs/2026-04-22-bugs-discovered.md` during an end-to-end
+minimal-techno production session, ships a plan-aware Splice download
+model, adds drum-rack pad-by-pad construction, and lands clip-length +
+note-range invariants so programmatic workflows stop corrupting
+arrangement timing.
+
+**Tool count**: 403 → 421 (+18).
+**Domain count**: unchanged at 52.
+**Tests**: 49 new contract tests across five helper modules. No regressions.
+
+### Added
+
+**Drum Rack pad-by-pad construction (BUG #1)**
+- `add_drum_rack_pad(track_index, pad_note, file_path)` — atomic tool
+  that does the full drum-rack build per pad: insert_rack_chain →
+  set_drum_chain_note → insert empty Simpler → load sample via native
+  Live 12.4 replace_sample with nested addressing. Returns
+  `{ok, chain_index, pad_note, nested_device_index}`. Requires Live 12.4+.
+- `replace_simpler_sample` and `load_sample_to_simpler` now accept
+  `chain_index` + `nested_device_index` for deep addressing inside
+  drum-rack chains.
+- Auto-increment of `in_note` on `insert_rack_chain` for drum racks
+  (BUG #13) — no more "all new chains pile up on note 36 (Multi)".
+
+**Live-session device-alive verification (BUG #19)**
+- `verify_device_alive(track_index, device_index)` — static check
+  returning `{alive, reason, recommendation}` based on parameter_count
+  and health_flags.
+- Optional `fire_test_note=True` path for definitive answer: captures
+  pre-hit RMS, fires a scratch MIDI clip, samples the meter over the
+  duration, captures post-hit RMS. Scratch clip auto-cleaned.
+- Remote Script handlers: `fire_test_note`, `cleanup_test_note`.
+
+**Splice plan-aware download gating (2026-04-14 carry-over)**
+- `SpliceGRPCClient.decide_download` with three branches: free samples
+  bypass, Ableton Live plan uses daily quota, credit-metered plans use
+  credit floor. Fixes the bug where the Ableton Live plan (100/day
+  unmetered) was blocked by the credit-floor check.
+- `DailyQuotaTracker` persisting `~/.livepilot/splice_quota.json` keyed
+  by UTC date. 100/day default, 90 warn threshold.
+- `classify_plan` reads feature flags (ableton_unmetered,
+  ableton_live_plan, unmetered_downloads, creator_plus) with precedence
+  locked down by regression-trap tests.
+
+**Splice HTTPS bridge scaffolding**
+- `mcp_server/splice_client/http_bridge.py` — auth + endpoint +
+  retry/timeout plumbing for the plugin-exclusive Describe-a-Sound and
+  Variations features. Tools return a clear "bridge not yet wired"
+  error until the real endpoint shapes are captured via mitmproxy.
+
+**Extended analyzer perception**
+- `analyze_loudness_live` (BUG #8) — LUFS + true-peak on the live
+  master without requiring a file render.
+- `get_master_spectrum` now accepts `window_ms` (BUG #6) — stable
+  averaged reads vs the previous single-sample jitter.
+
+**Clip length + note-range invariants (BUG #1c)**
+- `create_clip(length=N)` now forces `loop_end = N` and `end_marker = N`
+  after creation. Response exposes both fields.
+- `add_notes` auto-extends `loop_end` if any incoming note's
+  `start_time + duration` exceeds it. Response reports
+  `loop_end_extended_to` when extension fired.
+
+**Smart Simpler defaults (BUG #17 + #18)**
+- `load_browser_item(role=...)` applies post-load Simpler defaults:
+  - `drum`:    Snap=0, Vol=0dB, Trigger Mode=0 (Trigger), root=C1 (36)
+  - `melodic`: Snap=1, Vol=0dB, Trigger Mode=1 (Gate), root=C3 (60)
+  - `texture`: Snap=0, Vol=-6dB, Trigger Mode=1 (Gate), root=C3 (60)
+
+**Miscellaneous**
+- `get_track_info(-1000)` returns master track info (BUG #11).
+- `scan_full_library(max_per_category=5000)` — removed the hardcoded
+  1000 cap that silently truncated large categories (BUG #12).
+- `batch_set_parameters` accepts `{index: N, value}` and `{name: "X", value}`
+  shapes — the keys `get_device_parameters` actually returns (BUG #3).
+- `search_browser` / `search_samples` accept intuitive parameter aliases
+  (BUG #4).
+- `get_browser_items` paginates when output would exceed the token cap
+  (BUG #5).
+- `get_track_meters` returns consistent peak/L/R triple on a single time
+  window (BUG #7).
+- `set_song_scale` accepts string root notes ("C", "F#", "Bb") and
+  handles Live 12.4.0's moved `scale_names` attribute via a tolerant
+  resolver with a built-in fallback scale list (BUG #2).
+
+### Documentation
+
+- `docs/load_browser_item-uri-grammar.md` (BUG #14) — the three URI
+  forms, failure modes, discovery recipe, top-level folder map. Moved
+  under `livepilot/skills/livepilot-devices/references/`.
+- `livepilot-devices` SKILL — new "Custom Drum Rack Construction" and
+  "Parameter Name Quirks" sections (BUG #10, #16).
+- `livepilot-arrangement` SKILL — documents the Live LOM limitation
+  behind BUG #1b (programmatic arrangement automation) with two
+  workaround patterns (session-clip + record, or stepped section
+  clips).
+- `docs/M4L_BRIDGE.md` — drift fixes: bridge command count 28 → 30,
+  analyzer MCP tool count 20 → 33, Max 8 → Max 9 reference, new
+  Phase 3 section documenting 8 previously undocumented bridge
+  commands.
+
+### Fixed
+
+- `_live_caps` no longer caches the 12.0.0 fallback when
+  `get_session_info` returns no live_version — previously pinned the
+  entire session to the oldest capability tier.
+
+### Changed
+
+- `insert_rack_chain` on drum racks now auto-increments `in_note`
+  (BUG #13). Pass `auto_pad_note=false` to keep Live's default
+  collide-on-36 behavior.
+
+### Deferred
+
+- **BUG #15** — adding a sub_low (30-60 Hz) spectrum band requires a
+  Max 9 re-freeze of `LivePilot_Analyzer.amxd`. Deferred to the next
+  .amxd rebuild cycle. `get_mel_spectrum` provides finer-grained
+  perceptual bands as a workaround.
+- **BUG #1b** — programmatic creation of arrangement automation
+  breakpoints. Live LOM limitation (per Ableton docs,
+  `Clip.automation_envelope` returns None for arrangement clips);
+  documented workaround patterns instead of a synthetic fix.
+
+### Platform
+
+- LivePilot_Analyzer.amxd ping version bytes patched 1.15.0 → 1.16.0
+  (in-place binary patch — source bumps don't auto-refresh the frozen
+  JS, lesson from two prior releases).
+
+## 1.15.0-beta — Live 12.4 replace_sample native (April 21 2026)
+
+First Live 12.4 beta support release. Adds a native fast path for
+SimplerDevice.replace_sample(path) while preserving 100% backward
+compatibility for 12.0-12.3.x users.
+
+**Tool count**: unchanged at 403.
+**Domain count**: unchanged at 52.
+**Tests**: 2503 passed, 1 skipped, 0 regressions (+13 new from this release).
+
+### Added
+- **Live 12.4 support (beta):** `SimplerDevice.replace_sample(path)` native
+  LOM path is now used automatically on Live 12.4+. Handles empty Simplers —
+  fixes the long-standing workaround documented in
+  `feedback_load_browser_item_is_source_of_truth.md`.
+- New capability tier `"collaborative"` (Live 12.4+) exposed via
+  `LiveVersionCapabilities.capability_tier` and `.has_replace_sample_native`.
+- Remote Script: new `replace_sample_native` handler.
+- MCP server: new `_live_caps(ctx)` helper with lazy version-capability
+  caching on the lifespan context.
+- Registered `replace_sample_native` in `mcp_server/runtime/remote_commands.py`
+  REMOTE_COMMANDS (required by the boundary audit contract).
+
+### Changed
+- `replace_simpler_sample` and `load_sample_to_simpler` now route to the
+  native path when available and fall back to the M4L-bridge path
+  otherwise. Tool signatures, argument names, and return shapes unchanged.
+
+### Backward Compatibility
+- Live 12.0–12.3.x: zero behavior change. All routing still goes through
+  the M4L bridge.
+- Live 12.4+: native path preferred; bridge used only on fallback.
+
+### Verification status
+- Full test suite: 2503 passed, 0 failures.
+- Backward compat on Live 12.4: verified in-session — `replace_simpler_sample`
+  and `load_sample_to_simpler` both work via the bridge path on 12.4 (legacy
+  flow intact).
+- Native E2E on Live 12.4 empty-Simpler case: deferred until the plugin
+  swap activates the worktree's MCP code. Unit tests prove the routing
+  logic and the native handler wiring.
+
+## 1.14.1 — reload_handlers workflow + device/mixing fixes (April 21 2026)
+
+Patch release that lands the post-1.14.0 audit work: one new diagnostics
+tool, three bug fixes, and a new plugin-sync verification script.
+
+**Tool count**: 402 → **403** (added `reload_handlers`).
+**Domain count**: unchanged at 52.
+**Tests**: 2467 → **2485 passing** (+18 new), 0 regressions.
+
+### New tool: `reload_handlers`
+
+- Replaces the manual "toggle Control Surface in Live → Preferences →
+  Link/MIDI" step that every Remote Script edit required. New workflow:
+  after `npx livepilot --install`, call `reload_handlers` via the MCP
+  tool. The Remote Script side uses `pkgutil` + `importlib.reload()` to
+  re-fire all `@register` decorators in place in <1s, without dropping
+  the MCP TCP connection on port 9878.
+- Ships with a pkgutil-based module-discovery helper in
+  `remote_script/LivePilot/__init__.py`, so new handler modules added to
+  `remote_script/LivePilot/` are picked up automatically on reload.
+- Exception: the very first bootstrap (no prior `LivePilot.*` in
+  `sys.modules`) still needs one full Ableton restart. After that,
+  `reload_handlers` works forever.
+- Domain: `diagnostics`. Added to `docs/manual/tool-catalog.md` to keep
+  the CI skill-contract test green.
+
+### Bug fixes
+
+- **`find_and_load_device` duplicate loads** — the tool was no-oping
+  only on exact name match; changed to also treat cases where the
+  target device is already the tail of the chain as a no-op. Prevents
+  the "load Simpler, load Simpler, load Simpler" cascade when the MCP
+  server retries a loader.
+- **`get_device_parameters` "Invalid display value"** — certain Live
+  parameters (especially plugin wrappers on AU/VST) raise
+  `RuntimeError("Invalid display value")` when their
+  `str_for_value()` is queried before the parameter has settled. The
+  handler now swallows that specific error and returns the raw float
+  instead of 500-ing the whole request.
+- **Sidechain LOM reopen (BUG-A3 redux)** — Compressor2 moved its
+  sidechain block into a nested property in a recent Live update, so
+  `compressor_set_sidechain` lost the ability to toggle. The handler
+  now probes the LOM surface at tool-call time and falls back to the
+  flat path when the nested one isn't exposed.
+- **Mixing `channel` lazy-get** — channel objects were resolved eagerly
+  at import time, breaking in edge cases where the Song came up before
+  the mixer. Now resolved on first use.
+
+### New: plugin-sync verification
+
+- `scripts/verify_plugin_sync.py` — catches the v1.14.0 regression
+  class where `.mcp.json` went missing from
+  `~/.claude/plugins/cache/dreamrec-LivePilot/livepilot/$VERSION/`. All
+  four sync targets (active plugin dir, cache version dir, marketplace
+  snapshot, `installed_plugins.json`) are now verified by one command.
+
+---
+
+## 1.14.0 — Branch-native v2: producer context, synth intelligence, render verify (April 20 2026)
+
+Five-PR follow-up to v1.13.0 that closes the loops the first pass left
+open. Producer context flows through the branch lifecycle via a versioned
+`producer_payload`; synthesis adapters decode algorithm topology instead
+of always targeting the same operator; composer winners commit the full
+resolved plan instead of the audition scaffold; render-verify captures
+audio before/after each branch and feeds spectral movement into the
+hard-rule classifier; and four dedicated MCP tools expose the new
+producers to the LLM.
+
+**Tool count**: 398 → **402** (added `analyze_synth_patch`,
+`propose_synth_branches`, `extract_timbre_fingerprint`,
+`propose_composer_branches`). **Domain count**: unchanged at 52.
+**Tests**: 2409 → **2467 passing** (+58 new), 0 regressions.
+
+### New substrate
+
+- **`producer_payload: dict` on `BranchSeed`** (PR1) — versioned
+  opaque dict producers populate with regeneration / provenance /
+  winner-escalation context. Always carries `schema_version` (default 1)
+  so older payloads don't break newer readers. Lives on the seed, not
+  `compiled_plan`, so analytical-only branches can carry context too.
+  Canonical shapes documented per producer (synthesis / composer /
+  semantic_move / freeform / technique).
+
+- **`BranchSnapshot` gains render-based fields** (PR4) —
+  `capture_path`, `loudness`, `spectral_shape`, `fingerprint`. Populated
+  only when `run_experiment(render_verify=True)` opts in. Pre-v2
+  consumers see no shape change when render-verify is off.
+
+### Synthesis adapters get topology awareness (PR2)
+
+- **Wavetable**: position→region classification (sub / mid / bright /
+  complex) drives shift direction. Target brightness biases the chosen
+  target region — not just freshness scaling.
+
+- **Operator**: static `_ALGO_TOPOLOGY` table maps all 11 algorithms
+  to their carrier/modulator roles. Targeting picks the modulator with
+  the highest Level for the ratio shift; additive algorithms (5, 9)
+  fall back to the dominant carrier. No more "always Osc B".
+
+- **Analog / Drift / Meld**: single fixed proposers become strategy
+  registries. Gates honor `role_hint` ("bass" skips `detune_warmth`,
+  "pad" skips `filter_pluck`, silent engines skip `engine_mix_shift`)
+  and target fingerprint dimensions (`target.brightness` picks
+  `filter_sweep_open` vs `filter_sweep_close`).
+
+### Composer winner escalation (PR3)
+
+- Composer seeds now carry their `CompositionIntent` in
+  `producer_payload` at emit time. On `commit_experiment`,
+  `escalate_composer_branch` rehydrates the intent and runs the full
+  `ComposerEngine.compose()` pipeline — Splice / filesystem / browser
+  sample resolution — then swaps the scaffold plan for the resolved one
+  BEFORE `commit_branch_async` runs it through the async router. The
+  scaffold is preserved on `branch.evaluation` for audit.
+
+- Graceful fallback when compose yields zero executable layers:
+  commit runs the scaffold instead of erroring. User gets tracks +
+  scenes they can populate manually, with `composer_escalation.error`
+  explaining why escalation couldn't complete.
+
+- **Latency note**: composer winner commit now takes 10-30s (Splice +
+  filesystem resolution) vs ~0.5s pre-v2. Documented; a progress
+  callback version is future work.
+
+### Render-verify + classifier wiring (PR4)
+
+- `run_experiment(render_verify=False, render_duration_seconds=2.0)` —
+  opt-in per-branch audio capture → offline loudness + spectrum
+  analysis → `TimbralFingerprint` extraction. ~2 * duration seconds +
+  ~1-2s analysis overhead per branch; default off preserves speed.
+
+- New `derive_goal_progress_from_fingerprint(diff, target?)` turns
+  TimbralFingerprint diffs into `(goal_progress, measurable_count)`.
+  Dimensions below 0.02 epsilon are dropped as noise. With a target:
+  sign(target) * diff gives signed progress. Without: magnitude-only
+  contribution (branch moved = measurable).
+
+- `classify_branch_outcome` accepts `fingerprint_diff` + `timbral_target`
+  kwargs. When set and caller didn't supply their own measurable inputs,
+  the classifier derives them from the diff. Caller-supplied values
+  still take precedence (back-compat). Protection violations still
+  trump fingerprint evidence — safety invariant preserved.
+
+- `compare_experiments` automatically surfaces `fingerprint_diff` +
+  `fingerprint_before` + `fingerprint_after` on each branch's
+  `evaluation` dict via the existing pass-through.
+
+### Four new MCP tools (PR5, 398 → 402)
+
+- **`analyze_synth_patch(track_index, device_index, role_hint="")`** —
+  SynthProfile for any supported native synth. Fetches parameter state
+  + display values, hands to the adapter. Opaque fallback for
+  non-supported devices.
+
+- **`propose_synth_branches(track_index, device_index, target?,
+  freshness?, role_hint?)`** — algorithm/topology-aware branch seeds
+  with pre-compiled plans. Feeds directly to
+  `create_experiment(seeds=..., compiled_plans=...)`.
+
+- **`extract_timbre_fingerprint(spectrum?, loudness?, spectral_shape?)`**
+  — pure transform from analysis dicts to 9-dimensional
+  `TimbralFingerprint`. For callers that already have analysis data.
+
+- **`propose_composer_branches(request_text, count=2, freshness=0.65)`**
+  — N compositional hypotheses (canonical / energy_shift /
+  layer_contrast) with producer_payload-captured intents for
+  winner-commit escalation.
+
+### Migration notes for callers
+
+- All additions are optional-param / new-function shaped. Pre-v2
+  callers see no behavior change unless they opt in.
+- Pre-v2 serialized branches deserialize fine: `producer_payload`
+  defaults to `{"schema_version": 1}` when absent.
+- `create_experiment(move_ids=...)` identical behavior.
+- `enter_wonder_mode` response shape stable; `branch_seeds` /
+  `compiled_plans_by_seed_id` still additive.
+- `run_experiment(render_verify=False)` default matches v1.13.0
+  behavior exactly.
+
+### Known limitations
+
+See [`docs/manual/branch-native-migration.md`](docs/manual/branch-native-migration.md#known-limitations)
+for the full list. Headlines:
+
+- Wavetable region classification is a coarse heuristic on raw
+  `Osc 1 Pos`. Future work: render-based per-wavetable mapping.
+- Composer commit latency (10-30s) with no progress callback yet.
+- Render-verify requires the M4L analyzer bridge + LivePilot_Analyzer
+  on master; silently degrades to fast-path when either is missing.
+- End-to-end render-verify path (capture_audio + bridge) is hardware-
+  dependent and not unit-tested; wiring is covered via classifier +
+  fingerprint derivation tests.
+
+## 1.13.0 — Branch-native architecture (April 20 2026)
+
+Twelve-PR migration from "match request → pick move → compile move" to
+"understand intent → generate branches → compile branches → compare".
+The planning layer opens up — Wonder, Preview Studio, Experiment, and
+the new synthesis_brain all share one BranchSeed + CompiledBranch
+contract. Move-first is still available as a targeted flow; branch-native
+is the canonical exploratory path.
+
+**No tool count change** (still 398). **Domain count 51 → 52**
+(added `synthesis_brain`). **+175 new tests** across 9 new files
+(2206 → 2387 passing, 1 skipped, 0 failures).
+
+### New substrate (additive, non-breaking)
+
+- **`mcp_server/branches/`** (PR1) — shared `BranchSeed` and
+  `CompiledBranch` types with `seed_from_move_id` / `freeform_seed` /
+  `analytical_seed` factories. `BranchSeed` sources:
+  `semantic_move` / `freeform` / `synthesis` / `composer` / `technique`.
+- **SessionKernel creative controls** (PR2) — `freshness`,
+  `creativity_profile`, `sacred_elements`, `synth_hints` added as
+  optional fields on `SessionKernel` and `get_session_kernel`. Legacy
+  callers see zero behavior change.
+- **ExperimentBranch compat shim** (PR3) — `move_id` now optional;
+  new `ExperimentBranch.from_seed()` classmethod and
+  `create_experiment_from_seeds(seeds=[...], compiled_plans=[...])`
+  entry point. Legacy `create_experiment(move_ids=...)` keeps working
+  and internally delegates via `seed_from_move_id`.
+- **Creative conductor fork** (PR4) — `classify_request_creative()`
+  alongside `classify_request()`. Adds producer selection
+  (`branch_sources`, `seed_hints`) based on request content + kernel state.
+- **`interesting_but_failed` branch status** (PR7) — new
+  `classify_branch_outcome()` in `evaluation/policy.py`. Exploration
+  mode downgrades score / measurable-delta failures to
+  `interesting_but_failed`; protection violations still force undo
+  (safety invariant).
+- **Per-goal-mode novelty bands** (PR8) — TasteGraph's single
+  `novelty_band` is now a view over `novelty_bands["improve"]`; the
+  `explore` band lets surprise-me branch generation disconnect from
+  conservative improve-mode history. `bypass_taste_in_generation` flag
+  makes `rank_moves` return uniform scores.
+
+### Branch-native producers
+
+- **Wonder branch assembler** (PR6) — `generate_branch_seeds()` emits
+  seeds from four sources: semantic_move, technique (session memory),
+  sacred-element inversion (freshness-gated), and corpus hints.
+  `enter_wonder_mode` now surfaces `branch_seeds` alongside variants.
+- **`synthesis_brain/` subsystem** (PR9, PR10) — native-synth-aware
+  branch production with adapters for Wavetable, Operator, Analog,
+  Drift, Meld. `analyze_synth_patch()` / `propose_synth_branches()`
+  callable from Python; `extract_timbre_fingerprint()` builds a
+  TimbralFingerprint from 8-band spectrum + optional FluCoMa
+  descriptors. No MCP tools yet — next release will wire dedicated
+  tools and do the tool-count metadata sweep in one pass.
+- **Composer branch producer** (PR11) — `propose_composer_branches()`
+  emits N distinct compositional hypotheses from one prompt via three
+  strategies (canonical / energy_shift / layer_contrast), gated on
+  freshness. Each branch ships a pre-compiled scaffolding plan.
+
+### Docs refactor
+
+- **Skills + command guides thinned** (PR5) — `livepilot-core/SKILL.md`
+  now presents two peer flows (Flow A targeted / Flow B exploratory)
+  instead of one recipe-first pipeline. `arrange` / `beat` / `mix` /
+  `sounddesign` commands each add a short Branch-Native section.
+- **Branch status vocabulary** documented including
+  `interesting_but_failed` retention semantics.
+
+### Migration notes for callers
+
+- All additions are optional-param / new-function shaped. Any code
+  reading `branch.move_id` keeps working because `ExperimentBranch`
+  mirrors `seed.move_id` there. Any code calling
+  `create_experiment(move_ids=...)` keeps its exact behavior.
+- If you have persistent state on disk (`~/.livepilot/taste.json`):
+  v1.13 migrates `novelty_band` (flat float) to `novelty_bands` (dict)
+  on first read. Old clients reading the file still see the flat field.
+- Tests added across 9 new files — no existing test needed editing
+  beyond `test_experiment_engine.py` (which gains PR3 coverage but
+  keeps every pre-PR3 test passing).
+
+## 1.12.2 — Post-release audit reliability fixes (April 18 2026)
+
+Six issues surfaced by an immediate post-v1.12.0 deep audit (parallel
+code-reviewer subagents + manual verification). All fixed TDD-style —
+every bug now has a named regression guard in the test suite.
+
+**No tool count change** (still 398). **+11 regression tests**
+(2195 → 2206 passing, 1 skipped, 0 failed).
+
+### Critical fixes (reliability in hot paths)
+
+- **`send_capture` no longer blocks `send_command`** (BUG-audit-C1).
+  The M4L bridge shared `_cmd_lock` between `send_capture` and
+  `send_command`, so any concurrent MCP tool invocation during a
+  recording was blocked for the full capture duration (up to 35s).
+  The two operations use independent receiver state
+  (`_capture_future` vs `_response_callback`) and now use
+  independent locks (`_capture_lock` + `_cmd_lock`).
+  [`mcp_server/m4l_bridge.py:780-790, 912-913`](mcp_server/m4l_bridge.py).
+- **`_parse_osc` no longer crashes on malformed packets**
+  (BUG-audit-C2). `data.index(b'\x00')` raised `ValueError` when a
+  packet had no null byte — on UDP port 9880 collision with
+  non-OSC traffic, every incoming packet logged a noisy stack
+  trace. Replaced with `data.find(...)` + bounds checks on every
+  offset; malformed packets drop silently.
+  [`mcp_server/m4l_bridge.py:513-565`](mcp_server/m4l_bridge.py).
+- **`classify_simpler_slices` returns structured error on bad WAV**
+  (BUG-audit-C3). `sf.read()` was unguarded — corrupt or missing
+  files raised `soundfile.LibsndfileError` through the MCP
+  framework as an internal server error. Every other tool in the
+  module returns `{"error": ...}` dicts. Now wrapped in
+  `try/except` for consistent error shape.
+  [`mcp_server/tools/analyzer.py:571-581`](mcp_server/tools/analyzer.py).
+
+### High-severity fixes (API consistency)
+
+- **`batch_set_parameters` rejects negative `parameter_index`**
+  (BUG-audit-H3). `set_device_parameter` validates this at the MCP
+  layer; `batch_set_parameters` didn't, leaking an unstructured
+  `IndexError` from the Remote Script. Now rejected with a clear
+  ValueError at normalisation time.
+  [`mcp_server/tools/devices.py:318-328`](mcp_server/tools/devices.py).
+
+### Medium-severity fixes
+
+- **`_enrich_slice_response` uses positional fallback for missing
+  `index` field** (BUG-audit-M2). Direct `s["index"]` access in a
+  list comprehension raised `KeyError` on bridge version skew.
+  Now uses `s.get("index", i)` with `enumerate` fallback.
+  [`mcp_server/tools/analyzer.py:57-62`](mcp_server/tools/analyzer.py).
+- **`test_identify_returns_none_for_free_port` is no longer flaky**
+  (BUG-audit-M4). The test hardcoded port 59999 as "almost
+  certainly free"; when another process on the machine held it
+  (hitting Claude Desktop during the audit), the test failed
+  without diagnosing a real code bug. Now uses
+  `socket.bind(("127.0.0.1", 0))` to get a kernel-assigned free
+  port, releases it, then verifies.
+  [`tests/test_startup_safety.py:50-70`](tests/test_startup_safety.py).
+
+### .amxd binary patched in place
+
+- `m4l_device/LivePilot_Analyzer.amxd` had the `ping` response
+  version string patched from `"1.12.0"` → `"1.12.2"` via direct
+  byte replacement (same-length delta, size preserved). No Max
+  re-export needed.
+- `m4l_device/livepilot_bridge.js` source version also updated for
+  the next full rebuild.
+
+---
+
+## 1.12.1 — Silent-failure fixes + slice classifier (April 18 2026)
+
+Reconciles the "separate git stash" called out under v1.12.0's Known
+limitations — the 2026-04-18 minimal-groove session surfaced four
+silent-failure bugs and the need for a drum-slice spectral classifier.
+
+**+1 tool (397 → 398): `classify_simpler_slices`.** +43 regression
+guards (pure-Python, run without a live Ableton).
+
+### Ship-stoppers fixed
+
+- **`get_master_rms.pitch.midi_note` clamped** (BUG-F1) — polyphonic
+  pitch detector emitted values up to 319.15 with amplitude 0. Now
+  drops readings with zero amplitude or out-of-range MIDI.
+  [`mcp_server/tools/analyzer.py:128-147`](mcp_server/tools/analyzer.py).
+- **`get_simpler_slices` discloses base MIDI pitch** (BUG-F2) — Simpler
+  Slice mode uses C1 (MIDI 36) as slice 0, NOT C3. Response now
+  includes `base_midi_pitch` at top level and `midi_pitch` per slice.
+  Prevents the class of silent-audio bugs where MIDI notes at pitch
+  60+ trigger nothing. Docstring updated to mandate using the
+  returned `midi_pitch`.
+  [`mcp_server/tools/analyzer.py:37-62, 462-487`](mcp_server/tools/analyzer.py).
+- **`delete_track` last-track error message** (BUG-F3) — Ableton's
+  default rejection message was unrelated to the real cause ("you
+  can't add notes to a clip that doesn't exist yet"). Now pre-checks
+  `track_count` and raises a clear ValueError.
+  [`mcp_server/tools/tracks.py:93-112`](mcp_server/tools/tracks.py).
+- **`batch_set_parameters` accepts aligned schema** (BUG-F4) — supports
+  `parameter_index` / `parameter_name` (matching `set_device_parameter`)
+  in addition to the legacy `name_or_index`. Rejects ambiguous entries
+  with clear errors.
+  [`mcp_server/tools/devices.py:292-328`](mcp_server/tools/devices.py).
+
+### New tool
+
+- **`classify_simpler_slices(track, device, file_path?)`** — runs
+  FFT-based spectral analysis on a Simpler's slice boundaries, returns
+  each slice labeled as KICK / SNARE / HAT / ghost plus feature
+  breakdown (peak, rms, band %). Validated thresholds from the
+  2026-04-18 minimal-groove session on "Break Ghosts 90 bpm":
+    - KICK: sub+low ≥ 45%, high < 40%
+    - HAT: high ≥ 70% AND mid < 25%
+    - SNARE: mid ≥ 25% AND high ≥ 40% AND peak ≥ 0.6
+    - ghost: peak < 0.35
+  Eliminates the "assume slice 0 = kick" class of bug.
+
+### New module
+
+- **`mcp_server/sample_engine/slice_classifier.py`** — pure-Python
+  band-energy + peak classifier. Testable without Ableton
+  (`tests/test_slice_classifier.py` uses synthesized drum hits).
+  Exported `classify_segment()` and `classify_slices()` for direct
+  use outside MCP as well.
+
+### Documented bug entries
+
+- `BUGS.md` gains a new **"F. 2026-04-18 minimal-groove creative
+  session"** section: F1-F4 fixed here, F5-F7 scoped to v1.13+, F8
+  wontfix (workaround documented).
+
+### Not included in this release
+
+- `package.json` / `server.json` / plugin manifests / skill tool-count
+  sync — release-discipline is a separate task per CLAUDE.md's
+  "Version Bump" section. Run `python3 scripts/sync_metadata.py --fix`
+  before the next release.
+- Registering `classify_simpler_slices` in
+  `tests/test_tools_contract.py::test_analyzer_tools_registered` — the
+  total-count assertion there already passes if regenerated; the
+  registration list is additive and can land with the metadata sync.
+
+---
+
+## 1.12.0 — Live 12 LOM completeness (April 18 2026)
+
+Thirteen chunks closing the gap between LivePilot and Ableton Live 12.3.6's
+Live Object Model. **325 → 397 tools (+72). 45 → 51 domains (+6).**  Every
+addition is hasattr-probed where the underlying API varies by Live version
+— Core (12.0+), Enhanced (12.1.10+), and Full Intelligence (12.3+) tiers
+keep their graceful degradation contract.
+
+### New tools by chunk
+
+- **Chunk 1 — Song scale awareness (4 tools):** `get_song_scale`,
+  `set_song_scale`, `set_song_scale_mode`, `list_available_scales` — exposes
+  Live 12.0's Scale Mode at the song level. Remote Script probes
+  `song.scale_name` / `song.root_note`; missing on pre-12 falls back to
+  "Scale awareness unavailable".
+- **Chunk 2 — Per-clip scale override (3 tools):** `get_clip_scale`,
+  `set_clip_scale`, `set_clip_scale_mode` — Live 12.0 MIDI clip-level override
+  for the song scale. Honors `clip.scale_name` and `clip.scale_mode`.
+- **Chunk 3 — Tuning System (4 tools):** `get_tuning_system`,
+  `set_tuning_reference_pitch`, `set_tuning_note`, `reset_tuning_system` —
+  Live 12.1 microtonal tuning. Writes to `song.tuning_system`,
+  `tuning.reference_pitch`, and individual tuning-note cents.
+- **Chunk 4 — Follow Actions (8 tools):** Clip-level Live 12.0 revamp
+  (multi-action enum, `follow_action_time`, `follow_action_enabled`) +
+  scene-level Live 12.2+ (`scene.follow_action`, `scene.follow_action_time`)
+  + preset wrapper for "A→B→C chain" common shapes.
+- **Chunk 5 — Groove Pool (7 tools):** Pool enumeration, per-clip assignment,
+  master groove dial. Exposes Live 11+ `song.groove_pool` and the swing /
+  timing / random / velocity amount on each groove.
+- **Chunk 6 — Take Lanes (6 tools):** Enumeration, creation, per-lane clip
+  creation. Live 12.0 read surface + 12.2 write surface — both paths handled
+  with `hasattr` probes so older hosts degrade cleanly.
+- **Chunk 7 — Rack Variations + Macro CRUD (8 tools):** Variation
+  store/recall/delete + macro add/remove/randomize on Instrument/Audio-Effect
+  Racks (Live 11+).
+- **Chunk 8 — Sample Slice CRUD (6 tools):** `insert_slice`, `move_slice`,
+  `remove_slice`, `clear_slices`, `reset_slices`, `import_slices_from_onsets`.
+  Writes to `SimplerDevice.sample.slices` (Live 11+).
+- **Chunk 9 — Wavetable Modulation Matrix (5 tools):** Targets,
+  routing, amounts — completes the Wavetable surface alongside the existing
+  parameter tools (Live 11+).
+- **Chunk 10 — Song/Track long-tail primitives (12 tools):** `tap_tempo`,
+  `nudge_tempo_down/up`, exclusive arm/solo, `capture_and_insert_scene`,
+  `count_in`, Ableton Link state, `jump_in_session_clip`, performance-impact
+  read, `appointed_device`.
+- **Chunk 11 — Device A/B Compare (3 tools):** State read, toggle, copy
+  direction. Uses Live 12.3+ `Device.is_ab_state_enabled` / `ab_state`
+  where available; all three tools hasattr-probe so they return a clear
+  "unsupported on this Live build" error on 12.2 and older.
+- **Chunk 12 — ControlSurface enumeration (2 tools):** `list_control_surfaces`,
+  `get_control_surface_info`. Always-available diagnostic for multi-surface
+  setups.
+- **Chunk 13 — MIDI Tool bridge (4 tools):** `install_miditool_device`,
+  `set_miditool_target`, `get_miditool_context`, `list_miditool_generators`.
+  Exposes Live 12 MIDI Tools (Generators + Transformations) backed by
+  LivePilot generators (euclidean_rhythm, humanize, tintinnabuli). Ships
+  with both `.amxd` files pre-built from Live's factory templates — install
+  via `install_miditool_device()` which copies to the correct User Library
+  subfolders. **Note**: end-to-end Max-side integration is a known
+  follow-up; Max's `[js]` object may not locate `miditool_bridge.js` on
+  every machine without the folder being added to Max's File Preferences →
+  File Search Path. Server-side tools and config dispatch work standalone;
+  full round-trip notes-in-clip requires that Max path setup. Hence:
+  server shipped, Max-side user-setup step documented.
+
+### New domains (45 → 51)
+
+Source of truth is module layout — six new files registered @mcp.tool()
+decorators:
+
+- `mcp_server/tools/scales.py` — serves both scales (Chunks 1–2) AND tuning
+  (Chunk 3) since both live on the Song object.
+- `mcp_server/tools/follow_actions.py` — Chunk 4.
+- `mcp_server/tools/grooves.py` — Chunk 5.
+- `mcp_server/tools/take_lanes.py` — Chunk 6.
+- `mcp_server/tools/diagnostics.py` — Chunk 12.
+- `mcp_server/tools/miditool.py` — Chunk 13.
+
+Chunks 7–11 extended existing domains (devices, clips) and did not introduce
+new modules.
+
+### Known limitations
+
+- **MIDI Tool bridge (Chunk 13) — Max-side file search**: the `.amxd` files
+  reference `js miditool_bridge.js` relatively. Max normally searches the
+  .amxd's folder first, but Live's MIDI Tool instantiation context can
+  bypass that. If `Max → Window → Max Console` shows "can't find file
+  miditool_bridge.js" when you fire the tool: open Max → Options → File
+  Preferences → add `~/Music/Ableton/User Library/MIDI Tools/Max Generators`
+  and `~/Music/Ableton/User Library/MIDI Tools/Max Transformations` to the
+  File Search Path, save, reload the device.
+- A separate git stash ("pre-existing drift before LOM completeness work"
+  with `classify_simpler_slices` in flight) was left intact; the user will
+  reconcile it in its own release.
+
+### Not a breaking change
+
+Every new tool is additive. No existing tool names, parameters, or return
+shapes changed. Remote Script still boots cleanly on Live 12.0 — the 12.1+
+and 12.3+ tools just return `STATE_ERROR` with a clear message when the host
+lacks the underlying LOM attribute.
+
+## 1.10.9 — Second-pass audit + deferred-bugs shipped (April 18 2026)
+
+Completes every non-feature item on the v1.10.8 audit backlog. 2116 → 2132
+passing tests (+16 regression guards). 324 → 325 tools (`check_clip_key_consistency`
+lands from BUG-D1). Every deferred BUG-C and BUG-D entry either ships or is
+scoped to a follow-up feature; BUG-C4 is filed upstream as
+[PrefectHQ/fastmcp#3967](https://github.com/PrefectHQ/fastmcp/issues/3967).
+
+### Ship-stoppers fixed
+
+- **`send_capture` phantom 35s hang when receiver is None** —
+  [`mcp_server/m4l_bridge.py:441`](mcp_server/m4l_bridge.py). `send_command`
+  had a receiver-None guard; `send_capture` didn't. When UDP 9880 failed
+  to bind but the cache still reported connected, the OSC packet was
+  sent, the capture future was never registered, and the full 35s
+  timeout fired with a misleading "device may be busy" error. Added the
+  matching 5-line guard so the real cause surfaces immediately.
+- **`utils.py` stale after Control Surface toggle** —
+  [`remote_script/LivePilot/__init__.py:43`](remote_script/LivePilot/__init__.py).
+  Every handler does `from .utils import get_track, get_device`.
+  `importlib.reload(devices)` rebinds those names, but because `utils`
+  was not in `_HANDLER_MODULES`, the re-import resolved against the
+  stale `sys.modules["LivePilot.utils"]`. Added `utils` first in the
+  reload order so edits to the shared helpers pick up on toggle too,
+  honoring the dev-workflow guarantee documented at the top of the file.
+
+### New tools
+
+- **`check_clip_key_consistency`** (BUG-D1) — parses Splice-style
+  filename key tokens (`_D#min`, `_Ebmaj`, `_Cm`, …), cross-checks
+  against `get_detected_key`, returns the exact `set_clip_pitch(coarse=±N)`
+  call that would realign on mismatch. Handles `#`/`b` accidentals,
+  `min`/`m`/`maj` suffixes, absent tokens gracefully.
+- **`get_session_diagnostics(check_clip_keys=True)`** — opt-in scan
+  across every audio clip, appending `clip_key_mismatch` warnings with
+  the one-call fix attached.
+
+### Features shipped
+
+- **Session continuity persistence wired at startup** (BUG from external
+  audit). `bind_project_store_from_session()` now computes a project
+  fingerprint, opens the matching `ProjectStore`, AND rehydrates
+  `_threads` + `_turns` from disk. Wired into `server.py` lifespan with
+  a lazy rebind on first `record_turn_resolution` / `open_creative_thread`.
+  Creative threads and turn history now survive server restarts — the
+  README's "return to a project" claim is now load-bearing.
+- **Taste-aware `propose_next_best_move`** — replaces keyword-only
+  matching with `0.55 × keyword + 0.30 × taste_alignment + 0.15 ×
+  (1 − avoidance) ± 0.10 × family_bonus`. Cold-start users identical to
+  before; users with history get personalized ranking via
+  `dimension_weights` and `dimension_avoidances`. New return fields:
+  `score_breakdown`, `taste_active`, `taste_evidence_count`.
+- **Evaluation `taste_fit`** — previously hardcoded to `0.0`. Now
+  computed from `outcome_history` by matching same-direction deltas on
+  the same dimensions: ±0.2 per kept/undone match, neutral 0.5 baseline.
+- **`AutomationGraph.coverage_pct`** (BUG-D2, detection half) — new
+  fields `coverage_pct`, `clip_envelope_count`, `clips_scanned`
+  distinguish "no automation exists" from "we couldn't probe" from
+  "sparse but present". Surfaced in `get_project_brain_summary` as
+  `automation_coverage_pct`.
+
+### Refactor (BUG-C1)
+
+- **`mcp_server/tools/analyzer.py`** 1069 → 913 LOC. All 32
+  `@mcp.tool()` decorators stay in the module (FastMCP registration
+  order unchanged), helpers moved to `_analyzer_engine/`:
+  `context.py` (SpectralCache/bridge accessors, analyzer health check),
+  `sample.py` (Simpler post-load hygiene, filename heuristics),
+  `flucoma.py` (FluCoMa hint text, pitch-name table). Same
+  package-facade pattern as `_composition_engine` and `_agent_os_engine`.
+- **`sync_metadata::get_domains()` now skips `_*`** directories + files
+  under `mcp_server/tools/`. Matches Python private-package convention,
+  prevents internal helpers from registering as false domains.
+
+### Resilience (BUG-C3)
+
+- **`_get_all_tools()` probe chain extended** in `mcp_server/server.py`
+  to 4 paths: existing `_tool_manager._tools` and
+  `_local_provider._components`, plus speculative 3.3+ rename
+  `_local_provider._tools` and the future public `mcp.list_tools()`.
+  Each wrapped in try/except. All-empty fall-through now prints
+  `fastmcp.__version__` + the attempted probe labels — prior silent `[]`
+  return would disable schema coercion with no signal.
+- **New `_assert_tool_registry_accessible()`** self-test runs at module
+  import. Empty registry or a count mismatch against
+  `tests/test_tools_contract.py` fails loudly via stderr.
+
+### Upstream (BUG-C4)
+
+- **FastMCP feature request filed** —
+  [PrefectHQ/fastmcp#3967](https://github.com/PrefectHQ/fastmcp/issues/3967)
+  "Feature request: public tool-enumeration API". Migration is a
+  no-op once upstream lands a `mcp.list_tools()` or `mcp.tools`
+  surface — the probe chain already anticipates both.
+
+### Metadata + docs
+
+- **`sync_metadata.py` extended** — catches both `N tools` and hyphenated
+  `N-tool`, now covers `manifest.json` + `docs/manual/intelligence.md` +
+  `.claude-plugin/marketplace.json`. New prose-claim checks for
+  bridge-command count, enriched-device YAML count, and `GENRE_DEFAULTS`
+  key count — every narrative number now traces to a code derivation.
+- **README / CLAUDE.md / docs drift closed** — 28→30 bridge commands,
+  81→71 enriched devices, 7→4 genre defaults, 323→325 tool count in
+  stale marketplace/plugin/manifest descriptors. Intelligence manual
+  example signatures for `record_positive_preference`,
+  `record_anti_preference`, `evaluate_move` updated to match the
+  shipping APIs.
+- **Skill cleanups** — `livepilot-release` tool-count drift fixed;
+  `livepilot-wonder` reference paths corrected to point at their real
+  home in `livepilot-core`; arrangement vs composition-engine triggers
+  deduplicated (constructive vs analytical split).
+- **New test** `tests/test_claim_consistency.py` — 12 guards running
+  `sync_metadata --check` from pytest, verifying `manifest.json` and
+  `intelligence.md` stay in the sweep, and asserting that
+  `bind_project_store_from_session` keeps a non-test caller.
+
+### Quality-of-life
+
+- **`scripts/test.sh`** — blessed test entrypoint always uses `.venv/bin/python`,
+  closes the contributor trap where bare `pytest` failed 28 tests on
+  system Python.
+- **`.gitignore`** additions: `m4l_device/*.pre-presentation-backup`,
+  `m4l_device/*.pre-*-backup`, `.mcp.json.disabled`.
+- **Stale `livepilot-1.10.5.tgz`** removed from the repo root.
+
+---
+
+## 1.10.8 — Deep audit fix pass (April 18 2026)
+
+Outcome of a cross-subsystem audit (Remote Script, MCP server, M4L bridge,
+Sample/Splice/Atlas, Composer/Router, Installer, Tests). 2104 → 2116
+passing tests (added ~230 regression tests, 324 tools, 45 domains). New
+MCP tool: `reload_atlas`. Three orphan mix moves
+(`make_kick_bass_lock`, `create_buildup_tension`, `smooth_scene_handoff`)
+now produce real executable plans instead of silent zero-step failures.
+A family compiler handles all device-creation moves. CI now enforces
+metadata drift and `.amxd` freeze parity — preventing the class of bug
+that cost two prior releases.
+
+### Ship-stoppers
+
+- **`capture_audio` backend annotation** fixed in `REDUCE_REPETITION` —
+  was declared `mcp_tool`, is actually `bridge_command` (matched your
+  memory note about the backend-annotation invariant).
+- **Three orphan mix moves** (`make_kick_bass_lock`,
+  `create_buildup_tension`, `smooth_scene_handoff`) had no compilers
+  and produced silent zero-step plans — compilers added.
+- **Seven device-creation orphan moves** fixed via a family-level
+  compiler that maps `plan_template` → `CompiledStep`.
+- **`logger` used before definition** in `mcp_server/server.py`,
+  `mcp_server/tools/analyzer.py`, and
+  `mcp_server/translation_engine/tools.py` (the last one had the
+  definition buried inside a docstring — a genuine NameError on the
+  exception path). All three fixed; new regression test
+  `test_import_hygiene.py` will catch recurrences.
+- **FluCoMa SHA256 bypass** removed — `ACCEPT_FIRST_RUN` sentinel is
+  gone. Verification is now mandatory; a fresh run with unpinned
+  hashes requires explicit
+  `LIVEPILOT_ALLOW_UNVERIFIED_FLUCOMA=1` opt-in.
+- **FluCoMa Max 9 vs Max 8 path** fixed — detect whether Max 9 or Max 8
+  is actually installed instead of assuming the presence of
+  `Packages/` means the corresponding Max is installed. Fresh Max 9
+  machines were landing in the Max 8 legacy path.
+
+### Correctness
+
+- **Remote Script TCP UTF-8 boundary corruption** — accumulate raw bytes,
+  decode only on newline-framed lines. Previously a multi-byte sequence
+  straddling a 4096-byte recv boundary silently produced `\uFFFD`.
+- **`_command_queue.get_nowait()` race** on `AssertionError` — drain by
+  response-queue identity, not blind FIFO pop.
+- **`toggle_device` silent `parameters[0]` fallback** removed — now
+  raises `STATE_ERROR` if the device has no "Device On" parameter.
+- **`modify_notes` partial-batch mutation** — two-pass validate-then-apply
+  in both `notes.py` and `arrangement.py`.
+- **Browser deep-scan audio-thread stall** — `DEEP_MAX` reduced 200k → 20k,
+  clearer error pointing to `search_browser`.
+- **`_force_reload_handlers` silent swallow** — reload exceptions now log
+  through the ControlSurface so stale handlers are surfaced.
+- **`version_detect` failure caching** — no longer pins the whole session
+  to (12,0,0) on a transient detect failure.
+- **Atlas non-atomic write** — tmp + fsync + rename pattern.
+- **Atlas and corpus check-then-set race** — wrapped in the shared
+  `services.singletons.Singleton` helper. Atlas also auto-reloads when
+  `device_atlas.json` mtime advances. New `reload_atlas` MCP tool forces
+  a manual refresh.
+- **`time.sleep()` inside the TCP connection lock** — moved outside the
+  lock so other async handlers aren't blocked on the idle timer.
+- **M4L bridge chunk ordering** — out-of-order first-chunk now starts a
+  new bucket with a warning instead of corrupting the previous
+  sequence's payload.
+- **M4L bridge `receiver=None`** — fail fast with an explicit error
+  instead of sending OSC blind and waiting out the full timeout.
+- **Sample critic `-1.0` sentinel** — `overall_score` now respects the
+  `available` flag and averages only usable critics.
+- **Splice gRPC timeouts** added per-call (`SearchSamples`, `SampleInfo`,
+  `ValidateLogin`, `SyncSounds`, `DownloadSample`).
+- **Installer path traversal** — `LIVEPILOT_INSTALL_PATH` validated
+  against allowed roots.
+- **Installer overlay upgrade** — rename existing install to
+  `LivePilot.backup-<ts>/` before fresh copy, auto-prune old backups.
+  Stale files from renamed modules no longer survive upgrades.
+- **Installer `process.exit` vs `try/catch` mismatch** — `install()`
+  now raises typed `InstallerAbort` so the `--setup` wizard can
+  continue past a recoverable failure instead of dying mid-run.
+- **`step_results` non-dict drop** — warns instead of silently losing
+  the binding.
+- **Composer `_KEY_RE`** — tightened to require either accidental or
+  explicit quality word; "dark ambient" no longer parses as D major.
+- **Composer section-plan overshoot** — final pass trims oversized
+  sections so snapping can't push total past `duration_bars`.
+- **`export_clip_midi` extension guard** — refuses to write
+  non-`.mid`/`.midi` files after path resolution.
+
+### CI + test hygiene
+
+- `scripts/sync_metadata.py --check` is now a CI gate (three prior
+  drift releases were preventable).
+- `.amxd` version-string guard in CI — refuses PRs where the frozen
+  bridge embeds a version that doesn't match the repo.
+- `npm pack` cleanliness gate — fails on `.disabled`, `.backup`,
+  `.pre-*`, `.DS_Store`, or `.pyc` entries.
+- `test_tools_contract` now asserts every tool has a non-empty
+  description (≥20 chars) and a schema.
+- `test_move_annotations` silent-escape fixed — a declared backend
+  that classifies as `unknown` is now a hard failure.
+- `test_bridge_parity` promoted from `INFO:` print to hard assertion.
+- `test_corpus` adds a canary that fails when source files are absent
+  (previously 5 tests silently skipped).
+- `tests/test_splice_client.py` scaffolded — credit floor, timeout
+  constants, port.conf parsing, graceful-degrade fallback (10 tests).
+- `package.json` `files` allowlist added — npm pack is deterministic
+  (780 → 321 files, no dirty artifacts).
+- CHANGELOG + `capability-modes.md` added to `VERSION_FILES` in
+  `sync_metadata.py`.
+
+### Deferred (follow-up PR)
+
+- Mechanical `lifespan_context.setdefault(...)` sweep across 7 files
+  (eager constructor issue — small perf impact, not correctness).
+- `safe_call` helper to replace the ~14 remaining `except Exception:
+  pass/return None` patterns.
+- FastMCP tool description quality sweep (audit existing 324 tools for
+  copy-paste / below-threshold descriptions).
+
+### Release-process changes
+
+- **FluCoMa SHA256 pinned** to `1a5cb73…6a2` (the universal zip containing
+  both macOS `.mxo` and Windows `.mxe64` externals). Previous releases
+  shipped with `"ACCEPT_FIRST_RUN"` sentinels that skipped verification.
+- **`.amxd` refrozen** with matching `1.10.8` ping bytes. CI guard
+  (`amxd-freeze-drift`) enforces this on every push.
+
+## 1.10.7 — npm .amxd parity + domain-count consistency (April 18 2026)
+
+Shipping release. Brings npm's tarball back in line with the fresh `.amxd`
+freeze that landed on `main` after v1.10.6 tagged, and unifies the three
+formerly-disagreeing sources of the domain count.
+
+### Fixed
+
+- **npm tarball parity with the GitHub release.** v1.10.6's npm publish
+  predated commit `b0463ea` (the real fat `.amxd` freeze with matching ping
+  bytes), so `npm install livepilot@1.10.6` shipped the stale Batch-22
+  `.amxd` and `simpler_set_warp` silently no-op'd. v1.10.7 republishes with
+  the fresh `.amxd` already present in the GitHub release assets.
+- **Domain count unified at 45.** Three formerly-disagreeing sources: prose
+  docs claimed "43 domains", `generate_tool_catalog.py` inferred "36" (via
+  a hand-maintained whitelist that silently dropped ~10 domains —
+  `atlas`, `composer`, `creative_constraints`, `device_forge`,
+  `hook_hunter`, `preview_studio`, `sample_engine`, `session_continuity`,
+  `song_brain`, `stuckness_detector`, `wonder_mode` — into an "Other"
+  bucket), runtime module layout has 45. All three now agree.
+- **Inline domain lists completed.** `CLAUDE.md:31` was missing
+  `experiment`, `musical_intelligence`, and `semantic_moves`;
+  `livepilot/skills/livepilot-release/SKILL.md:63` was missing
+  `semantic_moves`.
+
+### Infra
+
+- **`scripts/sync_metadata.py` extended** with `check_domain_count()` and
+  `check_domain_list()` that derive truth from `mcp_server` module paths.
+  `--fix` mode now auto-corrects stale tool/domain counts and appends
+  missing inline-list entries; extra entries are never auto-removed so a
+  pattern miss can't silently delete a legitimate domain.
+- **`scripts/generate_tool_catalog.py`** now uses the same module-layout
+  rule (`mcp_server.<X>` / `mcp_server.tools.<Y>`) as `sync_metadata.py`
+  so the two tools can't disagree on the domain set again.
+- **`.mcpbignore`** excludes `m4l_device/*.pre-*-backup` rollback artifacts
+  from the packaged `.mcpb`, keeping release bundles pristine across
+  future freeze cycles.
+- **`CLAUDE.md` gains `## Domain Count` section** documenting the drift
+  enforcer alongside the existing `## Tool Count` and `## Version Bump`
+  sections.
+
+## 1.10.6 — Debuggability + Engine Modularization (April 17 2026)
+
+Defensive-programming release. Zero behavior change for users; substantial
+quality-of-life gains for developers and future debugging sessions.
+
+### Debuggability
+
+- **Silent-exception sweep.** All 79 `except Exception: pass` sites across
+  `mcp_server/` now emit a `logger.debug("<func> failed: %s", exc)` breadcrumb
+  while preserving the original body (pass / return X / continue). Previously
+  invisible failures now leave a trail. Run with `LOG_LEVEL=DEBUG` to surface.
+- **Credit-floor guard hardened.** `SpliceGRPCClient.download_sample()` now
+  enforces `CREDIT_HARD_FLOOR` defensively via `can_afford(1, budget=1)` before
+  the gRPC call. Tool-layer callers still gate upstream for UX; this closes
+  the hole if any future caller forgets. The docstring claimed this guard
+  existed — now the code matches.
+
+### Engine modularization
+
+Two single-file engines (2,477 LOC combined) split into packages while keeping
+the public surface identical. Callers that did `from . import X as engine` or
+`from .X import Symbol` continue to work unchanged.
+
+- **`mcp_server/tools/_composition_engine/`** — 6 sub-modules (models, sections,
+  critics, gestures, harmony, analysis) + facade. Was 1,530 LOC in one file;
+  now no sub-module exceeds 522 LOC.
+- **`mcp_server/tools/_agent_os_engine/`** — 6 sub-modules (models, world_model,
+  critics, evaluation, techniques, taste) + facade. Was 947 LOC; now no
+  sub-module exceeds 207 LOC. `_clamp` promoted to models.py to resolve a
+  circular-dep risk between `evaluation` and `taste`.
+
+### Infra
+
+- **CI matrix adds Python 3.11.** Ableton 12.3's embedded Python is 3.11 on
+  some platforms — catching drift pre-merge.
+- **`livepilot.mcpb` removed from git tracking.** It was already excluded from
+  `.npmignore` and `.mcpbignore`; now it's no longer bloating git history every
+  release. Distribute via GitHub Releases.
+- **`.git-backup-full/` deleted.** 3.4 MB worktree reclaim.
+
+### Docs
+
+- **OSC address convention** documented in both `m4l_device/livepilot_bridge.js`
+  and `mcp_server/m4l_bridge.py` — the existing tolerant normalization at
+  `_parse_osc` now has a written contract.
+
+### Tests
+
+1756 pass, 1 skipped (macOS-only path test on non-darwin), 0 failures.
+
+## 1.10.5 — Splice online catalog unblocked + Simpler sample-loading fixes (April 14 2026)
+
+The Splice integration was **never working online** in previous releases. The
+`SpliceGRPCClient` existed in the codebase but silently fell back to a
+SQLite-only path that returned only locally-downloaded samples (2 files on the
+test user's machine). The bug was a missing `grpcio` dependency in the venv
+combined with `sources.py` never checking for the gRPC client. Once unblocked,
+a single query returns 19,690+ catalog hits. The "Beatles × Boards of Canada"
+session that surfaced these bugs is archived at
+`docs/2026-04-14-bugs-discovered.md` with 13 bugs categorized P0–P3.
+
+Tool count: **317 → 320** (three new Splice catalog tools added).
+
+### Added
+- **`get_splice_credits`** — query the Splice user's subscription tier and
+  remaining credit balance. Returns `{connected, username, plan,
+  credits_remaining, credit_floor, can_download}`. Graceful degradation when
+  Splice desktop isn't running or grpcio is missing.
+- **`splice_catalog_hunt`** — search Splice's ONLINE catalog via gRPC (not
+  just local downloads). Supports query, bpm_min/max, key, sample_type,
+  genre filters. Returns full sample metadata including `file_hash` for
+  downloads. This is the tool that unblocks 19,690+ results previously
+  inaccessible.
+- **`splice_download_sample`** — download a sample by `file_hash` (costs 1
+  credit), with automatic credit-floor safety check. Optionally copies the
+  downloaded file into `~/Music/Ableton/User Library/Samples/Splice/` so
+  Ableton's browser indexes it, returning a `browser_uri` ready for
+  `load_browser_item`.
+- **Smart warped-loop defaults** in `load_sample_to_simpler` and
+  `replace_simpler_sample`: when the filename contains a BPM marker (e.g.
+  `86bpm`), Simpler's `S Start` is set to 0, `S Length` to 100%, and
+  `S Loop On` to 1 so the full musical loop plays. Previously these tools
+  used crop defaults designed for one-shots, which chopped warped loops.
+
+### Fixed
+- **P0-2 — Splice online catalog is finally reachable.** `grpcio>=1.60.0`
+  and `protobuf>=4.25.0` are now REQUIRED dependencies (added to
+  `requirements.txt`). `search_samples(source="splice")` now uses the gRPC
+  client from `ctx.lifespan_context["splice_client"]` when connected and
+  only falls back to SQLite when the gRPC path is unavailable. Before this
+  fix, a query like `"mellotron"` returned 0 hits; after, it returns 851.
+  Queries like `"lofi chord"` 80-92 BPM return 19,690 hits.
+- **P0-1 — Simpler sample replacement is verified.** Both
+  `replace_simpler_sample` and `load_sample_to_simpler` now verify by
+  reading the device name back after the replace. If the name doesn't
+  match the requested filename stem, the tool returns a clear error
+  instead of silently shipping a wrong sample (the previous behavior
+  caused the test session to play a kick drum named as a vocal for two
+  consecutive rebuilds). The error message recommends
+  `load_browser_item` as a more reliable alternative.
+- **P1-1 — Simpler `Snap` is automatically turned OFF** after sample load.
+  With Snap ON, the Sample Start position gets snapped to a zero-crossing
+  outside the newly loaded sample's data, causing silent playback. This was
+  the root cause of every "sample loaded but doesn't play" symptom in
+  previous sessions. The fix also applies to `replace_simpler_sample`.
+- **P2-6 — Warped-loop sample defaults** no longer crop arbitrary sections.
+  When `load_sample_to_simpler` or `replace_simpler_sample` detects a BPM
+  marker in the filename, it applies loop-appropriate defaults instead of
+  one-shot-appropriate defaults.
+
+### Removed
+Nothing removed — all additions are additive.
+
+### Verified
+- `tests/test_tools_contract.py::test_total_tool_count` — 320 tools
+  (up from 317)
+- `tests/test_tools_contract.py::test_sample_engine_tools_registered` —
+  includes `get_splice_credits`, `splice_catalog_hunt`,
+  `splice_download_sample`
+- Live gRPC round-trip: searched 3 queries against Splice online, found
+  21,488 combined catalog hits, downloaded 3 samples (credits 100 → 97),
+  copied into User Library, loaded onto 3 Ableton tracks via
+  `load_browser_item` — all verified via `get_track_info` device name
+  matching.
+
+### Known limitations
+- **Unlimited downloads inside Splice Sounds.vst3 are not yet drivable**
+  programmatically. The gRPC download path always decrements monthly
+  credits (100/month on most subscription tiers) regardless of
+  `SoundsStatus: subscribed`. The Splice Sounds VST3 uses a separate HTTPS
+  API that LivePilot cannot drive through Ableton's plugin boundary.
+  Treat this as a research item — see P2-7 in
+  `docs/2026-04-14-bugs-discovered.md`.
+- **The M4L bridge `.amxd` still reports 1.10.4** in its ping response.
+  Source code is at 1.10.5 but the frozen JS inside the .amxd wasn't
+  re-exported. For users installing via `npm install -g livepilot@1.10.5`
+  this is cosmetic — no bridge commands changed. If publishing a new
+  `.mcpb`, re-freeze or binary-patch the version bytes first (see
+  `feedback_amxd_freeze_drift.md`).
+
+### Why a new patch version
+The P0-2 fix (missing grpcio dependency) is a correctness bug: users
+installed previous versions believed the Splice integration worked, when
+in fact every "online" search returned only locally-downloaded files.
+This is a silent incorrect-behavior bug — the tool returned 0-2 results
+confidently without any warning. Users deserve a clearly-communicated
+fix release and the ability to `npm install -g livepilot@1.10.5`.
+
+## 1.10.4 — Bridge ping sync (April 14 2026)
+
+A pure ship-fix release. The frozen JS inside `LivePilot_Analyzer.amxd` was
+last re-exported during the v1.10.1 hardening pass and never re-frozen
+during the 1.10.2 / 1.10.3 sweeps. The published `npm livepilot@1.10.3`
+tarball therefore shipped with a stale `.amxd` whose `ping` returned
+`{"version": "1.10.1"}`. End users installing via `npm install -g livepilot`
+got the v1.10.3 source code but a v1.10.1 bridge.
+
+### Fixed
+- **M4L bridge ping reports 1.10.4 (was 1.10.1).** Source
+  `m4l_device/livepilot_bridge.js` updated and the `.amxd` was binary-patched
+  in place — replacing the 6-byte version literal at offset 6669978
+  (`b"1.10.3" -> b"1.10.4"`) leaves all `dire`/`sz32`/`of32` chunk offsets
+  numerically valid, so the patched device opens cleanly in Ableton without
+  needing a Max re-export. Verified by `tests/test_bridge_parity.py` and the
+  capture/contract tests (36 tests pass against the patched binary).
+- **`livepilot.mcpb` no longer ships internal docs.** `.mcpbignore` was
+  tightened to exclude `docs/superpowers/`, `docs/research/`, `docs/plans/`,
+  `docs/v2-master-spec/`, `docs/LivePilot-1.7-Perception/`, `docs/2026-*`,
+  `AGENT_OS_V1.md`, `COMPOSITION_ENGINE_V1.md`, `ableton-library-map.md`,
+  `patreon-content.md`, and `m4l_device/*.adv` (Ableton presets users save
+  into the dev folder). The bundle is back to lean shape: 4.66 MB / 403 files
+  vs the bloated 5.56 MB / 491 files an unpatched repack produced. The
+  `.mcp.json` exclusion is now root-only (`/.mcp.json`) so the
+  plugin-internal `livepilot/.mcp.json` stays in the bundle.
+
+### Why a new patch version
+npm package versions are immutable. Once `livepilot@1.10.3` was published with
+the stale `.amxd`, the only way to ship a fix to anyone using
+`npm install -g livepilot` is to bump and republish. Same root cause and same
+fix as the v1.10.1 → v1.10.2 jump.
+
+### Deprecation
+- `npm livepilot@1.10.3` deprecated with message: "stale M4L bridge .amxd
+  ships v1.10.1 ping; please install 1.10.4".
+
+### Verification
+- 36 bridge-related tests (`test_bridge_parity`, `test_capture_bridge`,
+  `test_m4l_capture_contract`, `test_sample_engine_analyzer`) pass against
+  the patched binary.
+- `unzip -p livepilot.mcpb m4l_device/LivePilot_Analyzer.amxd | grep 1.10.4`
+  matches; `1.10.1` and `1.10.3` are absent.
+- GitHub release `LivePilot_Analyzer.amxd` and bundled `livepilot.mcpb`
+  asset SHAs match local artifacts.
+
+## 1.10.3 — Truth Release (April 14 2026)
+
+A correctness pass focused on making the top-layer workflows **trustworthy
+in real use**. No new tool families, no new domains, no new breadth. Every
+change is a truth-release fix: execution paths are real, emitted plans are
+valid, sample matching is musically sane, and product language matches
+implementation.
+
+The four flagship workflows this release optimizes for:
+  1. **Session understanding** — already strong, unchanged
+  2. **Sample-guided section building** — fixed by §2 + §3
+  3. **Wonder rescue** — fixed by §1
+  4. **Targeted improvement ("tighten the low end")** — already strong, unchanged
+
+If a feature couldn't be made true in this cycle, it was downgraded honestly
+rather than preserved as fake capability.
+
+### Fixed — Execution truth (§1)
+
+- **Experiments now route through the async execution router.**
+  `mcp_server/experiment/engine.py` had two code paths (`run_branch` and
+  `commit_branch`) that called `ableton.send_command(tool, params)` directly
+  and suppressed every failure with a silent `except Exception: pass`. They
+  now go through `execute_plan_steps_async` with per-step results recorded
+  on `branch.execution_log`. Branch status reflects reality: `evaluated`
+  when steps ran, `failed` when zero succeeded, `committed_with_errors`
+  when a commit was partial. Users can see exactly which tools succeeded
+  and which didn't.
+- **`commit_preview_variant` actually applies the variant now.**
+  Previously this tool only marked the variant as chosen in an in-memory
+  store and updated taste memory — the comment said *"the caller should
+  then apply the variant's compiled plan"* which was a trust leak. Users
+  reasonably expected `commit` to **apply** the variant. It now runs the
+  variant's compiled plan through `execute_plan_steps_async` and returns
+  `execution_log` + `steps_ok` / `steps_failed` + explicit `status`
+  (`committed` / `committed_with_errors` / `failed`). Analytical-only
+  variants (no compiled plan) return `status="analytical_only"` and
+  `committed=False` instead of pretending to apply anything.
+
+### Fixed — Composer truthfulness (§2)
+
+- **`suggest_sample_technique` removed from the executable plan.**
+  The composer was emitting `{"tool": "suggest_sample_technique", "params":
+  {"technique_id": layer.technique_id}}` in both `compose()` and `augment()`.
+  The real tool's signature is `(file_path required, intent, philosophy,
+  max_suggestions)` — `technique_id` is not a parameter and `file_path` is
+  required. This step would have always failed at runtime. It's now dropped
+  from the executable plan entirely; `layer.technique_id` still surfaces
+  in the descriptive `result.layers[*].technique_id` output for user
+  inspection. The agent can call `suggest_sample_technique` separately with
+  a real file path if it wants per-sample recipe advice.
+  All 12 remaining composer tool emissions validated against real signatures
+  — they're all correct.
+
+### Fixed — Sample resolution quality (§3)
+
+- **Role-aware scored ranking replaces naive first-hit substring matching.**
+  The old `_filesystem_match` returned the first audio file whose name
+  contained the layer's role OR any query token. This produced obvious
+  musical mistakes: a `lead` layer asking for *"techno melody Am"* would
+  get matched to `drums_techno.wav` because of the shared "techno" token.
+  The new scorer considers:
+  * role word in filename (+3.0)
+  * filename's primary role matches layer role (+1.5 bonus)
+  * filename's primary role is a **different** role (−5.0 penalty — this
+    is what blocks the drums-for-lead failure)
+  * role-adjacent hint words (kick/snare for drums, sub/808 for bass, etc.)
+    (+2.0)
+  * query token overlap excluding the role word (+0.5 per token)
+  * tempo token overlap between filename and query (+1.0)
+  A candidate must score strictly above 0.0 to be returned — files with
+  no signal at all return `unresolved` instead of an arbitrary first pick.
+  Six new regression tests lock out specific failure patterns.
+
+### Fixed — Project identity stability (§5)
+
+- **`project_hash` uses much more entropy.** The old hash was
+  `tempo + track_count + sorted_track_names` — the author's own comment
+  said *"this is imperfect"*. It collided whenever two songs shared the
+  same tempo and track names, and it was invariant to track reordering,
+  scene changes, and arrangement length. The new hash includes:
+  * tempo (1 decimal)
+  * time signature
+  * song length in beats (arrangement duration — very distinguishing)
+  * **ordered** track list: `(index, name, color, has_midi_input)` per track
+  * return track count + names
+  * **ordered** scene list: `(index, name, color)` per scene
+  Six new tests lock out: track reordering collision, song-length collision,
+  scene-list collision, time-signature collision, and track-rename detection.
+  Not a true project ID (that still needs Live set file path access from
+  the Remote Script, deferred) but substantially less fragile in practice.
+
+### Changed — Product language (§6)
+
+- **README.md**: "Producer Agent — autonomous multi-step production"
+  rewritten as *"an orchestrated multi-step assistant for building,
+  layering and refining sessions. [...] The agent proposes plans; the user
+  confirms and listens. LivePilot is a high-trust operator, not an
+  autonomous producer."*
+- **docs/manual/getting-started.md**: "An autonomous agent that can build
+  entire tracks from high-level descriptions" rewritten to frame output as
+  a *"playable baseline — a starting point, not a finished track. You
+  listen, decide what works, and iterate."*
+- **docs/manual/intelligence.md**: `agentic_loop` workflow mode description
+  changed from *"Full autonomous loop with evaluation"* to *"Multi-step
+  plan-and-evaluate loop with explicit checkpoints"*.
+
+### Tests
+
+- **1756 passing**, 1 skipped (was 1740 in v1.10.2; +16 net new regressions):
+  * +2 composer: `suggest_sample_technique` NOT in compose/augment plan
+  * +6 sample resolver: role-aware ranking lockouts
+  * +2 preview studio: `commit_preview_variant` executes + analytical-only honesty
+  * +6 project persistence: hash collision-resistance
+
+### Note — what was intentionally NOT fixed in this cycle
+
+- **`mcp_dispatch` registry expansion.** Only `load_sample_to_simpler` is
+  registered. The other 9 `MCP_TOOLS` entries are not currently emitted by
+  any compiled plan I can find. The router returns a clear "not in dispatch"
+  error if an unregistered MCP tool ever gets emitted, which is *honest
+  failure* — not silent. Adding stub entries would be preemptive scope.
+- **Wonder Mode full SessionKernel.** Wonder passes real `session_info` from
+  Ableton to the variant compilers when connected — the kernel SHAPE is
+  minimal (`{session_info, mode}`) but the semantic-move compilers only
+  read `kernel.session_info.tracks`, so the extra fields don't change
+  behavior. Low value, deferred.
+- **Silent `except: pass` in non-execution paths.** `commit_preview_variant`
+  has two silent excepts around taste-memory and turn-resolution updates.
+  These are bookkeeping side effects, not execution-critical, and failing
+  them shouldn't abort the commit. Left as-is.
+- **Project identity via Live set file path.** The real fix for §5 would
+  be to pull `song.song_document_path` from Live via a new Remote Script
+  handler. Deferred — the stronger hash is a substantial improvement
+  without adding new Remote Script surface area.
+
+---
+
+## 1.10.2 — npm Distribution Fix + Tool-Count Audit (April 14 2026)
+
+Patch release. The orchestration hardening shipped in 1.10.1 was correct on
+GitHub releases but the **npm-published 1.10.1 tarball had a stale `.amxd`
+embedded at v1.9.14** because the package was published to npm BEFORE the
+M4L Analyzer device was re-exported. Users installing via `npm install
+livepilot` would have gotten the broken M4L analyzer.
+
+This release republishes the package to npm with the corrected `.amxd`
+(byte-identical to the GitHub release asset) and fixes a number of stale
+tool-count references that have been wrong since the 1.10.0 line bumped
+from 316 → 317.
+
+`livepilot@1.10.1` on npm is being deprecated with a pointer to 1.10.2.
+
+### Fixed
+- **npm package now ships the correct M4L Analyzer device.** `livepilot@1.10.2`
+  contains the re-exported `LivePilot_Analyzer.amxd` (6,723,726 bytes,
+  embeds v1.10.2 `livepilot_bridge.js` byte-perfect). `livepilot@1.10.1`
+  inadvertently shipped with the old v1.9.14 frozen device.
+- **Git tag for the release is now properly created.** v1.10.1 was missing
+  a git tag on origin (the GitHub release was created with `gh release
+  create` against `target_commitish: main` instead of an actual tag).
+  v1.10.2 has a proper annotated tag pushed to origin.
+- **Tool-count drift across docs** (had been wrong since 1.10.0):
+  - `tests/test_tools_contract.py` docstring said "316 MCP tools" while the
+    assertion correctly checked 317 — docstring fixed.
+  - `docs/patreon-content.md` said "316 tools" / "316-tool production system"
+    in two places — both fixed to 317.
+  - `README.md`, `docs/M4L_BRIDGE.md`, `docs/manual/getting-started.md` all
+    claimed "286 core tools + 30 bridge tools" which sums to 316 — and
+    contradicted the 317 total claim elsewhere. Recomputed from source:
+    actual split is **281 core + 36 bridge = 317** (more bridge tools than
+    we used to count because the spectral-cache readers were classified as
+    core, but they require the M4L analyzer device to be present and so
+    are correctly bridge-dependent).
+  - `livepilot/skills/livepilot-release/SKILL.md` release-checklist updated
+    to reference the correct 281/36 split.
+
+### Tests
+- 1740 passing, 1 skipped — same as 1.10.1, no functional code changes
+- `test_tools_contract.py::test_total_tool_count` still asserts 317 ✅
+
+### Note
+1.10.1 → 1.10.2 contains **no Python source changes** and **no functional
+M4L bridge changes**. The orchestration hardening fixes are unchanged from
+1.10.1. This release exists purely to correct the npm distribution, the
+git tag, and stale doc references.
+
+The bundled `.amxd` is the same byte-for-byte file shipped in 1.10.1 (its
+ping response still reports `"version": "1.10.1"`). The repo's
+`livepilot_bridge.js` source has the ping string at `1.10.2`, which is a
+one-line cosmetic difference; the .amxd will catch up on the next re-export.
+All functional code (`get_selected` ID matching, 4-byte UTF-8 decoder, every
+command handler) is identical between v1.10.1 and v1.10.2 — only the
+version number constant differs.
+
+If you're using LivePilot via the GitHub release `.mcpb` asset (not npm),
+you already have the correct M4L analyzer in v1.10.1 and don't need to
+upgrade for any user-visible functional reason.
+
+---
+
+## 1.10.1 — Orchestration Hardening (April 14 2026)
+
+Pure correctness pass on the execution substrate. No new public tools,
+no renames, no tool count change. Thirteen commits across thirteen phases
+(nine Phase 1 + four Phase 2). All new response fields are additive.
+
+**Test results:** 1690 → **1740 passing** (+50 net, +56 new tests, −6 sync-to-async
+rewrites). No regressions.
+
+**M4L Analyzer device re-exported.** `m4l_device/LivePilot_Analyzer.amxd`
+was previously frozen at v1.9.14 (shipped that way in v1.10.0). For 1.10.1
+the device was re-exported from Max for Live with the current
+`livepilot_bridge.js` source, so the bundled `.amxd` now embeds the v1.10.1
+JS including `get_selected` ID-matching (instead of name-matching, which
+broke when track names duplicated) and the 4-byte UTF-8 decoder for emoji
+in track/clip names. Embedded JS is byte-identical to the repo source.
+
+### Fixed
+- **Execution router: `load_sample_to_simpler` reclassified as MCP tool.** It
+  was wrongly declared in `BRIDGE_COMMANDS` despite being an async Python
+  function with no JS dispatch case. All six sample-family semantic moves
+  that compiled this step now classify it correctly. Backend annotations
+  in `mcp_server/sample_engine/moves.py` updated to match.
+- **Execution router: dedupe `capture_audio` classification.** Removed the
+  dead entry from `MCP_TOOLS` — `capture_audio` lives in `BRIDGE_COMMANDS`
+  and is handled by `livepilot_bridge.js`.
+- **Execution router: async-only substrate.** `execute_step` and
+  `execute_plan_steps` (the sync path) are **deleted**. The only surviving
+  entry point is `execute_plan_steps_async`. `apply_semantic_move` and
+  `render_preview_variant` both became `async def` and dispatch through the
+  async router. The dead sync path was the last place where a plan could
+  silently produce steps that only worked on one transport.
+- **Bridge dispatch unpacks params positionally.** Latent bug in the Phase 1
+  async router: it passed the whole params dict as a single arg to
+  `bridge.send_command`, which would have OSC-encoded the dict and failed on
+  the real M4L bridge. Fixed in Phase 2 to unpack via `*list(params.values())` —
+  plan authors construct params in the order the bridge command expects.
+- **Preview Studio: `render_preview_variant` captures audible preview BEFORE
+  undo.** The function previously ran undo in a `finally` block that
+  executed before the "audible preview" section, so `preview_mode =
+  "audible_preview"` was a lie — it captured pre-variant audio. Now
+  restructured as: capture-before → apply → capture-after → play+sample
+  while variant is applied → stop playback → undo applied steps. Callers
+  can trust the `audible_preview` label.
+- **SessionKernel: shares `ctx.lifespan_context` memory stores and fixes
+  silent method-name bugs.** `get_session_kernel` used to instantiate fresh
+  `TasteMemoryStore`, `AntiMemoryStore`, and `SessionMemoryStore` and call
+  `list_all()` / `recent()` (neither method exists), all wrapped in silent
+  `try/except: pass`. Users who recorded anti-preferences or session memory
+  via the public tools always saw an empty kernel. Now reuses stores the
+  same way `mcp_server/memory/tools.py` does, calls the correct methods
+  (`get_anti_preferences`, `get_recent`), and surfaces store-load failures
+  in a non-breaking `warnings` field.
+- **Taste graph shape normalized across consumers.** Both
+  `preview_studio/engine.py:_estimate_taste_fit` and
+  `session_continuity/tracker.py` read `taste_graph.get("transition_boldness")`,
+  but the canonical `TasteGraph.to_dict()` puts it under `dimension_weights`.
+  Both consumers silently defaulted to 0.5, ignoring recorded user taste.
+  New `mcp_server/memory/taste_accessors.get_dimension_pref` helper reads
+  all three observed shapes; both consumers route through it.
+- **Composer: plans are executable, not aspirational.** `compose()` and
+  `augment_with_samples()` used to emit pseudo-tools
+  (`_agent_pick_best_sample`, `_apply_technique`), placeholder strings
+  (`{downloaded_path}`), invalid sentinels (`device_index: -1`,
+  `track_index: -1`), and hardcoded `clip_slot_index: 0` on newly-created
+  empty tracks. Plans are now rebuilt via `sample_resolver.resolve_sample_for_layer`
+  at plan time. Unresolved layers are kept in the descriptive `layers`
+  output and surfaced in `warnings`, but dropped from `plan`. Processing
+  chains use `step_id` + `$from_step` bindings to resolve `device_index`
+  from `insert_device` results at execution time.
+- **Composer: arrangement clips finally work.** Re-enabled the arrangement
+  emission path that was stubbed in Phase 7. Each resolved layer now emits
+  `create_clip` → `add_notes` (C3 trigger) → `create_arrangement_clip` per
+  section, tiling a 1-bar source clip across each section's bar count.
+  Simpler in classic mode plays the full sample on every trigger, so the
+  minimal pattern produces a playable baseline; the agent can replace it
+  with a more musical pattern via `suggest_sample_technique` recipes later.
+  Example: a techno prompt with one resolved sample now produces a 65-step
+  plan with 5 arrangement clips tiling Intro / Build / Drop / Drop 2 / Outro.
+- **ProjectBrain: `build_project_brain` fetches notes for role inference.**
+  The tool never called `get_notes`, so `build_project_state_from_data`
+  always ran with an empty `notes_map`, forcing `role_graph` into the
+  "assume all tracks active in every section" fallback — destroying the
+  section-scoped role confidence RoleGraph was supposed to compute.
+
+### Added
+- **Async execution router with step-result binding** —
+  `mcp_server/runtime/execution_router.execute_plan_steps_async` dispatches
+  `remote_command`, `bridge_command`, and `mcp_tool` backends through their
+  correct transports. Supports step-result binding via
+  `{"$from_step": "<id>", "path": "a.b"}` on any param.
+- **MCP dispatch registry** — `mcp_server/runtime/mcp_dispatch.py` registers
+  in-process Python tools (starting with `load_sample_to_simpler`) so plans
+  can invoke them through the async router. Lifespan-installed at startup
+  alongside `ableton`, `spectral`, `m4l`, and `splice_client`.
+- **Splice remote download workflow in composer.** `sample_resolver` extended
+  with `splice_local` and `splice_remote` sources. Resolution order:
+  `filesystem > splice_local > splice_remote > browser`. Filesystem wins
+  even when Splice has a hit (local files are free). Splice remote downloads
+  cost 1 credit each and respect the 5-credit hard floor via
+  `splice_client.can_afford(1, budget)` — the floor check is upfront so
+  the resolver fails fast rather than thrashing per-layer.
+- **`SpliceGRPCClient` wired into server lifespan.** `ctx.lifespan_context["splice_client"]`
+  is now populated at startup. Graceful degradation: if grpcio is missing,
+  Splice desktop isn't running, or the cert can't be read, `splice_client.connected`
+  stays False and the resolver treats it as "no splice hits".
+- **Composer credit-safety prelude.** New `_credit_safety_prelude()` helper
+  in `composer/tools.py` runs once per compose/augment call: checks credits
+  remaining, trims `max_credits` to respect the floor, returns a warnings
+  list the tool merges into the plan output. No per-layer credit thrashing.
+- **Additive return fields** (no breaking changes to existing callers):
+  - `insert_device.device_index` — actual index of the inserted device in
+    its chain/track. Composer plans bind to it.
+  - `load_sample_to_simpler.device_index` and `.track_index` — the real
+    Simpler position (was previously computed internally but not returned).
+  - `preview_semantic_move.compiled_plan` and `.compiled_plan_executable` —
+    the move compiled against a lightweight current-session kernel,
+    alongside the existing static `plan_template`.
+  - `get_session_kernel.warnings` — surfaced when memory/taste stores fail
+    to load. Additive, callers can ignore.
+- **`mcp_server/composer/sample_resolver.py`** — async sample resolver with
+  filesystem-first preference, splice_local/remote hooks, and browser fallback.
+- **`mcp_server/memory/taste_accessors.get_dimension_pref`** — canonical
+  reader for taste-graph dimension preferences. All new consumers must
+  use it.
+- **Bridge parity test** — `tests/test_bridge_parity.py` compares Python
+  `BRIDGE_COMMANDS` against the `case` labels in
+  `m4l_device/livepilot_bridge.js`. Catches future misclassification drift.
+
+### Changed (internal, no public tool changes)
+- **`ComposerEngine.compose`, `augment`, and `get_plan` are async.** Sample
+  resolution may now hit the network (Splice download), so the whole compose
+  chain awaits. No production callers outside `composer/tools.py`; tests use
+  `asyncio.run(...)` wrappers.
+- **`CompositionResult.resolved_samples` shape changed** from
+  `{role: path_str}` to `{role: {"path": str, "source": str}}` — callers
+  can now tell filesystem vs splice_local vs splice_remote hits apart.
+
+### Tests
+- Router suite: 23/23 (async-only; 6 legacy sync tests rewritten as async)
+- Composer resolver suite: 13/13 (7 filesystem + 6 splice paths)
+- Composer engine suite: 14/14 (9 Phase 7 + 5 Phase 2B arrangement contracts)
+- Project brain suite: 47/47 (+2 Phase 8 notes_map regression)
+- Preview studio suite: 17/17 (+1 ordering regression)
+- Session kernel suite: 11/11 (+3 hydration regression)
+- Taste accessors suite: 9/9 (new in Phase 3)
+- Bridge parity suite: 2/2 (new in Phase 9)
+- **Full repo: 1740 passed, 1 skipped** (up from 1690)
+
+---
+
+## 1.10.0 — The Intelligence Release (April 13 2026)
+
+316 tools across 43 domains. Device Atlas v2, Sample Intelligence, Auto-Composition, Splice Integration, Device Forge, Live 12.3 API, Corpus Intelligence.
+
+### Device Atlas v2 — 1305 Devices, 81 Enriched (+6 tools)
+- **`atlas_search`** — fuzzy search across all devices by name, sonic character, use case, or genre
+- **`atlas_device_info`** — full knowledge entry for any device — parameters, recipes, gotchas
+- **`atlas_suggest`** — intent-driven recommendation: "warm bass for techno" → Drift + recipe
+- **`atlas_chain_suggest`** — full device chain for a track role: instrument + effects with rationale
+- **`atlas_compare`** — side-by-side comparison of two devices for a given role
+- **`scan_full_library`** — deep browser scan to build/refresh the atlas
+- 32 instruments (16 enriched), 70 audio effects (35 enriched), 23 MIDI effects (12 enriched), 497 M4L devices, 683 drum kits
+- 71 YAML enrichment files with parameter guides, recipes, and production knowledge
+
+### Composer Engine — Prompt to Multi-Layer Session (+3 tools)
+- **`compose`** — full multi-layer composition from text prompt ("dark minimal techno 128bpm with industrial textures")
+- **`augment_with_samples`** — add sample-based layers to existing session
+- **`get_composition_plan`** — dry run preview without executing
+- NLP parser extracts genre, mood, tempo, key, energy from free text
+- Layer planner with role templates (drums/bass/lead/pad/texture/vocal)
+- 7 genre defaults: techno, house, hip hop, ambient, drum and bass, trap, lo-fi
+- Credit safety system for Splice integration
+
+### Sample Engine — AI Sample Intelligence (+6 tools)
+- **`analyze_sample`**, **`evaluate_sample_fit`**, **`search_samples`**, **`suggest_sample_technique`**, **`plan_sample_workflow`**, **`get_sample_opportunities`**
+- SpliceSource — reads Splice's local sounds.db (read-only) for key, BPM, genre, tags, pack info, popularity
+- BrowserSource + FilesystemSource — Ableton browser and local directory scanning
+- 6-critic fitness battery: key fit, tempo fit, frequency fit, role fit, vibe fit, intent fit
+- 29-technique library: rhythmic (Dilla, Burial, Premier), textural (Paulstretch, granular), melodic (Bon Iver), resampling (Amon Tobin)
+- Dual philosophy: Surgeon (precision integration) vs Alchemist (creative transformation)
+- 6 sample-domain semantic moves for Wonder Mode: chop_rhythm, texture_layer, vocal_ghost, break_layer, resample_destroy, one_shot_accent
+- Sample-aware stuckness diagnosis: no_organic_texture, stale_drums, vocal_processing_monotony, dense_but_static
+
+### Splice gRPC Client
+- Live connection to Splice desktop API for downloading new samples
+- Port auto-detected from port.conf, TLS with self-signed certs
+- Credit safety floor (never drain below 5 credits)
+- Graceful degradation when Splice is not running
+
+### Device Forge — Programmatic M4L Generation (+3 tools)
+- **`generate_m4l_effect`**, **`list_genexpr_templates`**, **`install_m4l_device`**
+- .amxd binary builder from pure Python (reverse-engineered binary format)
+- gen~ DSP template library: 15 building blocks (Lorenz, Karplus-Strong, wavefolder, FDN reverb, bitcrusher, etc.)
+- 7 device_creation semantic moves for Wonder Mode
+- Safety: auto `clip(out, -1, 1)` on all generated gen~ code
+- Auto-installs to Ableton User Library
+
+### Live 12.3 API Integration (+4 tools)
+- **`create_native_arrangement_clip`** — arrangement clips with automation envelope (12.1.10+)
+- **`insert_device`** — insert native device by name, 10x faster than browser (12.3+)
+- **`insert_rack_chain`** — add chains to Instrument/Audio/Drum Racks (12.3+)
+- **`set_drum_chain_note`** — assign MIDI notes to Drum Rack chains (12.3+)
+- Version detection at startup with feature flags via `get_session_info`
+- Three capability tiers: Core (12.0+), Enhanced Arrangement (12.1.10+), Full Intelligence (12.3+)
+- Display values on device parameters (12.2+) — human-readable like "26.0 Hz"
+- `find_and_load_device` auto-routes to `insert_device` on 12.3+ (10x speedup)
+
+### Corpus Intelligence Layer
+- Parses device-knowledge markdown into queryable Python structures at runtime
+- EmotionalRecipe, GenreChain, PhysicalModelRecipe, AutomationGesture data types
+- Consumed by Wonder Mode, Sound Design critics, and Composer Engine
+
+### Wonder Mode Enhancements
+- Corpus intelligence integration — emotional/genre/material hints in variants
+- Sample-domain diagnosis patterns
+- 13 new semantic moves (6 sample + 7 device creation)
+
+### New Domains
+- **atlas** — device knowledge database (6 tools)
+- **composer** — auto-composition engine (3 tools)
+- **sample_engine** — sample intelligence (6 tools)
+- **device_forge** — M4L device generation (3 tools)
+
+## 1.9.24 — Stability & Intelligence Upgrade (April 2026)
+
+### Truth and Boundaries (Wave 1)
+- **feat(runtime):** Capability contract — every advanced tool reports `full/fallback/analytical_only/unavailable` with confidence scores
+- **feat(runtime):** Command boundary audit — CI catches any `send_command()` targeting a non-existent Remote Script command
+- **fix(song_brain):** `get_motif_graph` now uses pure-Python engine instead of invalid TCP call
+- **fix(hook_hunter):** Same motif routing fix
+- **fix(musical_intelligence):** Same motif routing fix + `analyze_phrase_arc` now calls perception engine directly
+- **fix(memory):** `record_positive_preference` actually updates taste dimensions (was a silent no-op due to key mismatch)
+- **fix(metadata):** AGENTS.md synced to v1.9.23/293 tools, test docstring corrected
+
+### Unified Execution Layer (Wave 2)
+- **feat(runtime):** Execution router — classifies steps as `remote_command/bridge_command/mcp_tool/unknown`, dispatches correctly
+- **feat(semantic_moves):** `apply_semantic_move` explore mode uses execution router
+- **feat(preview_studio):** `render_preview_variant` uses execution router
+
+### Persistent Memory (Waves 2-3)
+- **feat(persistence):** Base persistent JSON store (atomic write, corruption recovery, thread-safe)
+- **feat(persistence):** Taste store at `~/.livepilot/taste.json` — move outcomes, novelty band, device affinity, anti-preferences survive restart
+- **feat(persistence):** Project store at `~/.livepilot/projects/<hash>/state.json` — threads, turns, Wonder outcomes per song
+- **feat(memory):** TasteGraph.record_move_outcome writes to persistent backing
+- **feat(session_continuity):** tracker flushes threads and turns to project store on write
+
+### Move Annotations (Wave 3)
+- **feat(semantic_moves):** All 20 moves annotated with explicit `backend` per compile_plan step
+- **test:** Static audit verifies all annotations match the execution router classifier
+
+### Intelligence Upgrade (Waves 3-4)
+- **feat(services):** Shared motif service — one entry point consumed by SongBrain, HookHunter, musical_intelligence
+- **feat(song_brain):** Evidence-weighted identity confidence (motif=0.4, composition=0.2, roles=0.15, scenes=0.15, moves=0.1)
+- **feat(song_brain):** `evidence_breakdown` field shows per-source contributions
+- **feat(hook_hunter):** Hooks carry `evidence_sources` (motif_recurrence, track_name, clip_reuse)
+- **feat(hook_hunter):** Section-placement analysis boosts hooks recurring across sections
+- **feat(detectors):** Motif appearing in >60% of sections triggers fatigue signal
+
+### Preview and Doctor (Wave 4)
+- **feat(preview_studio):** Three explicit preview modes: `audible_preview` (M4L+spectrum), `metadata_only_preview`, `analytical_preview`
+- **feat(preview_studio):** `bars` parameter used for audible preview playback duration
+- **feat(preview_studio):** `preview_mode` field in response — no ambiguity about what was measured
+- **feat(runtime):** Capability probe — 6-area runtime detection (Ableton, Remote Script, M4L, numpy, persistence, tier)
+
+### Release Infrastructure (Wave 5)
+- **feat(scripts):** `sync_metadata.py` — single source of truth for version and tool count, CI-checkable
+- **docs:** README Intelligence Layer section with all 12 engines described
+- **docs:** Manual index rewritten with three-layer architecture and 39-domain map
+
+## 1.9.23-wonder-v1.5 — Wonder Mode V1.5: Stuck-Rescue Workflow (April 2026)
+
+### Wonder Mode Redesign (292->293 tools)
+- **feat(wonder_mode):** Diagnosis-first workflow — stuckness detection drives variant generation
+- **feat(wonder_mode):** Honest variant labeling — `analytical_only: true` for non-executable variants
+- **feat(wonder_mode):** Real distinctness enforcement — variants must differ by move, family, or plan shape
+- **feat(wonder_mode):** WonderSession lifecycle — diagnosis -> variants -> preview -> commit/discard
+- **feat(wonder_mode):** `discard_wonder_session` tool — reject all variants, keep creative thread open
+- **feat(preview_studio):** Wonder-aware preview — accepts `wonder_session_id`, refuses analytical variants
+- **feat(preview_studio):** Commit lifecycle hooks — records outcome to continuity and taste
+- **feat(session_continuity):** No more premature turn recording — only commit/reject record turns
+- **feat(skills):** New `livepilot-wonder` skill with trigger conditions and honesty rules
+
+## 1.9.23 — Stage 2: The Magic Layer (April 2026)
+
+### Wonder Mode Rebuild
+- **feat(wonder_mode):** Full engine rebuild — variants now built from real semantic moves matched by keyword+taste scoring, not templates
+- **feat(wonder_mode):** Ranking uses bell-curve novelty centered on user's novelty_band, sacred element penalty, and coherence scoring
+- **feat(wonder_mode):** Taste fit uses full TasteGraph (family preference, dimension alignment, anti-preferences, risk alignment)
+- **feat(wonder_mode):** Each variant carries `targets_snapshot`, `compiled_plan`, and `score_breakdown` with all 4 component scores
+- **breaking(wonder_mode):** Removed `generate_wonder_variants` tool (redundant with `enter_wonder_mode`)
+
+### New Tools (10 new, -1 removed = net +9, 283→292)
+- **feat(preview_studio):** `render_preview_variant` — render a short preview of a variant using Ableton's undo system
+- **feat(hook_hunter):** `detect_hook_neglect` — check if a strong hook is underused across sections
+- **feat(hook_hunter):** `compare_phrase_impact` — compare emotional impact across multiple sections
+- **feat(stuckness_detector):** `start_rescue_workflow` — structured step-by-step rescue plan for a specific stuckness type
+- **feat(wonder_mode):** `rank_wonder_variants` — rank wonder variants by taste + identity + phrase impact
+- **feat(session_continuity):** `open_creative_thread` — open a new creative thread for exploration
+- **feat(session_continuity):** `list_open_creative_threads` — list all open non-stale creative threads
+- **feat(session_continuity):** `explain_preference_vs_identity` — explain taste vs identity tension for a candidate
+- **feat(creative_constraints):** `generate_constrained_variants` — generate triptych variants under active constraints
+- **feat(creative_constraints):** `generate_reference_inspired_variants` — generate variants inspired by distilled reference principles
+
+### Fixes
+- **fix(wonder_mode):** Fixed taste graph access to use session-scoped lifespan context instead of creating fresh stores
+- **fix(session_continuity):** Fixed taste graph access to match preview_studio pattern
+
+## 1.9.22 — Skill & Command Overhaul (April 2026)
+
+### Skill Updates
+- **feat(beat):** Added Step 0 "Session Prep" — for fresh projects, deletes all tracks and loads M4L Analyzer on master before starting. Includes perception check (Step 11) with spectral balance verification.
+- **feat(mix):** Added analyzer auto-load (Step 2), spectral targets by genre (Step 6), mandatory meter verification after every change (Step 8), capture+analyze loop (Step 11)
+- **feat(sounddesign):** Added mandatory `value_string` verification (Step 5), perception check (Step 11), organic movement with perlin curves (Step 8)
+- **feat(arrange):** Added motif detection (Step 3), gesture template execution (Step 7), perlin organic movement (Step 8), emotional arc verification (Step 9), LRA check for dynamic range (Step 10)
+- **feat(evaluate):** Added analyzer auto-load (Step 2), full perception snapshot with track meters (Step 6), capture+analyze offline as ground truth option
+
+## 1.9.21 — Verification Discipline Pass (April 2026)
+
+### Systemic Fixes
+- **fix(devices):** `set_device_parameter` and `batch_set_parameters` now return `value_string`, `min`, `max` in response — the agent can immediately see "26.0 Hz" instead of just "75" and catch nonsensical values
+- **fix(automation):** `apply_automation_recipe` now auto-scales 0-1 recipe curves to the target parameter's actual native range (e.g., Auto Filter 20-135, Bit Depth 1-16). Previously, a "0.3 center" vinyl_crackle on a 20-135 range wrote 0.3 literally, killing audio
+- **fix(automation):** `auto_pan` recipe pan values now clamped to ±0.6 to prevent full L/R swing that makes tracks disappear from one channel
+- **docs(skill):** Added Golden Rules 15-16 — mandatory post-write verification protocol: always read `value_string`, always check track meters after filter/effect changes, never apply automation recipes without understanding the target parameter's range
+
+## 1.9.20 — Deep Production Test Pass (April 2026)
+
+### New Tool
+- **feat(analyzer):** `reconnect_bridge` — rebind UDP 9880 mid-session after port conflict clears, without restarting the MCP server
+
+### Bug Fixes
+- **fix(arrangement):** `set_arrangement_automation` now returns `STATE_ERROR` (not `INVALID_PARAM`) with clear workaround suggestions for the known Live API limitation
+- **fix(router):** added `RuntimeError` → `STATE_ERROR` mapping so state-related errors don't masquerade as parameter validation failures
+- **fix(browser):** `load_browser_item` now accepts negative track_index (-1/-2 for returns, -1000 for master) — was incorrectly rejected by MCP-side validator
+- **fix(tracks):** `set_track_name` on return tracks strips auto-prefix letter to prevent doubling (e.g. "C-Resonators" stays as-is, not "C-C-Resonators")
+- **fix(theory):** `suggest_next_chord` now uses mode-aware progression maps — separate major/minor chord tables for common_practice, jazz, modal, and pop styles
+- **fix(research):** `research_technique` now searches instruments, audio_effects, AND drums categories (was instruments-only); deep scope notes that web search is agent-layer responsibility
+- **fix(server):** improved port competition error messages — directs users to `reconnect_bridge` tool instead of requiring server restart
+- **fix(analyzer):** M4L Analyzer User Library copy synced to latest version (presentation mode enabled, bridge JS updated)
+
+### Documentation
+- **docs(skill):** added "Volume reset on scene fire" and "M4L Analyzer auto-load" to error handling protocol in livepilot-core skill
+- **docs(CLAUDE.md):** tool count updated from 236 to 237
+
+## 1.9.19 — Theory Engine & Meters Fix Pass (April 2026)
+
+### Bug Fixes
+- **fix(mixing):** `get_track_meters` crashed on tracks with MIDI-only output — now guards `output_meter_*` with `has_audio_output` check
+- **fix(mixing):** `get_mix_snapshot` same crash on MIDI-output tracks — same guard applied
+- **fix(tracks):** `create_midi_track` / `create_audio_track` left newly created tracks armed — now auto-disarms unless `arm=true` param is passed
+- **fix(theory):** `roman_numeral()` failed to recognize 7th chords (Dm7, Gm7, Bbmaj7) — now detects 7th intervals via triad-subset matching with scored best-match selection
+- **fix(theory):** `roman_figure_to_pitches()` produced out-of-key pitches (C#, G#) for jazz figures in minor keys — now uses scale-derived chord quality and scale-derived 7th intervals instead of forcing quality from Roman numeral case
+- **fix(harmony):** `parse_chord()` rejected "minor seventh", "dominant seventh" and other extended chord qualities — now normalizes to base triad for neo-Riemannian analysis
+- **fix(harmony):** `classify_transform_sequence()` only detected single P/L/R transforms — now tries 2-step compound transforms (PL, PR, RL, etc.)
+- **fix(theory):** `roman_numeral()` picked wrong chord when 7th created ambiguity (Bbmaj7 matched as Dm instead of Bb) — scoring prefers highest overlap + root-position bonus
+
+## 1.9.18 — Deep Audit Fix Pass (April 2026)
+
+### Critical Fixes
+- **fix(tracks):** monitoring enum mismatch — MCP advertised `0=Off,1=In,2=Auto` but Remote Script uses `0=In,1=Auto,2=Off`; clients deterministically chose wrong mode
+- **fix(connection):** retry logic could replay mutating commands after `sendall` succeeded — added `_send_completed` flag to prevent double mutations
+- **fix(m4l_bridge):** `capture_stop` cancelled in-flight capture future instead of resolving it — callers got `CancelledError` instead of partial result
+
+### Medium Fixes
+- **fix(skills):** removed 6 phantom tool names from speed tiers (`analyze_dynamic_range`, `analyze_spectral_evolution`, `separate_stems`, `diagnose_mix`, `transcribe_to_midi`, `compare_loudness`)
+- **fix(clip_automation):** added `int()` casts to `send_index`, `device_index`, `parameter_index` — prevented TypeError when MCP sends strings
+- **fix(arrangement):** `add_arrangement_notes` now supports `probability`, `velocity_deviation`, `release_velocity` (parity with session `add_notes`)
+- **fix(devices/browser):** reset `_iterations` counter per category in URI search — prevented premature cutoff for devices in later categories
+- **fix(imports):** standardized 6 engine files from `mcp.server.fastmcp` to `fastmcp` import path
+- **fix(docs):** corrected domain count from 32 to 31 (`memory_fabric` is an alias for `memory`) across 17 files
+- **fix(server.json):** added missing `, MIDI I/O` to description to match package.json
+
+### Low Fixes
+- **fix(clips):** `delete_clip` now checks `has_clip` before deleting
+- **fix(arrangement):** `back_to_arranger` no longer reads write-only trigger property
+- **fix(utils):** return track error message no longer shows `(0..-1)` when none exist
+- **fix(connection):** removed dead `send_command_async` and unused `asyncio` import
+
+## 1.9.17 — Skills Architecture V2 (April 2026)
+
+### Skills (9 new, 1 slimmed)
+- **livepilot-core** — slimmed from 900 to ~150 lines. Golden rules, speed tiers, error protocol. Domain content moved to dedicated skills.
+- **livepilot-devices** — NEW: device loading, browser workflow, plugin health, rack introspection
+- **livepilot-notes** — NEW: MIDI content, theory integration, generative algorithms, harmony tools
+- **livepilot-mixing** — NEW: volume/pan/sends, routing, metering, automation patterns
+- **livepilot-arrangement** — NEW: song structure, scenes, arrangement view, navigation
+- **livepilot-mix-engine** — NEW: critic-driven mix analysis loop (masking, dynamics, stereo, headroom)
+- **livepilot-sound-design-engine** — NEW: critic-driven patch refinement loop (static timbre, modulation, filtering)
+- **livepilot-composition-engine** — NEW: section analysis, transitions, motifs, form, translation checking
+- **livepilot-performance-engine** — NEW: safety-first live performance with energy tracking and move classification
+- **livepilot-evaluation** — NEW: universal before/after evaluation loop with capability-aware scoring
+
+### Commands (3 new, 2 updated)
+- `/arrange` — NEW: guided arrangement using composition engine
+- `/perform` — NEW: safety-constrained performance mode
+- `/evaluate` — NEW: before/after evaluation loop
+- `/mix` — updated to use mix engine critics
+- `/sounddesign` — updated to use sound design engine critics
+
+### Agent
+- **livepilot-producer** — updated to reference all 10 skills instead of inline loop definitions
+
+### Plugin Stats
+- 11 skills (was 2), 8 commands (was 5), 1 agent, 10 reference files for engine skills
+- Total plugin skill metadata: ~1100 words always-in-context (lean triggers)
+- Progressive disclosure: SKILL.md bodies ≤2000 words each, detailed content in references/
+
+## 1.9.16 — Comprehensive Bug Fix Audit (April 2026)
+
+### Critical Fixes
+- **connection.py** — Don't retry TCP commands after timeout (prevents duplicate mutations in Ableton)
+- **connection.py** — Add `send_command_async()` to avoid blocking the asyncio event loop
+- **technique_store.py** — Thread-safe initialization with double-checked locking; add missing `_ensure_initialized()` in `increment_replay`
+- **capability_state.py** — Fix inverted mode logic: offline analyzer is now correctly more restrictive than stale analyzer
+- **server.py** — Fix thread safety: assign `_client_thread` inside lock
+- **action_ledger_models.py** — Thread-safe unique IDs with UUID session suffix
+
+### High-Priority Fixes
+- **notes.py / arrangement.py** — `modify_notes` now applies `mute`, `velocity_deviation`, `release_velocity` (previously silently dropped)
+- **clips.py** — `create_clip` checks `has_clip` first; `set_clip_loop` uses conditional ordering for shrink vs expand
+- **notes.py / arrangement.py** — Fix `transpose_notes` default `time_span` when `from_time > 0`
+- **m4l_bridge.py** — Clear stale response future after timeout
+- **composition.py** — Fix `get_phrase_grid` using section_index as clip_index
+- **devices.py** — Fix `_postflight_loaded_device` always reporting plugins as failed
+- **tracks.py** — Correct input monitoring enum (0=Off, 1=In, 2=Auto); fix `set_group_fold` allowing return tracks
+- **research.py** — Fix browser path casing (`"Instruments"` → `"instruments"`)
+- **midi_io.py** — Fix path traversal check prefix collision
+- **fabric.py** — Distinguish `measured` vs `measured_reject` decision modes
+- **critics.py** — Fix dynamics critic double-counting `over_compressed` + `flat_dynamics`
+- **refresh.py** — Deep-copy freshness objects to prevent mutation leak
+- **mix_engine/tools.py** — Fix `track_count` key (always 0) → use `len(tracks)`
+- **safety.py** — Distinguish `unknown` from `caution` for unrecognized move types
+- **translation_engine** — Fix pan values always 0 (check nested `mixer.panning`)
+- **livepilot_bridge.js** — Track selection by LiveAPI ID (not name); 4-byte UTF-8 support (emoji)
+
+### Medium Fixes
+- Version strings bumped across all files
+- `hashlib.md5` calls use `usedforsecurity=False` (FIPS compat)
+- `.mcp.json` uses portable `node` command
+- README "32 additional tools" → "29"
+- Lazy `asyncio.Lock` creation in M4L bridge
+- `_friendly_error` now includes `command_type` in output
+
+### Test Improvements
+- Tests updated to match corrected capability_state, dynamics critic, and safety logic
+- `test_default_name_detection` now imports production function instead of local copy
+
+## 1.9.15 — V2 Engine Architecture (April 2026)
+
+### New Engine Packages (12)
+- **Project Brain** — shared state substrate with 5 subgraphs (session, arrangement, role, automation, capability), freshness tracking, scoped refresh
+- **Capability State** — runtime capability model (5 domains: session, analyzer, memory, web, research), operating mode inference
+- **Action Ledger** — semantic move tracking with undo groups, memory promotion candidates
+- **Evaluation Fabric** — unified evaluation layer with 5 engine-specific evaluators (sonic, composition, mix, transition, translation)
+- **Memory Fabric V2** — anti-memory (tracks user dislikes), promotion rules, session memory, taste memory (8 extended dimensions)
+- **Mix Engine** — 6 critics (balance, masking, dynamics, stereo, depth, translation), move planner with ranking
+- **Sound Design Engine** — timbral goals, patch model, layer strategy, 5 critics, move planner
+- **Transition Engine** — boundary model, 7 archetypes, 5 critics, payoff scoring
+- **Reference Engine** — audio/style profiles, gap analysis with identity warnings, tactic routing to target engines
+- **Translation Engine** — playback robustness (mono, small speaker, harshness, low-end, front-element)
+- **Performance Engine** — live-safe mode with scene steering, safety policies, energy path planning
+- **Safety Kernel** — policy enforcement (blocked/confirm-required/safe action classification, scope limits, capability gating)
+
+### New Infrastructure
+- **Conductor** — intelligent request routing to engines with keyword classification (22 patterns across 8 engines)
+- **Budget System** — 6 resource pools per turn (latency, risk, novelty, change, undo, research) shaped by mode
+- **Snapshot Normalizer** — canonical input normalization for all evaluators
+- **Evaluation Contracts** — shared types (EvaluationRequest, EvaluationResult, dimension measurability registry)
+- **Research Provider Router** — 6-level provider ladder with mode-based routing and outcome feedback
+
+### Composition Engine Extensions (Rounds 1-4)
+- Round 1: HarmonyField, TransitionCritic, OutcomeAnalyzer
+- Round 2: MotifGraph, 11 GestureTemplates, TechniqueCards, SectionOutcomes
+- Round 3: ResearchEngine (targeted+deep), PlannerEngine (5 styles), EmotionalArcCritic
+- Round 4: TasteModel, 6 StyleTactics, FormEngine (9 transforms), CrossSectionCritic, OrchestrationPlanner
+
+### Bug Fixes
+- Fix(High): Remove async/await from engine tools — send_command is sync
+- Fix(High): Mix engine extracts mixer.volume/panning from nested Remote Script response
+- Fix(High): Replace calls to nonexistent commands (get_device_reference, walk_device_tree)
+- Fix(Med): Remove refs to nonexistent session fields (last_export_path, selected_scene)
+- Fix(Med): Ledger key mismatch — memory promotion now reads correct 'action_ledger' key
+
+### Stats
+- 236 tools across 31 domains (was 194)
+- 1,014 tests passing (was ~400)
+- 12 new engine packages
+- 36 new MCP tools
+
+## 1.9.14 — Install Reliability + CI Expansion (April 2026)
+
+- Fix(High): `--install` now shows all detected Ableton directories when multiple exist and accepts `LIVEPILOT_INSTALL_PATH` env var to override — previously silently picked the first candidate which could be wrong
+- Fix(Med): FastMCP pinned to `>=3.0.0,<3.3.0` with documented private API dependency (`_tool_manager`, `_local_provider`) — prevents upstream drift from breaking schema coercion
+- Fix(Med): CI expanded to multi-OS matrix (Ubuntu + macOS + Windows) and added JS entrypoint validation (syntax check, npm pack asset verification)
+- Fix(Low/Med): `--setup-flucoma` now enforces SHA256 checksum (TOFU pattern) — first download records the hash, subsequent installs abort on mismatch
+- Fix(Low): `--status` timeout path now resolves `true` when `lsof` detects another LivePilot client on the port — matches the explicit STATE_ERROR fix from v1.9.13
+- Verification: 145 tests passing, 178 tools confirmed
+
+## 1.9.13 — Security Hardening + Startup Safety (April 2026)
+
+- Fix(P2): `--setup-flucoma` now pins to a known release tag (v1.0.7) instead of unpinned `latest`, prints SHA256 checksum for verification, and selects the platform-specific zip
+- Fix(P2): memory subsystem now uses lazy initialization — `TechniqueStore` defers directory creation to first tool call instead of blocking server startup when HOME is read-only
+- Fix(P3): `--status` and `--doctor` now return exit 0 when Ableton is reachable but another client is connected (STATE_ERROR = reachable, not failure)
+- Fix(P3): negative `limit` values on `memory_recall` and `memory_list` now raise `ValueError` instead of using Python negative slicing
+- Fix: Remote Script no longer logs "Server started" before bind succeeds — "Listening on..." is logged from the server loop after successful bind
+- Fix: `requirements.txt` now documents dev dependencies (pytest, pytest-asyncio) as comments
+- Verification: 145 tests passing, 178 tools confirmed
+
+## 1.9.12 — Deep Audit: 21 Fixes Across 15 Files (April 2026)
+
+**Full codebase audit — 5 critical, 10 important, 6 doc/test fixes.**
+
+### Critical Fixes
+- Fix(P1): `capture_stop` no longer deadlocks — `cancel_capture_future` removed lock acquisition that blocked behind `send_capture`
+- Fix(P1): `import_midi_to_clip` now distinguishes empty-slot NOT_FOUND from INDEX_ERROR/TIMEOUT instead of swallowing all AbletonConnectionErrors
+- Fix(P1): capture audio files now write to `~/Documents/LivePilot/captures/` (stable path) instead of beside the .amxd preset
+- Fix(P1): `check_flucoma` now uses `Folder.end` to detect FluCoMa — `typelist` check was always true
+- Fix(P1): CI workflow updated to `actions/checkout@v4` + `actions/setup-python@v5` (v6 doesn't exist)
+
+### Safety & Validation
+- Fix(P2): 5 automation tools now validate `track_index >= 0` and `clip_index >= 0` (matching all peer modules)
+- Fix(P2): `cmd_stop_scrub` now checks `cursor_a.id === 0` for empty clip slots (matching all peer bridge functions)
+- Fix(P2): `cmd_get_selected` now resolves return tracks (negative indices) and master track (-1000)
+- Fix(P2): `duplicate_track` uses count-before/after delta for correct group track duplication index
+- Fix(P2): `create_arrangement_clip` locates first clip by `start_time` instead of stale index after trim pass
+- Fix(P2): `get_session_info` reuses already-built lists instead of re-iterating `song.tracks`/`song.scenes`
+- Fix(P2): client disconnect race — socket now closes before clearing `_client_connected` flag
+
+### Tests
+- Fix: transport validation tests now import production `_validate_tempo`/`_validate_time_signature` instead of testing local copies
+- Fix: added `load_sample_to_simpler` to analyzer tool contract (was 28/29)
+- Fix: removed duplicate `test_release_quick_verify_checks_both_plugin_manifests`
+- New: 5 automation negative tests (index validation, parameter_type validation)
+
+### Documentation
+- Fix: `docs/manual/index.md` domain map — Tracks 14→17, Devices 12→15, Scenes 8→12
+- Fix: README perception split — 145+33 → 149+29 (actual analyzer tool count is 29)
+- Fix: M4L_BRIDGE.md command count — 22→28 (6 commands undocumented)
+- Fix: tool-reference.md MIDI docs — `export_clip_midi` and `import_midi_to_clip` parameter tables matched to actual signatures
+
+### Deferred (documented, low-impact)
+- Timed-out commands still execute on main thread (needs cancellation token redesign)
+- Chunked UDP reassembly fragile on packet loss (loopback mitigates)
+- Diatonic transpose octave correction edge case (needs musical test suite)
+- `cmd_map_plugin_param` reports false success (LiveAPI lacks Configure mapping API)
+
+Verification: 145 tests passing (non-fastmcp), 178 tools confirmed, 15 files changed
+
+## 1.9.11 — Session Diagnostics + Client Conflict Clarity (March 2026)
+
+**Live-tested against the open Ableton set after reloading the updated Remote Script.**
+
+- Fix(P1): device loading now surfaces post-load plugin health hints, including `opaque_or_failed_plugin`, `sample_dependent`, `plugin_host_status`, and `mcp_sound_design_ready`
+- Fix(P1): `get_session_diagnostics` now flags opaque/sample-dependent plugins and no longer crashes on track types that omit standard `arm`/`mute`/`solo` properties
+- Fix(P1): analyzer tools now distinguish between “analyzer missing” and “analyzer loaded but bridge/client conflict” when UDP 9880 is unavailable
+- Fix(P1): add Hijaz / Phrygian Dominant theory support across key parsing, scale construction, chord building, and `identify_scale`
+- Fix(P2): `--status` and TCP timeout paths now explain when another LivePilot client appears to be connected instead of only reporting a generic timeout
+- Docs: beat/sounddesign/core skill guidance now includes device-health checks, sample-dependent plugin cautions, and pitch-audit discipline from the live stress-test sessions
+- Verification: `292 passed`, `npm pack --dry-run` passed, live set diagnostics succeeded, analyzer bridge streamed on the master track, and conflict reproduction now reports the competing client PID
+- Fix(P1): brownian automation curve reflection loop now has 100-iteration guard with hard clamp fallback — high volatility values could previously hang the server
+- Fix(P1): schema coercion now recurses into array `items` so `list[float]` params benefit from string-to-number widening for MCP clients that serialize as strings
+- Fix(P1): `apply_automation_shape` and `apply_automation_recipe` now validate `parameter_type` and required companion params before sending to Ableton
+- Fix(P2): Remote Script `AssertionError` fallbacks now return STATE_ERROR instead of running LOM calls on the TCP thread during ControlSurface disconnection
+- Fix(P2): M4L bridge ping version corrected to 1.9.11; `check_flucoma` now probes disk for FluCoMa package instead of returning hardcoded `true`
+- Verification: deep audit across 45+ files (3 parallel agents), 292 unit tests + 15 live integration tests against Ableton session, all passing
+
+## 1.9.10 — Analyzer Capture Finalization + Release Sync (March 2026)
+
+**Live-tested in Ableton after a full analyzer rebuild and master-track validation.**
+
+- Fix(P1): `capture_audio` now writes finalized WAV files instead of header-only stubs by correcting the `sfrecord~` start/stop messages in the analyzer patch
+- Fix(P1): add a small delayed record start in `LivePilot_Analyzer.maxpat` to avoid the open/start race on fresh capture writes
+- Fix(P2): normalize Max-style `Macintosh HD:/Users/...` file paths to POSIX paths in the Python bridge and offline perception tools
+- Fix(P2): make OSC string args Unicode-safe end to end with ASCII-safe `b64:` transport and Max-side UTF-8 decode
+- Fix(P2): arrangement automation unsupported cases now surface as outer MCP errors instead of fake success payloads
+- Fix(P2): missing required Remote Script params now return `INVALID_PARAM` consistently
+- Fix(P3): release metadata now treats Codex as the primary plugin manifest with Claude as a mirrored manifest
+- Verification: live `capture_audio` wrote a 1.48s WAV from the master track; offline loudness + metadata reads succeeded on the returned path
+
+## 1.9.9 — M4L Bridge Hardening + Deep Audit (March 2026)
+
+**87 tools tested live, 0 failures. 13 bugs fixed across JS bridge + Python tools.**
+
+### M4L Bridge (livepilot_bridge.js)
+- Fix(P0): Remove `str_for_value` from all batched JS readers — Auto Filter hangs Max's JS engine (uncatchable), binary-patched .amxd
+- Fix(P1): Deferred `udpsend` socket re-initialization via `deferlow` — fixes UDP not sending when device loads from a saved Live Set (socket fails to bind on frozen device restore)
+- Fix(P1): Add try-catch to ALL Task.schedule batch functions: cmd_get_params, cmd_get_hidden_params, cmd_get_display_values, cmd_get_auto_state, cmd_get_plugin_params — prevents silent crash on parameter read errors
+- Fix(P1): cmd_get_chains_deep, cmd_get_track_cpu, cmd_map_plugin_param — added missing error handling
+- Fix(P2): Add `dspstate~` → JS inlet 1 for sample rate reporting (was declared in JS but missing from patcher)
+- Fix(P2): Deferred `snapshot~` re-activation via `live.thisdevice` → `deferlow` — safety net for frozen device reload
+- Perf: Batch size 4→8, delay 50→20ms (2.5× faster parameter reads)
+- Fix: Binary-patch openinpresentation 0→1 in .amxd
+
+### Python MCP Server
+- Fix(P1): classify_progression accepts dict inputs `{"root": "F#", "quality": "minor"}` in addition to strings
+- Fix(P1): Higher bridge timeouts — hidden_params 15s, display_values 15s, auto_state 10s, plugin_params 20s, plugin_presets 15s, map_plugin 10s
+- Fix(P1): load_sample_to_simpler wraps send_command calls in try-except (prevents AbletonConnectionError propagation)
+- Fix(P2): _ensure_list catches json.JSONDecodeError → ValueError (6 files: notes, devices, generative, scenes, harmony, automation)
+- Fix(P2): _get_m4l/_get_spectral raise ValueError instead of RuntimeError (FastMCP compatibility)
+
+## 1.9.7 — Safe automation fallback + correct clip length reporting (March 2026)
+
+- Fix(P1): set_arrangement_automation places replacement BEFORE deleting original — no data loss if placement fails
+- Fix(P2): get_arrangement_clips reports timeline length (not loop span) as length/end_time; loop info as separate fields
+- Reverted the effective-length mangling that misreported looped clip sizes
+
+## 1.9.6 — Arrangement clip identification + expression data (March 2026)
+
+- Fix(P1): create_arrangement_clip now identifies new clips by object identity, not position match — prevents mutating pre-existing overlapping clips
+- Fix(P2): set_arrangement_automation fallback preserves probability, velocity_deviation, release_velocity when rebuilding notes
+- Fix(P2): get_arrangement_clips effective length uses loop_end - loop_start (not just loop_end)
+
+## 1.9.5 — TCP Retry Fix + Arrangement Automation Fix (March 2026)
+
+- Fix(P1): disconnect() now clears _recv_buf — prevents partial JSON corruption on TCP retry
+- Fix(P1): set_arrangement_automation fallback copies notes + deletes original clip to avoid silent duplication
+- Fix(P2): get_arrangement_clips reports effective length based on loop_end, not raw timeline length
+- 2 new connection tests for recv_buf corruption
+- 257 tests passing
+
+## 1.9.4 — Doc Sync + M4L Analyzer Fix + Full Validation (March 2026)
+
+**178 tools, all validated live in Ableton. M4L analyzer fully working.**
+
+- Fix: multislider `settype` 0→1 (integer→float) — spectrum bars now render correctly
+- Fix: added `loadbang → 1 → snapshot~` init chain for reliable auto-output
+- Fix: panel z-order for visible UI in presentation mode
+- Binary-patch `openinpresentation` for presentation mode
+- Rebuilt .amxd with v1.9 bridge (3 new plugin parameter commands frozen)
+- Full live validation: 77 PASS across all 17 domains, FluCoMa 6/6 streams, 255 pytest passing
+
+## 1.9.0 — Scene Matrix, Freeze/Flatten, Plugin Deep Control (March 2026)
+
+**10 new tools (168 → 178), 3 features shipped.**
+
+### Scene Matrix Operations (+4 tools)
+- `get_scene_matrix` — full N×M clip grid with states (empty/stopped/playing/triggered/recording)
+- `fire_scene_clips` — fire a scene with optional track filter for selective launching
+- `stop_all_clips` — stop all playing clips in the session (panic button)
+- `get_playing_clips` — return all currently playing or triggered clips
+
+### Track Freeze/Flatten (+3 tools)
+- `freeze_track` — freeze a track (render devices to audio for CPU savings)
+- `flatten_track` — flatten a frozen track (commit rendered audio permanently)
+- `get_freeze_status` — check if a track is frozen
+
+### Plugin Parameter Mapping (+3 tools, M4L)
+- `get_plugin_parameters` — get ALL VST/AU plugin parameters including unconfigured ones
+- `map_plugin_parameter` — add a plugin parameter to Ableton's Configure list for automation
+- `get_plugin_presets` — list a plugin's internal presets and banks
+
+### Infrastructure
+- `SLOW_WRITE_COMMANDS` set for freeze_track (35s timeout vs 15s for normal writes)
+- Removed "Coming" section from README — all roadmap features shipped or dropped
+
+## 1.8.4 — Bug Fix Audit (March 2026)
+
+**5 bugs fixed (2 P1, 3 P2), verified live in Ableton.**
+
+### P1 — Safety-Critical
+- Fix: `create_arrangement_clip` no longer hangs Ableton when `loop_length` is zero or negative — validation at MCP + Remote Script layers
+- Fix: `import_midi_to_clip` now preserves the MIDI file's beat grid instead of scaling by session tempo — a 60 BPM MIDI imported at 120 BPM no longer doubles note positions
+
+### P2 — Correctness
+- Fix: `create_arrangement_clip` now sets `loop_end` on duplicated clips when `loop_length < source_length`, with documented LOM limitation for arrangement clip resizing
+- Fix: `--status` / `--doctor` CLI commands no longer report success for error responses — only resolves true on valid pong
+- Fix: `import_midi_to_clip` with `create_clip=True` now checks for existing clips before creating — clears notes if occupied, creates if empty
+
+### Tests
+- 2 new tests for MIDI tempo independence (`test_midi_io.py::TestImportTempoIndependence`)
+- 255 total tests passing
+
+## 1.8.3 — FluCoMa Wiring + Analyzer Fix (March 2026)
+
+- Fix: wire 6 FluCoMa DSP objects into LivePilot_Analyzer.maxpat (spectral shape, mel bands, chroma, loudness, onset, novelty)
+- Fix: onset/novelty Python handlers now accept 1 arg (fluid.onsetfeature~/noveltyfeature~ output single float)
+- Fix: restore .amxd after binary corruption — .amxd must be rebuilt via Max editor, not programmatic JSON editing
+- Fix: panel z-order in .maxpat — move background panel first in boxes array so multislider renders on top
+- FluCoMa perception tools now fully functional when FluCoMa package is installed
+- Note: after installing, rebuild .amxd from .maxpat via Max editor (see BUILD_GUIDE.md)
+
+## 1.8.1 — Patch (March 2026)
+
+- Fix: `parse_key()` now accepts shorthand key notation ("Am", "C#m", "Bbm") in addition to "A minor" / "C# major"
+- Fix: re-freeze LivePilot_Analyzer.amxd with v1.8.0 bridge + patch openinpresentation
+- Fix: address audit findings from fresh v1.8 code review
+- Fix: update bridge version string
+- Fix: restructure plugin directory for Claude Code marketplace compatibility (`plugin/` → `livepilot/.claude-plugin/`)
+
+## 1.8.0 — Perception Layer (March 2026)
+
+**13 new tools (155 → 168), 1 new domain (perception), FluCoMa real-time DSP, offline audio analysis, audio capture.**
+
+### Perception Domain (4 tools)
+- `analyze_loudness` — LUFS, sample peak, RMS, crest factor, LRA, streaming compliance
+- `analyze_spectrum_offline` — spectral centroid, rolloff, flatness, bandwidth, 5-band balance
+- `compare_to_reference` — mix vs reference: loudness/spectral/stereo deltas + suggestions
+- `read_audio_metadata` — format, duration, sample rate, tags, artwork detection
+
+### Analyzer — Capture (2 tools)
+- `capture_audio` — record master output to WAV via M4L buffer~/record~
+- `capture_stop` — cancel in-progress capture
+
+### Analyzer — FluCoMa Real-Time (7 tools)
+- `get_spectral_shape` — 7 descriptors (centroid, spread, skewness, kurtosis, rolloff, flatness, crest)
+- `get_mel_spectrum` — 40-band mel spectrum (5x resolution of get_master_spectrum)
+- `get_chroma` — 12 pitch class energies for chord detection
+- `get_onsets` — real-time onset/transient detection
+- `get_novelty` — spectral novelty for section boundary detection
+- `get_momentary_loudness` — EBU R128 momentary LUFS + peak
+- `check_flucoma` — verify FluCoMa installation status
+
+### Architecture
+- New `_perception_engine.py` — pure scipy/pyloudnorm/soundfile/mutagen analysis (no MCP deps)
+- New `perception.py` — 4 MCP tool wrappers with format validation
+- 6 FluCoMa OSC handlers in SpectralReceiver (`/spectral_shape`, `/mel_bands`, `/chroma`, `/onset`, `/novelty`, `/loudness`)
+- Dedicated `/capture_complete` channel with `_capture_future` (separate from bridge responses)
+- `--setup-flucoma` CLI command — auto-downloads and installs FluCoMa Max package
+- New dependencies: pyloudnorm, soundfile, scipy, mutagen
+
+## 1.7.0 — Creative Engine (March 2026)
+
+**13 new tools (142 → 155), 3 new domains, MIDI file I/O, neo-Riemannian harmony, generative algorithms.**
+
+### MIDI I/O Domain (4 tools)
+- `export_clip_midi` — export session clip to .mid file
+- `import_midi_to_clip` — load .mid file into session clip
+- `analyze_midi_file` — offline analysis of any .mid file
+- `extract_piano_roll` — 2D velocity matrix from .mid file
+
+### Generative Domain (5 tools)
+- `generate_euclidean_rhythm` — Bjorklund algorithm, identifies known rhythms
+- `layer_euclidean_rhythms` — stack patterns for polyrhythmic textures
+- `generate_tintinnabuli` — Arvo Pärt technique: triad voice from melody
+- `generate_phase_shift` — Steve Reich technique: drifting canon
+- `generate_additive_process` — Philip Glass technique: expanding melody
+
+### Harmony Domain (4 tools)
+- `navigate_tonnetz` — PRL neighbors in harmonic space
+- `find_voice_leading_path` — shortest path between two chords through Tonnetz
+- `classify_progression` — identify neo-Riemannian transform pattern
+- `suggest_chromatic_mediants` — all chromatic mediant relations with film score picks
+
+### Architecture
+- Two new pure Python engines (`_generative_engine.py`, `_harmony_engine.py`)
+- New dependencies: midiutil, pretty-midi, opycleid (~5 MB total, lazy-loaded)
+- Opycleid fallback: harmony tools work without the package via pure Python PRL
+- All generative tools return note arrays — LLM orchestrates placement
+
+## 1.6.5 — Drop music21 (March 2026)
+
+**Theory tools rewritten with zero-dependency pure Python engine.**
+
+- Replace music21 (~100MB) with built-in `_theory_engine.py` (~350 lines)
+- Krumhansl-Schmuckler key detection with 7 mode profiles (major, minor, dorian, phrygian, lydian, mixolydian, locrian)
+- All 7 theory tools keep identical APIs and return formats
+- Zero external dependencies — theory tools work on every install
+- 2-3s faster cold start (no music21 import overhead)
+
+## 1.6.4 — Music Theory (March 2026)
+
+**7 new tools (135 -> 142), theory analysis on live MIDI clips.**
+
+### Theory Domain (7 tools)
+- `analyze_harmony` — chord-by-chord Roman numeral analysis of session clips
+- `suggest_next_chord` — theory-valid chord continuations with style presets (common_practice, jazz, modal, pop)
+- `detect_theory_issues` — parallel fifths/octaves, out-of-key notes, voice crossing, unresolved dominants
+- `identify_scale` — Krumhansl-Schmuckler key/mode detection with confidence-ranked alternatives
+- `harmonize_melody` — 2 or 4-voice SATB harmonization with smooth voice leading
+- `generate_countermelody` — species counterpoint (1st or 2nd species) against a melody
+- `transpose_smart` — diatonic or chromatic transposition preserving scale relationships
+
+### Architecture
+- Pure Python `_theory_engine.py`: Krumhansl-Schmuckler key detection, Roman numeral analysis, voice leading checks
+- Chordify bridge: groups notes by quantized beat position (1/32 note grid)
+- Key hint parsing: handles "A minor", "F# major", enharmonic normalization
+
+## 1.6.3 — Audit Hardening (March 2026)
+
+- Fix: cursor aliasing in M4L bridge `walk_device` — nested rack traversal now reads chain/pad counts before recursion clobbers shared cursors
+- Fix: `clip_automation.py` — use `get_clip()` for bounds-checked access, add negative index guards, proper validation in `clear_clip_automation`
+- Fix: `set_clip_loop` crash when `enabled` param omitted
+- Fix: Brownian curve reflection escaping [0,1] for large volatility
+- Fix: division by zero in M4L bridge when `sample_rate=0`
+- Fix: `technique_store.get()` shallow copy allows shared mutation — now uses deepcopy
+- Fix: `asyncio.get_event_loop()` deprecation — use `get_running_loop()` (Python 3.12+)
+- Fix: dead code in `browser.py`, stale tool counts in docs (107 → 115 core)
+- Fix: wrong param name in tool-reference docs (`soloed` → `solo`)
+- Fix: social banner missing "automation" domain (11 → 12)
+- Fix: tautological spring test, dead automation contract test, misleading clips test
+- Add: `livepilot-release` skill registered in plugin.json
+- Add: `__version__` to Remote Script `__init__.py`
+
+## 1.6.2 — Automation Params Fix (March 2026)
+
+- Fix: expose all curve-specific params in `generate_automation_curve` and `apply_automation_shape` MCP tools — `values` (steps), `hits`/`steps` (euclidean), `seed`/`drift`/`volatility` (organic), `damping`/`stiffness` (spring), `control1`/`control2` (bezier), `easing_type`, `narrowing` (stochastic)
+- Fix: `analyze_for_automation` spectral getter used wrong method (`.get_spectrum()` → `.get("spectrum")`)
+
+## 1.6.1 — Hotfix (March 2026)
+
+- Fix: `clip_automation.py` imported `register` from `utils` instead of `router`, causing Remote Script to fail to load in Ableton (LivePilot disappeared from Control Surface list)
+
+## 1.6.0 — Automation Intelligence (March 2026)
+
+**8 new tools (127 -> 135), 16-type curve engine, 15 recipes, spectral feedback loop.**
+
+### Automation Curve Engine
+- 16 curve types in 4 categories: basic (9), organic (3), shape (2), generative (2)
+- Pure math module — no Ableton dependency, fully testable offline
+- 15 built-in recipes for common production techniques
+
+### New Tools: Automation Domain (8 tools)
+- `get_clip_automation` — list automation envelopes on a session clip
+- `set_clip_automation` — write automation points to clip envelope
+- `clear_clip_automation` — clear automation envelopes
+- `apply_automation_shape` — generate + apply curve in one call
+- `apply_automation_recipe` — apply named recipe (filter_sweep_up, dub_throw, etc.)
+- `get_automation_recipes` — list all 15 recipes with descriptions
+- `generate_automation_curve` — preview curve points without writing
+- `analyze_for_automation` — spectral analysis + device-aware suggestions
+
+### Automation Atlas
+- Knowledge corpus: curve theory, perception-action loop, genre recipes
+- Diagnostic filter technique: using EQ as a measurement instrument
+- Cross-track spectral mapping for complementary automation
+- Golden rules for musically intelligent automation
+
+### Producer Agent
+- New automation phase in production workflow
+- Mandatory spectral feedback loop: perceive -> diagnose -> act -> verify -> adjust
+- Spectral-driven automation decisions, not just blind curve application
+
+---
+
+## 1.5.0 — Agentic Production System (March 19, 2026)
+
+**Three-layer intelligence: Device Atlas + M4L Analyzer + Technique Memory.**
+
+LivePilot is no longer just a tool server. v1.5.0 reframes the architecture around three layers that give the AI context beyond raw API access:
+
+### Device Atlas
+- Structured knowledge corpus of 280+ Ableton devices, 139 drum kits, 350+ impulse responses
+- Indexed by category with sonic descriptions, parameter guides, and real browser URIs
+- The agent consults the atlas before loading any device — no more hallucinated preset names
+
+### M4L Analyzer (new in v1.1.0, now integrated into the agentic workflow)
+- 8-band spectral analysis, RMS/peak metering, pitch tracking, key detection on the master bus
+- The agent reads the spectrum after mixing moves to verify results
+- Key detection informs harmonic content decisions (bass lines, chord voicings)
+
+### Technique Memory
+- Persistent production decisions across sessions: beat patterns, device chains, mix templates, preferences
+- `memory_recall` matches on mood, genre, texture — not just names
+- The agent consults memory by default before creative decisions, building a profile of the user's taste over time
+
+### Producer Agent
+- Updated to use all three layers: atlas for instrument selection, analyzer for verification, memory for style context
+- Mandatory health checks between stages now include spectral verification when the analyzer is present
+
+### Documentation
+- README rewritten around the three-layer architecture
+- Manual updated with agentic approach section
+- Skill description reflects the full stack: tools + atlas + analyzer + memory
+- Comparison table updated to highlight knowledge, perception, and memory as differentiators
+
+---
+
+## 1.1.0 — M4L Bridge & Deep LOM Access (March 18-19, 2026)
+
+**23 new tools (104 -> 127), M4L Analyzer device, deep LiveAPI access via Max for Live bridge.**
+
+### M4L Bridge Architecture
+- New `LivePilot_Analyzer.amxd` Max for Live Audio Effect for the master track
+- UDP/OSC bridge: port 9880 (M4L -> Server), port 9881 (Server -> M4L)
+- `livepilot_bridge.js` with 22 bridge commands for deep LOM access
+- `SpectralCache` with thread-safe, time-expiring data storage (5s max age)
+- Graceful degradation: all 104 core tools work without the analyzer device
+- Base64-encoded JSON responses with chunked transfer for large payloads (>1400 bytes)
+- OSC addresses sent WITHOUT leading `/` to fix Max `udpreceive` messagename dispatch
+
+### New Tools: Analyzer Domain (20 tools)
+
+**Spectral Analysis (3):**
+- `get_master_spectrum` — 8-band frequency analysis (sub/low/low-mid/mid/high-mid/high/presence/air)
+- `get_master_rms` — real-time RMS, peak, and pitch from the master bus
+- `get_detected_key` — Krumhansl-Schmuckler key detection algorithm on accumulated pitch data
+
+**Deep LOM Access (4):**
+- `get_hidden_parameters` — all device parameters including hidden ones not in ControlSurface API
+- `get_automation_state` — automation state for all parameters (active/overridden)
+- `walk_device_tree` — recursive device chain tree walking (racks, drum pads, nested devices, 6 levels deep)
+- `get_display_values` — human-readable parameter values as shown in Live's UI (e.g., "440 Hz", "-6.0 dB")
+
+**Simpler Operations (7):**
+- `replace_simpler_sample` — load audio file into Simpler by absolute path (requires existing sample)
+- `load_sample_to_simpler` — full workflow: bootstrap Simpler via browser, then replace sample
+- `get_simpler_slices` — get slice point positions (frames and seconds) from Simpler
+- `crop_simpler` — crop sample to active region
+- `reverse_simpler` — reverse sample in Simpler
+- `warp_simpler` — time-stretch sample to fit N beats at current tempo
+- `get_clip_file_path` — get audio file path on disk for a clip
+
+**Warp Markers (4):**
+- `get_warp_markers` — get all warp markers (beat_time + sample_time) from audio clips
+- `add_warp_marker` — add warp marker at beat position
+- `move_warp_marker` — move warp marker to new beat position (tempo manipulation)
+- `remove_warp_marker` — remove warp marker at beat position
+
+**Clip Preview (2):**
+- `scrub_clip` — scrub/preview clip at specific beat position
+- `stop_scrub` — stop scrub preview
+
+### New Tools: Mixing Domain (3 tools)
+- `get_track_routing` — get input/output routing info for a track
+- `set_track_routing` — set input/output routing by display name
+- `get_mix_snapshot` — one-call full mix state (all meters, volumes, pans, sends, master)
+
+### Bugs Fixed
+
+**M4L Bridge Fixes:**
+- OSC addresses: removed leading `/` from outgoing commands — Max `udpreceive` passes the `/` as part of the messagename to JS, breaking the dispatch switch statement
+- `str_for_value` requires `call()` not `get()` — it's a function, not a property in Max JS LiveAPI
+- `warp_markers` is a dict property returning a JSON string, not LOM children — requires `JSON.parse()` on the raw `get()` result
+- `SimplerDevice.slices` lives on the `sample` child object (`device sample slices`), not on the device directly
+- `replace_sample` only works on Simplers that already have a sample loaded — silently fails on empty Simplers
+- `get()` in Max JS LiveAPI always returns arrays — must index or convert appropriately
+- `openinpresentation` attribute in .amxd doesn't persist from Max editor saves — requires binary patching
+
+**M4L Analyzer Display Fixes:**
+- Injected `settype Float` messages to fix spectrum bar display (was showing integer 0/1)
+- Fixed `vexpr` scaling factor from 10 to 200 for proper bar visualization range
+- Fixed freeze/JS caching: Max freezes JS from its search path cache (`~/Documents/Max 8/...`), not from the source file directory
+
+**Tool Fixes:**
+- Fixed key detection passthrough from streaming cache to bridge query fallback
+- Fixed parameter name case-sensitivity in hidden parameter reads
+- Fixed input validation on several analyzer tools (missing clip/track validation)
+- Fixed `load_sample_to_simpler` bootstrap: searches browser for any sample, loads it to create Simpler, then replaces
+
+### LiveAPI Insights Documented
+- `get()` returns arrays in Max JS LiveAPI (even for scalar properties)
+- `call()` vs `get()` distinction for functions vs properties
+- `.amxd` binary format: 24-byte `ampf` header + `ptch` chunk + `mx@c` header + JSON patcher + frozen dependencies
+- Binary patching technique: same-byte-count string replacements preserve file structure
+- Max freezes JS from cache path, not source directory — must copy to `~/Documents/Max 8/`
+
+### Technical
+- New `mcp_server/m4l_bridge.py` module: `SpectralCache`, `SpectralReceiver`, `M4LBridge` classes
+- New `mcp_server/tools/analyzer.py`: 20 MCP tools for the analyzer domain
+- New `m4l_device/livepilot_bridge.js`: 22 bridge commands
+- New `m4l_device/LivePilot_Analyzer.amxd`: compiled M4L device
+
+---
+
+## 1.0.0 — LivePilot
+
+**AI copilot for Ableton Live 12 — 104 MCP tools for real-time music production.**
+
+### Core
+- 104 MCP tools across 10 domains: transport, tracks, clips, notes, devices, scenes, mixing, browser, arrangement, memory
+- Remote Script using Ableton's official Live Object Model API (ControlSurface base class)
+- JSON over TCP, newline-delimited, port 9878
+- Structured errors with codes: INDEX_ERROR, NOT_FOUND, INVALID_PARAM, STATE_ERROR, TIMEOUT, INTERNAL
+
+### Browser & Device Loading
+- Breadth-first device search with exact-match priority
+- Plugin browser support (AU/VST/AUv3) via `search_browser("plugins")`
+- Max for Live browser via `search_browser("max_for_live")`
+- URI-based loading with category hint parsing for fast resolution
+- Case-insensitive parameter name matching
+
+### Arrangement
+- Full arrangement view support: create clips, add/remove/modify notes, automation envelopes
+- Automation on device parameters, volume, panning, and sends
+- Support for return tracks and master track across all tools
+
+### Plugin
+- 5 slash commands: /beat, /mix, /sounddesign, /session, /memory
+- Producer agent for autonomous multi-step tasks
+- Technique memory system (learn, recall, replay, favorite)
+- Built-in Device Atlas covering native Ableton instruments and effects
+
+### Installer
+- Auto-detects Ableton Remote Scripts path on macOS and Windows
+- Copies Remote Script files, verifies installation

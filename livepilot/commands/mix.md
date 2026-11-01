@@ -1,0 +1,47 @@
+---
+name: mix
+description: Mixing assistant — analyze and balance track levels, panning, and sends
+---
+
+Help the user mix their session using the V2 orchestration pipeline.
+
+## Orchestration Flow
+
+1. **Session kernel** — `get_session_kernel(request_text=<user's request>, mode="improve")` for the full turn snapshot
+2. **Route** — `route_request(<user's request>)` to get engine routes + semantic move recommendations
+3. **Ensure analyzer** — call `ensure_analyzer_on_master` before trusting spectral reads. If it returns `install_required`, call `install_m4l_device(source_path="<repo>/m4l_device/LivePilot_Analyzer.amxd")` and retry. If it warns that the analyzer is not last on master, tell the user and treat spectral data as untrusted until it is repaired. If the bridge is disconnected, try `reconnect_bridge`.
+
+## Analysis Phase
+
+4. **Quick status** — `get_mix_summary` for track count, dynamics, stereo, issues
+5. **Run critics** — `get_mix_issues` for problems. `get_masking_report` for frequency collisions.
+6. **Spectral check** — `get_master_spectrum` for 9-band balance (sub_low → air). Genre targets:
+   - Hip-hop: sub/sub_low dominant, centroid 400-800 Hz
+   - Electronic / microhouse: sub_low carries the kick (Villalobos), centroid 800-1500 Hz
+   - Ambient: mid-focused, low sub_low + sub, centroid 500-1000 Hz
+7. **Musical intelligence** — `detect_role_conflicts` to find tracks competing for the same space. `detect_repetition_fatigue` if arrangement feels stale.
+
+## Decision Phase
+
+8. **Propose semantic moves** — `propose_next_best_move(request_text=<user's request>)` for ranked suggestions (e.g., `make_punchier`, `widen_stereo`, `tighten_low_end`)
+9. **Preview chosen move** — `preview_semantic_move(move_id)` to see the full compile plan before executing
+10. **Rank by taste** — if user has history, `rank_moves_by_taste(move_specs)` to personalize ordering
+
+## Execution Phase
+
+11. **Compile for approval** — `apply_semantic_move(move_id, mode="improve")` returns the compiled plan without executing it. Present the concrete steps to the user. After approval, execute the returned steps individually and verify each write.
+12. **Verify after EVERY change** — read `value_string` in response, call `get_track_meters(include_stereo=true)`, check no track went silent
+13. **Capture + analyze** — `capture_audio` then `analyze_loudness` for LUFS/LRA, `analyze_spectrum_offline` for centroid/balance
+14. **Evaluate** — `evaluate_mix_move` with before/after snapshots. If `keep_change` is false, `undo` immediately.
+
+## Summary
+
+15. **Report** — "What I did / what improved / what I protected / what remains"
+16. **Session memory** — `add_session_memory` for notable decisions
+17. **Taste update** — successful moves update the TasteGraph automatically
+
+For deeper critic-driven iterative improvement, use the livepilot-mix-engine skill.
+
+## Branch-Native Exploratory Mode
+
+When the user asks for multiple options or is vague about direction ("try a few things", "I don't know what's wrong — just make it better", "what would you do?"), use Flow B from livepilot-core SKILL.md. Build 2-3 `create_experiment` seeds with different angles — for example one `semantic_move` seed for a conventional fix, one `freeform` seed for an unconventional approach (sidechain from an unexpected source, mid/side EQ instead of stereo EQ, etc.), one `synthesis` seed if the root cause is instrument-level (PR9+). Set `get_session_kernel(freshness=0.7)` to nudge branches away from the safest option.

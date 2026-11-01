@@ -1,0 +1,705 @@
+"""FastMCP entry point for LivePilot."""
+
+from contextlib import asynccontextmanager
+import asyncio
+import logging
+import os
+import subprocess
+
+from fastmcp import FastMCP, Context  # noqa: F401
+
+from .connection import AbletonConnection
+from .m4l_bridge import SpectralCache, SpectralReceiver, M4LBridge, MidiToolCache
+from .persistence.taste_store import PersistentTasteStore
+
+# Logger must be defined before any function uses it — several module-level
+# helpers below (e.g. _master_has_livepilot_analyzer) call logger.debug on
+# the import-time code path, so defining logger later raised NameError when
+# those helpers fired from a tool module's module-level init.
+logger = logging.getLogger(__name__)
+
+_public_tool_surface_configured = False
+
+
+def _identify_port_holder(port: int) -> str | None:
+    """Identify which process holds the given UDP port (for logging only).
+
+    Returns a string like "PID 12345 (python3 mcp_server)" or None if
+    identification fails. Never kills or modifies the holder.
+    """
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-t", "-i", f"UDP:{port}"],
+            text=True,
+            timeout=3,
+        ).strip()
+        my_pid = os.getpid()
+        for pid_str in out.splitlines():
+            pid = int(pid_str)
+            if pid != my_pid:
+                try:
+                    cmdline = subprocess.check_output(
+                        ["ps", "-p", str(pid), "-o", "command="],
+                        text=True, timeout=2,
+                    ).strip()
+                    return f"{pid} ({cmdline[:60]})"
+                except (subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                        FileNotFoundError):
+                    return str(pid)
+        return None
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            ValueError):
+        # TimeoutExpired catches the busy-system case where lsof exceeds
+        # the 3-second budget; we treat it as "can't identify" and return
+        # None so startup never stalls for slow host diagnostics.
+        return None
+
+
+def _check_remote_script_version(ableton: AbletonConnection) -> None:
+    """BUG-A1: detect stale Remote Script installs at startup.
+
+    The installed Remote Script is loaded by Ableton at its own launch time
+    and cached in Python's module system — source-tree edits don't take
+    effect until the user reinstalls + restarts Live. When the installed
+    copy lags behind the MCP-server source, commands added after the install
+    date (e.g. ``insert_device`` in v1.10.6) return "Unknown command type".
+
+    This check pings the Remote Script, compares its reported version to
+    the MCP server version, and logs a loud warning on mismatch. We don't
+    abort — the server should still work for whatever handlers the older
+    Remote Script does support — but we make the drift visible.
+    """
+    import sys
+
+    try:
+        from . import __version__ as mcp_version
+    except ImportError:
+        mcp_version = "unknown"
+
+    try:
+        pong = ableton.send_command("ping")
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "Remote Script version check failed: %s", exc,
+        )
+        return
+
+    if not isinstance(pong, dict):
+        return
+    rs_version = pong.get("remote_script_version")
+    if rs_version is None:
+        # Remote Script is old enough that it doesn't even embed its version
+        # in ping responses — definitely stale.
+        msg = (
+            "LivePilot: Remote Script is out of date (pre-version-handshake). "
+            "Run 'npx livepilot --install' and restart Ableton Live to fix "
+            "'Unknown command type' errors for newer tools (insert_device, "
+            "set_clip_pitch, etc)."
+        )
+        print(msg, file=sys.stderr)
+        return
+
+    if str(rs_version) != str(mcp_version):
+        msg = (
+            f"LivePilot: Remote Script version {rs_version} does not match "
+            f"MCP server version {mcp_version}. Newer tools may fail with "
+            f"'Unknown command type'. Run 'npx livepilot --install' and "
+            f"restart Ableton Live to resync."
+        )
+        print(msg, file=sys.stderr)
+
+
+def _master_has_livepilot_analyzer(ableton: AbletonConnection) -> bool:
+    """Check whether the analyzer device is currently on the master track."""
+    try:
+        track = ableton.send_command("get_master_track")
+    except Exception as exc:
+        logger.debug("_master_has_livepilot_analyzer failed: %s", exc)
+        return False
+    devices = track.get("devices", []) if isinstance(track, dict) else []
+    for device in devices:
+        normalized = " ".join(
+            str(device.get("name") or "").replace("_", " ").replace("-", " ").lower().split()
+        )
+        if normalized == "livepilot analyzer":
+            return True
+    return False
+
+
+async def _warm_analyzer_bridge(
+    ableton: AbletonConnection,
+    spectral: SpectralCache,
+    timeout: float = 3.0,
+) -> None:
+    """Give the analyzer stream a short startup window before first use."""
+    # _master_has_livepilot_analyzer does a blocking TCP round-trip — run it
+    # off the event-loop thread so a slow Ableton can't stall startup.
+    if not await asyncio.to_thread(_master_has_livepilot_analyzer, ableton):
+        return
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(timeout, 0.0)
+    while loop.time() < deadline:
+        if spectral.is_connected:
+            return
+        await asyncio.sleep(0.05)
+
+
+def _bind_session_continuity(ableton: AbletonConnection) -> None:
+    """Hydrate the session-continuity tracker from persistent per-project state.
+
+    Fetches a minimal session fingerprint (tempo, signature, track/scene
+    layout) from the Remote Script, computes a project hash, and asks the
+    tracker to bind the matching ProjectStore + restore any previously-saved
+    creative threads and turn resolutions from disk.
+
+    Never raises: startup must succeed even if Ableton isn't reachable. In
+    that case, the tracker stays in-memory and the first ``record_turn_*`` /
+    ``open_thread`` call will lazy-bind via ``ensure_project_store_bound()``.
+    """
+    try:
+        from .session_continuity.tracker import bind_project_store_from_session
+
+        info = ableton.send_command("get_session_info")
+        if isinstance(info, dict) and not info.get("error"):
+            bind_project_store_from_session(info)
+    except Exception as exc:
+        logger.debug("_bind_session_continuity: lazy-bind (reason: %s)", exc)
+
+
+async def _run_optional_startup(
+    ableton: AbletonConnection,
+    spectral: SpectralCache,
+    bridge_state: dict,
+    splice_client,
+) -> None:
+    """Prime optional integrations without delaying MCP availability."""
+
+    async def _prime_splice() -> None:
+        try:
+            await splice_client.connect()
+        except Exception as exc:
+            logger.debug("Splice startup connection unavailable: %s", exc)
+
+    async def _prime_ableton() -> None:
+        try:
+            await asyncio.to_thread(_check_remote_script_version, ableton)
+            if bridge_state["transport"] is not None:
+                await _warm_analyzer_bridge(ableton, spectral)
+            await asyncio.to_thread(_bind_session_continuity, ableton)
+        except Exception as exc:
+            logger.debug("Ableton optional startup unavailable: %s", exc)
+
+    await asyncio.gather(_prime_splice(), _prime_ableton())
+
+
+@asynccontextmanager
+async def lifespan(server):
+    """Create and yield the shared AbletonConnection + M4L bridge + registries."""
+    from .runtime.mcp_dispatch import build_mcp_dispatch_registry
+    from .splice_client.client import SpliceGRPCClient
+
+    ableton = AbletonConnection()
+    spectral = SpectralCache()
+    miditool = MidiToolCache()
+    receiver = SpectralReceiver(spectral, miditool_cache=miditool)
+    m4l = M4LBridge(spectral, receiver, miditool_cache=miditool)
+    # Publish the shared-secret token that 1.28+ frozen analyzers validate
+    # on every OSC 9881 command (LAN-exposure fix). Legacy devices ignore
+    # the file entirely; a failed write just keeps the untokened path.
+    # See docs/PENDING_AMXD_REFREEZE.md.
+    await asyncio.to_thread(m4l.publish_auth_token)
+    mcp_dispatch = build_mcp_dispatch_registry()
+
+    # Splice gRPC client — connected in the optional background primer below.
+    # Sample tools also reconnect lazily, so MCP startup never waits on the
+    # desktop app being unavailable.
+    splice_client = SpliceGRPCClient()
+
+    # Start UDP listener for incoming M4L spectral data (port 9880)
+    loop = asyncio.get_running_loop()
+    transport = None
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: receiver,
+            local_addr=('127.0.0.1', 9880),
+        )
+    except OSError:
+        # Port 9880 already bound — another LivePilot instance is running.
+        # Degrade gracefully. The reconnect_bridge tool can retry later
+        # if the other instance is stopped.
+        import sys
+        # _identify_port_holder runs two blocking subprocess.check_output
+        # calls (lsof + ps) — offload so a slow/busy host can't stall the
+        # event loop during startup, same as the neighboring lifespan calls.
+        holder_info = await asyncio.to_thread(_identify_port_holder, 9880)
+        print(
+            "LivePilot: UDP port 9880 already in use%s — "
+            "analyzer/bridge tools unavailable at startup. "
+            "Use the reconnect_bridge tool after stopping the other instance, "
+            "or restart this server."
+            % (f" (PID {holder_info})" if holder_info else ""),
+            file=sys.stderr,
+        )
+        transport = None
+
+    # Store transport + loop so tools can attempt reconnection mid-session
+    bridge_state = {
+        "transport": transport,
+        "loop": loop,
+        "receiver": receiver,
+    }
+
+    # Version check, analyzer warm-up, project binding, and Splice discovery
+    # are valuable but optional. Run them after the server becomes callable;
+    # every dependent tool already has a lazy/degraded path.
+    startup_task = asyncio.create_task(
+        _run_optional_startup(ableton, spectral, bridge_state, splice_client)
+    )
+
+    try:
+        yield {
+            "ableton": ableton,
+            "spectral": spectral,
+            "miditool": miditool,
+            "m4l": m4l,
+            "_bridge_state": bridge_state,
+            "mcp_dispatch": mcp_dispatch,
+            "splice_client": splice_client,
+            "_startup_task": startup_task,
+            # Persistent taste backing so dimension weights / anti-preferences
+            # survive a server restart (P2-29). Keyed "persistent_taste" to match
+            # the existing wonder/runtime/preview_studio setdefault callers so all
+            # tools share ONE instance. Only present on the live server; tests
+            # construct their own context without it → session-only taste.
+            "persistent_taste": PersistentTasteStore(),
+        }
+    finally:
+        # Let the bounded transport checks settle before closing shared clients.
+        # This affects shutdown only; initial MCP availability is immediate.
+        try:
+            await startup_task
+        except Exception as exc:
+            logger.debug("optional startup task ended during shutdown: %s", exc)
+        if bridge_state["transport"]:
+            bridge_state["transport"].close()
+        m4l.close()
+        ableton.disconnect()
+        try:
+            await splice_client.disconnect()
+        except Exception as exc:
+            logger.debug("lifespan failed: %s", exc)
+# Report LivePilot's own version in the MCP initialize handshake. Without
+# this, serverInfo.version reports the FastMCP *library* version (e.g.
+# "3.4.7"), which clients reasonably mistake for the LivePilot build --
+# making a stock install look like an unknown fork.
+from . import __version__ as _livepilot_version  # noqa: E402
+
+mcp = FastMCP("LivePilot", lifespan=lifespan, version=_livepilot_version)
+
+# Import tool modules so they register with `mcp`
+from .tools import transport    # noqa: F401, E402
+from .tools import tracks       # noqa: F401, E402
+from .tools import clips        # noqa: F401, E402
+from .tools import notes        # noqa: F401, E402
+from .tools import devices      # noqa: F401, E402
+from .tools import scenes       # noqa: F401, E402
+from .tools import scales       # noqa: F401, E402
+from .tools import follow_actions  # noqa: F401, E402
+from .tools import grooves      # noqa: F401, E402
+from .tools import take_lanes   # noqa: F401, E402
+from .tools import mixing       # noqa: F401, E402
+from .tools import browser      # noqa: F401, E402
+from .tools import arrangement  # noqa: F401, E402
+from .tools import memory       # noqa: F401, E402
+from .tools import analyzer     # noqa: F401, E402
+from .tools import automation   # noqa: F401, E402
+from .tools import theory       # noqa: F401, E402
+from .tools import generative   # noqa: F401, E402
+from .tools import harmony      # noqa: F401, E402
+from .tools import midi_io      # noqa: F401, E402
+from .tools import perception   # noqa: F401, E402
+from .tools import agent_os     # noqa: F401, E402
+from .tools import composition  # noqa: F401, E402
+from .tools import motif         # noqa: F401, E402
+from .tools import research      # noqa: F401, E402
+from .tools import planner       # noqa: F401, E402
+from .project_brain import tools as project_brain_tools  # noqa: F401, E402
+from .runtime import tools as runtime_tools              # noqa: F401, E402
+from .runtime import action_tools as action_ledger_tools  # noqa: F401, E402
+from .evaluation import tools as evaluation_tools  # noqa: F401, E402
+from .memory import tools as memory_fabric_tools   # noqa: F401, E402
+from .mix_engine import tools as mix_engine_tools  # noqa: F401, E402
+from .sound_design import tools as sound_design_tools      # noqa: F401, E402
+from .transition_engine import tools as transition_tools   # noqa: F401, E402
+from .reference_engine import tools as reference_tools     # noqa: F401, E402
+from .translation_engine import tools as translation_tools  # noqa: F401, E402
+from .performance_engine import tools as performance_tools  # noqa: F401, E402
+from .runtime import safety_tools  # noqa: F401, E402
+from .semantic_moves import tools as semantic_move_tools  # noqa: F401, E402
+from .experiment import tools as experiment_tools         # noqa: F401, E402
+from .musical_intelligence import tools as musical_intel_tools  # noqa: F401, E402
+from .song_brain import tools as song_brain_tools              # noqa: F401, E402
+from .preview_studio import tools as preview_studio_tools      # noqa: F401, E402
+from .hook_hunter import tools as hook_hunter_tools            # noqa: F401, E402
+from .stuckness_detector import tools as stuckness_tools       # noqa: F401, E402
+from .wonder_mode import tools as wonder_mode_tools            # noqa: F401, E402
+from .session_continuity import tools as session_cont_tools    # noqa: F401, E402
+from .creative_constraints import tools as constraints_tools   # noqa: F401, E402
+from .creative_director import tools as creative_director_tools  # noqa: F401, E402
+from .device_forge import tools as device_forge_tools          # noqa: F401, E402
+from .sample_engine import tools as sample_engine_tools        # noqa: F401, E402
+from .atlas import tools as atlas_tools                        # noqa: F401, E402
+from .composer import tools as composer_tools                  # noqa: F401, E402
+from .synthesis_brain import tools as synthesis_brain_tools    # noqa: F401, E402
+from .user_corpus import tools as user_corpus_tools            # noqa: F401, E402
+from .audit import tools as audit_tools                        # noqa: F401, E402
+from .grader import tools as grader_tools                      # noqa: F401, E402
+from .listening import tools as listening_tools                # noqa: F401, E402
+from .listening import taste_tools as listening_taste_tools   # noqa: F401, E402
+from .tools import diagnostics   # noqa: F401, E402
+from .tools import miditool       # noqa: F401, E402
+
+# ---------------------------------------------------------------------------
+# Schema coercion patch — accept strings for numeric parameters
+# ---------------------------------------------------------------------------
+# Some MCP clients (with deferred tools) send all parameter
+# values as strings.  Their client-side Zod validators reject "0" against
+# {"type": "integer"} before the request even reaches our server.
+#
+# Fix: widen every integer/number property in the advertised JSON Schema to
+# also accept strings.  Server-side Pydantic validation (lax mode) coerces
+# "5" → 5 and "0.75" → 0.75 automatically, so no tool code changes needed.
+# ---------------------------------------------------------------------------
+
+
+def _coerce_schema_property(prop: dict) -> None:
+    """Widen a single JSON Schema property to also accept strings."""
+    if prop.get("type") in ("integer", "number") and "anyOf" not in prop:
+        original_type = prop.pop("type")
+        prop["anyOf"] = [{"type": original_type}, {"type": "string"}]
+    elif "anyOf" in prop:
+        # Skip if this anyOf was already coerced (contains both a numeric and string type)
+        variant_types = {v.get("type") for v in prop["anyOf"] if isinstance(v, dict)}
+        if "string" in variant_types and variant_types & {"integer", "number"}:
+            return
+        for variant in prop["anyOf"]:
+            if isinstance(variant, dict):
+                _coerce_schema_property(variant)
+    # Recurse into array items so list[int]/list[float] params also accept strings
+    if "items" in prop and isinstance(prop["items"], dict):
+        _coerce_schema_property(prop["items"])
+    if "properties" in prop and isinstance(prop["properties"], dict):
+        for nested in prop["properties"].values():
+            if isinstance(nested, dict):
+                _coerce_schema_property(nested)
+    if "$defs" in prop and isinstance(prop["$defs"], dict):
+        for nested in prop["$defs"].values():
+            if isinstance(nested, dict):
+                _coerce_schema_property(nested)
+
+
+def _get_all_tools():
+    """Get all registered tools — defends against FastMCP internal drift.
+
+    FastMCP's public API doesn't expose the registry as of 3.3.x (see
+    docs/FASTMCP_UPSTREAM_FR.md). Until it does, we probe known internal
+    attribute paths. Each probe fires in try/except so a structural
+    rearrangement (e.g. ``_components`` renamed under 3.4+) falls through
+    to the next path rather than exploding.
+
+    WARNING: Accesses FastMCP private internals. Pinned to
+    fastmcp>=4.0.3,<4.1.0 in requirements.txt (verified 2026-09-11: 4.0.3
+    still keeps ``_local_provider._components``). The startup self-test
+    (_assert_tool_registry_accessible) will fail loudly if every probe
+    returns empty — better than silently returning [] and disabling
+    schema coercion.
+    """
+    probes = [
+        # FastMCP 0.x: mcp._tool_manager._tools (dict of name -> Tool)
+        ("_tool_manager._tools", lambda: list(mcp._tool_manager._tools.values())),
+        # FastMCP 3.0–3.3: mcp._local_provider._components
+        # (verified 2026-05-21 against fastmcp 3.3.1 — still the active path)
+        (
+            "_local_provider._components",
+            lambda: list(mcp._local_provider._components.values()),
+        ),
+        # FastMCP 3.4+ speculative: mcp._local_provider._tools (anticipated
+        # rename based on naming conventions in other providers). Verified
+        # 2026-05-21 against fastmcp 3.3.1 — the rename did NOT happen in
+        # 3.3.x; ``_local_provider._components`` remains the live registry.
+        # Kept here so a future bump that DOES rename surfaces a partial
+        # match rather than a full miss.
+        (
+            "_local_provider._tools",
+            lambda: list(mcp._local_provider._tools.values()),
+        ),
+        # NB: mcp.list_tools() IS the public API, but it's a coroutine —
+        # can't be iterated in a sync context. We skip it here and rely on
+        # the internal probes. When FastMCP exposes a sync view we'll add
+        # it back. (Earlier form tried `list(mcp.list_tools())` which
+        # raised `RuntimeWarning: coroutine was never awaited` at every
+        # module import — removed 2026-04-22.)
+    ]
+    # Observation 2026-04-22: some FastMCP 3.x builds keep BOTH the legacy
+    # `_tool_manager._tools` dict AND the newer `_local_provider._components`
+    # registry populated at the same time — but the legacy one lags the
+    # newer one (385 vs 422 during a recent startup). Returning the FIRST
+    # non-empty probe accidentally picked the stale view. Instead, collect
+    # every working probe and return the LARGEST view (the registry with
+    # the most tools is the authoritative one).
+    best: list = []
+    for label, fn in probes:
+        try:
+            tools = fn()
+        except (AttributeError, TypeError):
+            continue
+        except Exception:  # noqa: BLE001 — any error from an internal probe means "skip"
+            continue
+        if tools and len(tools) > len(best):
+            best = tools
+    if best:
+        return best
+
+    # All probes empty. Surface fastmcp version + attempted paths so the
+    # breakage is diagnosable without re-reading the code.
+    import sys
+    try:
+        import fastmcp as _fm
+        fm_version = getattr(_fm, "__version__", "unknown")
+    except Exception:  # noqa: BLE001
+        fm_version = "unknown"
+    print(
+        "LivePilot: ERROR — could not access FastMCP tool registry "
+        f"(fastmcp=={fm_version}). Tried: "
+        + ", ".join(label for label, _ in probes)
+        + ". Schema coercion and tool-catalog generation will be broken. "
+        "If FastMCP updated its internals, see docs/FASTMCP_UPSTREAM_FR.md.",
+        file=sys.stderr,
+    )
+    return []
+
+
+def _read_expected_tool_count() -> int | None:
+    """Read the expected tool count from tests/test_tools_contract.py."""
+    import re
+    from pathlib import Path
+    try:
+        contract_path = (
+            Path(__file__).resolve().parents[1]
+            / "tests" / "test_tools_contract.py"
+        )
+        if not contract_path.exists():
+            return None
+        match = re.search(
+            r"assert len\(tools\) == (\d+)",
+            contract_path.read_text(encoding="utf-8"),
+        )
+        return int(match.group(1)) if match else None
+    except Exception:  # noqa: BLE001 — must not block startup
+        return None
+
+
+def _assert_tool_registry_accessible() -> None:
+    """Loudly fail startup if the FastMCP registry probe returns nothing.
+
+    Called once at module import, just before schema patching. The schema
+    patch silently no-ops on an empty registry, so without this assertion
+    a FastMCP-internals rename would degrade silently and produce a server
+    with 324 tools but no string-to-number coercion — a subtle, hard-to-
+    diagnose class of failure we've paid for once already.
+
+    Note: only the "registry accessible at all" guard runs at module load.
+    The exact-count check moved to ``_assert_expected_tool_count()`` and
+    runs from main() — at module-load time, circular imports between
+    server.py and tool modules can leave the count temporarily under-
+    reported (a tool module being imported directly by a test or another
+    consumer triggers server.py's self-test before the importing module's
+    own ``@mcp.tool()`` decorators have fired). See BUG fix in v1.23.4.
+    """
+    import sys
+    actual = len(_get_all_tools())
+    if actual == 0:
+        # Registry probe returned empty — this is the regression the test guards.
+        # Don't sys.exit (some test harnesses import server.py without a live
+        # FastMCP); print a loud diagnostic and let downstream code react.
+        print(
+            "LivePilot: STARTUP SELF-TEST FAILED — _get_all_tools() returned 0. "
+            "FastMCP internals likely changed. Verify requirements.txt pin "
+            "(fastmcp>=3.0.0,<3.3.0) matches the installed version.",
+            file=sys.stderr,
+        )
+
+
+def _assert_expected_tool_count() -> None:
+    """Verify the registered tool count matches the contract.
+
+    Run from ``main()`` after all tool-module imports have completed. Avoids
+    the false-positive that fires when a tool module is imported directly
+    (which triggers server.py's self-test mid-import, before the importer's
+    own decorators have run).
+    """
+    import sys
+    expected = _read_expected_tool_count()
+    actual = len(_get_all_tools())
+    if expected is not None and actual != expected:
+        print(
+            f"LivePilot: STARTUP SELF-TEST WARNING — _get_all_tools() "
+            f"returned {actual} tools, tests/test_tools_contract.py expects "
+            f"{expected}. If you've added/removed tools, update the contract "
+            "and run scripts/sync_metadata.py --fix.",
+            file=sys.stderr,
+        )
+
+
+def _patch_tool_schemas() -> None:
+    """Post-process all registered tool schemas for string coercion."""
+    for tool in _get_all_tools():
+        props = tool.parameters.get("properties", {})
+        for name, prop in props.items():
+            if name == "ctx":
+                continue  # skip the Context parameter
+            _coerce_schema_property(prop)
+        for definition in tool.parameters.get("$defs", {}).values():
+            if isinstance(definition, dict):
+                _coerce_schema_property(definition)
+
+
+def _configure_public_tool_surface() -> str:
+    """Install the compact search-first catalog used by real MCP sessions.
+
+    ``LIVEPILOT_TOOL_PROFILE=full`` preserves the historical 474-tool
+    listing for diagnostics and older clients. Other supported values are
+    ``producer`` (default), ``composition``, ``mixing``, and ``sampling``.
+    Hidden tools remain directly callable by name.
+    """
+    global _public_tool_surface_configured
+    if _public_tool_surface_configured:
+        return os.environ.get("LIVEPILOT_TOOL_PROFILE", "producer").strip().lower()
+
+    requested = os.environ.get("LIVEPILOT_TOOL_PROFILE", "producer").strip().lower()
+    if requested == "full":
+        _public_tool_surface_configured = True
+        return requested
+
+    from .runtime.tool_surface import build_tool_search_transform
+
+    try:
+        transform = build_tool_search_transform(requested)
+    except ValueError as exc:
+        logger.warning("%s; falling back to producer", exc)
+        requested = "producer"
+        transform = build_tool_search_transform(requested)
+    mcp.add_transform(transform)
+    _public_tool_surface_configured = True
+    return requested
+
+_assert_tool_registry_accessible()
+_patch_tool_schemas()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v1.23.0: User-local atlas overlay loading.
+#
+# YAMLs from ~/.livepilot/atlas-overlays/<namespace>/ are loaded into the
+# module-level OverlayIndex singleton. The 3 extension_atlas_* tools
+# registered above resolve the singleton at REQUEST time (via the
+# get_overlay_index() accessor).
+#
+# v1.27.3 perf batch: population moved from an unconditional import-time
+# call here (measured ~1.1s of a ~2s import with a populated overlay tree)
+# to lazy first-access population inside get_overlay_index() itself (see
+# _ensure_loaded() in mcp_server/atlas/overlays.py, guarded by a lock).
+# Nothing in this codebase depends on the singleton being populated at
+# import time — every caller resolves it via get_overlay_index() at request
+# time — so this boot hook is no longer needed.
+# Spec: docs/superpowers/specs/2026-04-25-user-local-extensions-design.md §6.1
+# ─────────────────────────────────────────────────────────────────────────
+
+
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8109
+
+
+def _http_settings() -> tuple[str, int]:
+    """Resolve host/port for the streamable-http transport from the env."""
+    host = os.environ.get("LIVEPILOT_HTTP_HOST", DEFAULT_HTTP_HOST).strip() or DEFAULT_HTTP_HOST
+    raw_port = os.environ.get("LIVEPILOT_HTTP_PORT", "").strip()
+    if not raw_port:
+        return host, DEFAULT_HTTP_PORT
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.warning(
+            "LIVEPILOT_HTTP_PORT=%r is not an integer; falling back to %d",
+            raw_port,
+            DEFAULT_HTTP_PORT,
+        )
+        return host, DEFAULT_HTTP_PORT
+    if not (1024 <= port <= 65535):
+        logger.warning(
+            "LIVEPILOT_HTTP_PORT=%d is out of range 1024-65535; falling back to %d",
+            port,
+            DEFAULT_HTTP_PORT,
+        )
+        return host, DEFAULT_HTTP_PORT
+    return host, port
+
+
+def main():
+    """Run the MCP server.
+
+    Transport defaults to stdio — the historical behaviour, unchanged, and
+    what ``npx livepilot`` / the MCPB bundle rely on.
+
+    Setting ``LIVEPILOT_TRANSPORT=http`` (alias ``streamable-http``) instead
+    serves the MCP protocol over streamable-http so a single long-lived
+    process can be shared by several clients, rather than each client
+    spawning its own. This matters here because Ableton's Remote Script
+    accepts exactly one TCP client on port 9878 — one shared server keeps
+    that socket single-owner instead of having concurrent stdio processes
+    fight over it. ``AbletonConnection`` already serialises every
+    send/receive cycle behind a lock, so concurrent MCP sessions queue
+    rather than interleave.
+
+    Host/port come from ``LIVEPILOT_HTTP_HOST`` (default 127.0.0.1) and
+    ``LIVEPILOT_HTTP_PORT`` (default 8109). The endpoint is ``/mcp``.
+    Binding is loopback-only and DNS-rebinding protection is on, because
+    the server is unauthenticated.
+    """
+    # Verify tool count matches the contract — runs here (not at module load)
+    # so all tool-module imports have completed regardless of the import path
+    # that brought server.py in. See _assert_tool_registry_accessible() docstring.
+    _assert_expected_tool_count()
+    profile = _configure_public_tool_surface()
+    logger.info("LivePilot public tool profile: %s", profile)
+
+    transport = os.environ.get("LIVEPILOT_TRANSPORT", "stdio").strip().lower()
+    if transport in ("http", "streamable-http"):
+        host, port = _http_settings()
+        logger.info("LivePilot serving streamable-http on http://%s:%d/mcp", host, port)
+        mcp.run(
+            transport="http",
+            host=host,
+            port=port,
+            show_banner=False,
+            host_origin_protection=True,
+            allowed_hosts=[
+                "127.0.0.1",
+                "localhost",
+                f"127.0.0.1:{port}",
+                f"localhost:{port}",
+            ],
+        )
+        return
+
+    if transport != "stdio":
+        logger.warning("Unknown LIVEPILOT_TRANSPORT=%r; falling back to stdio", transport)
+    mcp.run(transport="stdio")
+
+if __name__ == "__main__":
+    main()
