@@ -667,6 +667,7 @@ class SpectralReceiver(asyncio.DatagramProtocol):
         # analyzer instance owns one udpsend socket, so its source port is a
         # stable identity once it has announced itself via /stream_hello.
         self._sources: dict[int, dict] = {}
+        self._current_source: Optional[int] = None
 
     def set_miditool_handler(self, handler: Optional[Callable[[str, dict, list], None]]) -> None:
         """Register a callback invoked on each /miditool/request packet.
@@ -702,12 +703,17 @@ class SpectralReceiver(asyncio.DatagramProtocol):
                 )
             return
         try:
-            self._parse_osc(data, source=addr[1] if len(addr) > 1 else None)
+            # Datagrams are handled one at a time on the event loop, so the
+            # sender port can ride along on the instance for _parse_osc.
+            self._current_source = addr[1] if len(addr) > 1 else None
+            self._parse_osc(data)
         except Exception as exc:
             import sys
             print(f"LivePilot: malformed OSC packet from {addr}: {exc}", file=sys.stderr)
+        finally:
+            self._current_source = None
 
-    def _parse_osc(self, data: bytes, source: Optional[int] = None) -> None:
+    def _parse_osc(self, data: bytes) -> None:
         """Parse a minimal OSC message (address + typed args).
 
         BUG-audit-C2: earlier versions used `data.index(b'\\x00')` directly,
@@ -764,7 +770,7 @@ class SpectralReceiver(asyncio.DatagramProtocol):
                 while offset % 4 != 0:
                     offset += 1
 
-        self._handle_message(address, args, source=source)
+        self._handle_message(address, args, source=self._current_source)
 
     def _register_source(self, source: Optional[int], args: list) -> None:
         """Handle ``/stream_hello <kind> <index> <device_id>``.
