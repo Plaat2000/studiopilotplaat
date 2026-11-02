@@ -79,6 +79,15 @@ checkout, your local edits to `remote_script/LivePilot/` aren't what ends up
 in Ableton. The `node bin/livepilot.js` form runs the installer from your
 current tree, so the files copied into Ableton match your checkout exactly.
 
+The installer reads `Library.cfg` in Ableton's versioned preferences to find
+custom User Libraries, including libraries on external drives. Configured
+libraries take priority over the default Music/Documents location, with newer
+Live versions checked first. Check the printed destination: updating an unused
+copy will not change the handlers Live actually loads. You can explicitly pick
+a detected library's `Remote Scripts` folder with `LIVEPILOT_INSTALL_PATH`.
+Missing configurations retain the usual defaults; unreadable or invalid
+configurations print a warning.
+
 After the copy succeeds, restart Ableton and enable the Control Surface as
 described in [getting-started.md](getting-started.md) Step 2.
 

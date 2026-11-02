@@ -11,6 +11,15 @@ def get_track_info(song, params):
     """Return detailed info for a single track."""
     track_index = int(params["track_index"])
     track = get_track(song, track_index)
+    group_track_index = None
+    if track_index >= 0 and track.is_grouped:
+        parent = track.group_track
+        group_track_index = next(
+            (i for i, candidate in enumerate(song.tracks) if candidate == parent),
+            None,
+        )
+        if group_track_index is None:
+            raise ValueError("Parent group is no longer in the session; refresh the track layout")
 
     # Clip slots
     clips = []
@@ -82,6 +91,7 @@ def get_track_info(song, params):
         "solo": track.solo,
         "is_foldable": track.is_foldable,
         "is_grouped": track.is_grouped,
+        "group_track_index": group_track_index,
         "clip_slots": clips,
         "devices": devices,
         "mixer": mixer,

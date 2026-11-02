@@ -170,3 +170,59 @@ def test_get_track_info_normal_track_unaffected():
     assert result["has_midi_input"] is True
     assert result["has_audio_input"] is False
     assert result["current_monitoring_state"] == 1
+
+
+def test_get_track_info_reports_immediate_group_for_nested_tracks():
+    tracks = _load_tracks_module()
+    outer = _GroupTrack("Outer")
+    nested = _GroupTrack("Nested")
+    child = _NormalTrack("Member")
+    nested.is_grouped = child.is_grouped = True
+    nested.group_track = outer
+    child.group_track = nested
+    song = _FakeSong([outer, nested, child, _NormalTrack("Ungrouped")])
+
+    results = [tracks.get_track_info(song, {"track_index": i}) for i in range(4)]
+
+    assert [result["group_track_index"] for result in results] == [None, 0, 1, None]
+    assert results[1]["is_foldable"] is True
+    assert results[2]["is_grouped"] is True
+
+
+def test_get_track_info_refuses_missing_parent_instead_of_guessing_membership():
+    tracks = _load_tracks_module()
+    child = _NormalTrack("Member")
+    child.is_grouped = True
+    child.group_track = _GroupTrack("Removed")
+
+    with pytest.raises(ValueError, match="Parent group"):
+        tracks.get_track_info(_FakeSong([child]), {"track_index": 0})
+
+
+def test_get_track_info_return_and_master_have_no_group_parent():
+    tracks = _load_tracks_module()
+    song = _FakeSong([])
+    song.return_tracks = [_NormalTrack("Return")]
+    song.master_track = _NormalTrack("Master")
+
+    for index in (-1, -1000):
+        assert tracks.get_track_info(song, {"track_index": index})["group_track_index"] is None
+
+
+def test_parent_lookup_uses_live_object_equality_not_names_or_proxy_identity():
+    tracks = _load_tracks_module()
+
+    class GroupProxy(_GroupTrack):
+        def __init__(self, identity):
+            super().__init__("Same name")
+            self.identity = identity
+
+        def __eq__(self, other):
+            return isinstance(other, GroupProxy) and self.identity == other.identity
+
+    child = _NormalTrack("Member")
+    child.is_grouped = True
+    child.group_track = GroupProxy("second")
+    song = _FakeSong([GroupProxy("first"), GroupProxy("second"), child])
+
+    assert tracks.get_track_info(song, {"track_index": 2})["group_track_index"] == 1

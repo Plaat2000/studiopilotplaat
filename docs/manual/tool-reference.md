@@ -184,6 +184,12 @@ Tools for creating, deleting, naming, coloring, and controlling tracks.
 
 Returns detailed info about a single track: its clips, devices, volume, pan, mute/solo/arm state, and routing.
 
+Group metadata includes `is_foldable` (group bus), `is_grouped`, and
+`group_track_index`: the 0-based index of the immediate parent group, or `null`
+for an ungrouped track, return or master. Nested groups identify their own
+immediate parent; clients should not infer membership from names or track order.
+The `fold_state` field on group buses reports whether the group is folded in Live.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `track_index` | int | *(required)* | Track number (0-based) |
