@@ -291,7 +291,7 @@ With the Analyzer installed, you get 38 additional tools including:
 - **Hidden parameters** — access device parameters not exposed by the standard ControlSurface API
 - **Display values** — read human-readable parameter values (e.g., "−6.0 dB" instead of 0.70)
 
-The Analyzer is optional. Most tools work without it. The 38 spectral/analyzer tools strictly require the Analyzer on the master track; the device/sample tools that call the bridge have graceful fallbacks.
+The Analyzer is optional. Most tools work without it. The 41 spectral/analyzer tools strictly require the Analyzer on the master track; the device/sample tools that call the bridge have graceful fallbacks.
 
 ---
 

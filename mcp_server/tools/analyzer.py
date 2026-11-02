@@ -229,6 +229,68 @@ async def reconnect_bridge(ctx: Context) -> dict:
         }
 
 
+async def _windowed_spectrum(cache, window_ms: int, samples: int) -> dict:
+    """Mean-pool spectrum readings from one analyzer cache over a window."""
+    # Windowed sampling — mean-pool N readings across the window.
+    # Each cache read is ~free; we sleep between reads to let the
+    # analyzer update its internal buffer.
+    if window_ms > 10000:
+        return {"error": "window_ms must be <= 10000 (10 seconds)", "code": "INVALID_PARAM"}
+    n = samples if samples > 0 else max(3, window_ms // 50)
+    n = min(n, 100)
+    interval = (window_ms / 1000.0) / max(n - 1, 1)
+    bands_acc: list[dict] = []
+    tracker = _WindowedFrameTracker()
+    for i in range(n):
+        snap = cache.get("spectrum")
+        if snap and snap.get("value"):
+            bands_acc.append(snap["value"])
+            tracker.observe(snap)
+        if i < n - 1:
+            await asyncio.sleep(interval)
+    if not bands_acc:
+        return {
+            "code": "STATE_ERROR",
+            "error": "No spectrum data captured — analyzer may be stale",
+            "analyzer_hint": "Ensure LivePilot_Analyzer is active on master",
+        }
+    # Aggregate: mean / min / max / stddev per band.
+    keys = set()
+    for s in bands_acc:
+        keys.update(s.keys())
+    bands_mean = {}
+    bands_min = {}
+    bands_max = {}
+    bands_std = {}
+    for k in keys:
+        vals = [s.get(k, 0.0) for s in bands_acc]
+        mean = sum(vals) / len(vals)
+        bands_mean[k] = round(mean, 4)
+        bands_min[k] = round(min(vals), 4)
+        bands_max[k] = round(max(vals), 4)
+        if len(vals) > 1:
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            bands_std[k] = round(var ** 0.5, 4)
+        else:
+            bands_std[k] = 0.0
+    result = {
+        "bands": bands_mean,
+        "bands_min": bands_min,
+        "bands_max": bands_max,
+        "bands_std": bands_std,
+        "window_ms": window_ms,
+        "samples_collected": len(bands_acc),
+        "distinct_frames": tracker.distinct_frames,
+    }
+    stall = tracker.stall_warning("spectrum")
+    if stall:
+        result["warning"] = stall
+    key_data = cache.get("key")
+    if key_data:
+        result["detected_key"] = key_data["value"]
+    return result
+
+
 @mcp.tool()
 async def get_master_spectrum(
     ctx: Context,
@@ -266,64 +328,8 @@ async def get_master_spectrum(
     await _require_analyzer_async(cache)
 
     if window_ms and window_ms > 0:
-        # Windowed sampling — mean-pool N readings across the window.
-        # Each cache read is ~free; we sleep between reads to let the
-        # analyzer update its internal buffer.
-        if window_ms > 10000:
-            return {"error": "window_ms must be <= 10000 (10 seconds)", "code": "INVALID_PARAM"}
-        n = samples if samples > 0 else max(3, window_ms // 50)
-        n = min(n, 100)
-        interval = (window_ms / 1000.0) / max(n - 1, 1)
-        bands_acc: list[dict] = []
-        tracker = _WindowedFrameTracker()
-        for i in range(n):
-            snap = cache.get("spectrum")
-            if snap and snap.get("value"):
-                bands_acc.append(snap["value"])
-                tracker.observe(snap)
-            if i < n - 1:
-                await asyncio.sleep(interval)
-        if not bands_acc:
-            return {
-                "code": "STATE_ERROR",
-                "error": "No spectrum data captured — analyzer may be stale",
-                "analyzer_hint": "Ensure LivePilot_Analyzer is active on master",
-            }
-        # Aggregate: mean / min / max / stddev per band.
-        keys = set()
-        for s in bands_acc:
-            keys.update(s.keys())
-        bands_mean = {}
-        bands_min = {}
-        bands_max = {}
-        bands_std = {}
-        for k in keys:
-            vals = [s.get(k, 0.0) for s in bands_acc]
-            mean = sum(vals) / len(vals)
-            bands_mean[k] = round(mean, 4)
-            bands_min[k] = round(min(vals), 4)
-            bands_max[k] = round(max(vals), 4)
-            if len(vals) > 1:
-                var = sum((v - mean) ** 2 for v in vals) / len(vals)
-                bands_std[k] = round(var ** 0.5, 4)
-            else:
-                bands_std[k] = 0.0
-        result = {
-            "bands": bands_mean,
-            "bands_min": bands_min,
-            "bands_max": bands_max,
-            "bands_std": bands_std,
-            "window_ms": window_ms,
-            "samples_collected": len(bands_acc),
-            "distinct_frames": tracker.distinct_frames,
-        }
-        stall = tracker.stall_warning("spectrum")
-        if stall:
-            result["warning"] = stall
-        key_data = cache.get("key")
-        if key_data:
-            result["detected_key"] = key_data["value"]
-        if sub_detail:
+        result = await _windowed_spectrum(cache, window_ms, samples)
+        if "bands" in result and sub_detail:
             _attach_sub_detail(cache, result)
         return result
 
@@ -2341,3 +2347,173 @@ def ensure_analyzer_on_master(ctx: Context) -> dict:
         "is_last_on_master": True,  # fresh load always lands at the end
         "duplicate_count": 1,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-track analyzer streams
+#
+# Stream-aware analyzer builds announce their host track with
+# ``/stream_hello`` from the same UDP socket that carries their perception
+# data, so the bridge keeps each track-local instance in its own cache and
+# the master cache stays the master. Track loading is refused until the
+# analyzer on master has proven it is stream-aware: an older frozen build
+# on a track would otherwise blend its readings into the master stream.
+
+
+def _track_stream_key(track_index: int) -> str:
+    if track_index >= 0:
+        return f"track:{track_index}"
+    return f"return:{-track_index - 1}"
+
+
+def _streams_unsupported_result() -> dict:
+    return {
+        "status": "streams_unsupported",
+        "code": "STATE_ERROR",
+        "error": (
+            "The loaded LivePilot_Analyzer build does not announce separate "
+            "streams, so a track-local instance would mix its readings into "
+            "the master analysis."
+        ),
+        "hint": (
+            "Re-freeze m4l_device/LivePilot_Analyzer.amxd in Max from the "
+            "current livepilot_bridge.js (docs/MAX_FREEZE_WORKFLOW.md), run "
+            "scripts/sync_amxd_targets.sh --apply, then reload the analyzer "
+            "on master."
+        ),
+    }
+
+
+@mcp.tool()
+def ensure_analyzer_on_track(ctx: Context, track_index: int) -> dict:
+    """Load LivePilot_Analyzer as the LAST device on a track or return.
+
+    The instance reports its own separate stream (read it with
+    get_track_spectrum); the master analyzer and master tools are
+    unaffected. Refuses with status "streams_unsupported" when the
+    analyzer build cannot label its stream. Use ensure_analyzer_on_master
+    for the master track.
+
+    track_index: 0+ regular tracks, -1/-2... return tracks.
+    Returns status already_loaded / loaded / streams_unsupported / failed,
+    plus device_index, is_last_on_track and stream.
+    """
+    track_index = int(track_index)
+    if track_index == -1000:
+        return {
+            "status": "failed", "code": "INVALID_PARAM",
+            "error": "Use ensure_analyzer_on_master for the master track.",
+        }
+    if track_index < -99:
+        return {"status": "failed", "code": "INVALID_PARAM",
+                "error": "track_index must be >= 0 or a return index (-1, -2, ...)."}
+    cache = _get_spectral(ctx)
+    if not cache.streams_supported:
+        return _streams_unsupported_result()
+    ableton = ctx.lifespan_context["ableton"]
+    try:
+        info = ableton.send_command("get_track_info", {"track_index": track_index})
+    except Exception as exc:
+        return {"status": "failed", "code": "INTERNAL",
+                "error": f"Could not read track {track_index}: {exc}"}
+    devices = (info or {}).get("devices") or []
+    matches = [d for d in devices if d.get("name") == _ANALYZER_DEVICE_NAME]
+    stream = _track_stream_key(track_index)
+    if matches:
+        is_last = devices[-1].get("name") == _ANALYZER_DEVICE_NAME
+        result = {
+            "status": "already_loaded",
+            "device_index": matches[0].get("index"),
+            "is_last_on_track": is_last,
+            "duplicate_count": len(matches),
+            "stream": stream,
+        }
+        if not is_last:
+            result["warning"] = (
+                f"{_ANALYZER_DEVICE_NAME} is not the LAST device on this track; "
+                "it reads the signal before the devices after it."
+            )
+        return result
+    try:
+        loaded = _load_analyzer_impl(
+            ctx, track_index=track_index,
+            device_name=_ANALYZER_DEVICE_NAME, allow_duplicate=False,
+        )
+    except Exception as exc:
+        return {"status": "failed", "code": "STATE_ERROR", "error": str(exc)}
+    return {
+        "status": "loaded",
+        "device_index": (loaded or {}).get("device_index"),
+        "is_last_on_track": True,
+        "duplicate_count": 1,
+        "stream": stream,
+    }
+
+
+@mcp.tool()
+async def get_track_spectrum(
+    ctx: Context,
+    track_index: int,
+    window_ms: int = 0,
+    samples: int = 0,
+) -> dict:
+    """Get the 9-band spectrum from a track-local LivePilot_Analyzer stream.
+
+    Same bands and window_ms/samples semantics as get_master_spectrum, but
+    read from the analyzer placed on that track (see
+    ensure_analyzer_on_track) — never from the master stream. The reading
+    is the track's own output at the analyzer position: post its devices,
+    pre-fader-group/master processing. Detected key is per instance.
+
+    track_index: 0+ regular tracks, -1/-2... return tracks.
+    """
+    track_index = int(track_index)
+    if track_index == -1000:
+        return {"code": "INVALID_PARAM",
+                "error": "Use get_master_spectrum for the master track."}
+    cache = _get_spectral(ctx)
+    if not cache.streams_supported:
+        return _streams_unsupported_result()
+    stream_key = _track_stream_key(track_index)
+    stream = cache.stream(stream_key)
+    if stream is None or not stream.is_connected:
+        return {
+            "code": "STATE_ERROR",
+            "stream": stream_key,
+            "error": "No fresh data from an analyzer on this track.",
+            "hint": (
+                "Call ensure_analyzer_on_track(track_index) and make sure "
+                "the track is producing audio."
+            ),
+        }
+    if window_ms and window_ms > 0:
+        result = await _windowed_spectrum(stream, window_ms, samples)
+    else:
+        result = {}
+        snap = stream.get("spectrum")
+        if snap:
+            result["bands"] = snap["value"]
+            result["age_ms"] = snap["age_ms"]
+        key_data = stream.get("key")
+        if key_data:
+            result["detected_key"] = key_data["value"]
+    result["stream"] = stream_key
+    result["track_index"] = track_index
+    peak = stream.get("peak")
+    rms = stream.get("rms")
+    if peak:
+        result["peak"] = peak["value"]
+    if rms:
+        result["rms"] = rms["value"]
+    return result
+
+
+@mcp.tool()
+def get_analyzer_streams(ctx: Context) -> dict:
+    """List the analyzer streams the bridge currently separates.
+
+    streams_supported is True when a stream-aware analyzer build has
+    announced itself; streams lists each live track/return instance with
+    its track_index, device_id and whether fresh data is arriving.
+    """
+    return _get_spectral(ctx).stream_status()
