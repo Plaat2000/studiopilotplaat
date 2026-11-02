@@ -1,3 +1,17 @@
+# PENDING — per-track analyzer streams (JS changed, not yet frozen)
+
+`m4l_device/livepilot_bridge.js` gained `/stream_hello` stream identity,
+command-port release on non-master instances, and master-only refusal of
+capture/key commands (see docs/M4L_BRIDGE.md "Per-track analyzer streams").
+The frozen `LivePilot_Analyzer.amxd` does NOT contain this yet, so
+`ensure_analyzer_on_track` returns `streams_unsupported` until it is re-frozen
+with the procedure below (sync JS to the Max search path, Edit in Max,
+unfreeze/re-freeze, save), then `bash scripts/sync_amxd_targets.sh --apply` and
+reload the analyzer on master. `get_analyzer_streams` reports
+`streams_supported: true` once the new build is running.
+
+---
+
 # .amxd Re-Freeze Batch — LivePilot_Analyzer — SHIPPED 2026-07-31
 
 **Status: FROZEN AND SHIPPED at 1.28.0.** Everything below is now live in the
