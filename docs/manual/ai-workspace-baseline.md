@@ -16,6 +16,7 @@ Copilot and Codex are separate clients with their own registrations.
 | Codex | Separate optional client/plugin | `AGENTS.md`, `livepilot/.Codex-plugin/plugin.json` | Codex installed and its local MCP path points to an existing checkout |
 | Ableton Remote Script | Executes Live Object Model commands | `remote_script/LivePilot/` | Installed in Ableton's User Library; TCP port 9878 |
 | M4L Analyzer bridge | Provides analyzer/LiveAPI data | `m4l_device/` | Analyzer loaded in Live; UDP 9880 and OSC 9881 |
+| M4L analysis/chat window | Hosts the local analysis UI | Max `LivePilot_Chat.maxpat` webview | Fixed URL `http://127.0.0.1:7666/`; its web app must be running |
 
 VS Code is the editor, not an AI model. Claude Code, Copilot, and Codex are
 separate clients. Claude Code can run the LivePilot MCP server without the
@@ -23,6 +24,8 @@ optional Claude marketplace plugin. Plugin manifests provide client-specific
 instructions and packaging; they do not install or activate the client by
 themselves. MCP connects a client to the LivePilot server. The Ableton Remote
 Script and M4L bridge are separate runtime connections behind that server.
+The M4L analysis/chat webview on port 7666 is a separate local UI service;
+do not confuse it with LivePilot's optional MCP HTTP transport on port 8109.
 
 ## Studio Runtime Requirements
 
