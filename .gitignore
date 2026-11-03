@@ -37,10 +37,13 @@ CONTEXT-local.md
 
 # OS
 .DS_Store
+._*
 Thumbs.db
 
 # IDE
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/mcp.json
 .idea/
 *.swp
 *.swo

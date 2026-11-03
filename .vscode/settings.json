@@ -1,0 +1,36 @@
+{
+    "git.terminalAuthentication": true,
+    "chat.tools.terminal.autoApprove": {
+        "/^node -e 'const p=require\\(\"node:path\"\\),o=require\\(\"node:os\"\\),f=require\\(\"node:fs\"\\);const h=process\\.env\\.COPILOT_HOME\\|\\|p\\.join\\(o\\.homedir\\(\\),\"\\.copilot\"\\);const d=p\\.join\\(h,\"extensions\"\\);console\\.log\\(d\\);if\\(f\\.existsSync\\(d\\)\\) console\\.log\\(f\\.readdirSync\\(d\\)\\.join\\(\"\\\\n\"\\)\\);'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node -p 'process\\.execPath'; ls /Users/[^/]+/\\.copilot; ls /Applications/\"Visual Studio Code\\.app\"/Contents/Resources/app/extensions/copilot\\* 2>/dev/null$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^lsof -nP -iUDP:9880$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    },
+    "chat.mcp.serverSampling": {
+        "studiopilotplaat/.mcp.json: LivePilot": {
+            "allowedModels": [
+                "copilotcli/auto",
+                "copilot/auto"
+            ]
+        },
+        "studiopilotplaat/.vscode/mcp.json: LivePilot": {
+            "allowedModels": [
+                "copilot/auto",
+                "copilotcli/auto"
+            ]
+        }
+    },
+    "python.testing.pytestArgs": [
+        "mcp_server"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
+}
