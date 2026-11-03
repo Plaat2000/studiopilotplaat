@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v1.30.1 — 2026-11-03
+
+### Changed — workspace setup
+- Document Claude as the primary client, clarify the separate Claude and VS
+  Code MCP registrations, and record the fixed M4L analysis/chat webview port.
+- Remove the stale project MCP sampling permission after consolidating Claude
+  on the connected `LivePilot-dev` server.
+
 ### Changed — dependencies
 - `fastmcp` moves to the 4.0 line (`>=4.0.3,<4.1.0`). The private tool
   registry `_get_all_tools()` reads (`_local_provider._components`) is
