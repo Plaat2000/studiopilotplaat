@@ -3,6 +3,7 @@
 ## Project
 - **Repo:** This directory (LivePilot)
 - **Type:** Agentic MCP production system for Ableton Live 12
+- **Workspace setup:** `docs/manual/ai-workspace-baseline.md` maps Claude, Copilot, Codex, MCP, Ableton, and local sync configuration.
 - **Three layers:** Device Atlas (knowledge) + M4L Analyzer (perception) + Technique Memory (learning)
 - **Sister projects:** TDPilot (TouchDesigner), ComfyPilot (ComfyUI)
 - **Historical design snapshot:** `docs/specs/2026-03-17-livepilot-design.md` (March 2026 baseline; current truth lives in README/CLAUDE/AGENTS/manual + `scripts/sync_metadata.py`)

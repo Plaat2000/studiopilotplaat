@@ -15,12 +15,6 @@
         }
     },
     "chat.mcp.serverSampling": {
-        "studiopilotplaat/.mcp.json: LivePilot": {
-            "allowedModels": [
-                "copilotcli/auto",
-                "copilot/auto"
-            ]
-        },
         "studiopilotplaat/.vscode/mcp.json: LivePilot": {
             "allowedModels": [
                 "copilot/auto",
