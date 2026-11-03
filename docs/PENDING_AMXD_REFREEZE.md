@@ -1,3 +1,16 @@
+# FROZEN — per-track analyzer streams
+
+`m4l_device/livepilot_bridge.js` gained `/stream_hello` stream identity,
+command-port release on non-master instances, and master-only refusal of
+capture/key commands (see docs/M4L_BRIDGE.md "Per-track analyzer streams").
+The frozen `LivePilot_Analyzer.amxd` now contains these changes. Verified with
+`bash scripts/sync_amxd_targets.sh`: the embedded version is 1.30.0, all bridge
+commands and source identifiers are present, and the Ableton User Library
+copy matches the repository build. `get_analyzer_streams` reports
+`streams_supported: true` when the updated device is loaded.
+
+---
+
 # .amxd Re-Freeze Batch — LivePilot_Analyzer — SHIPPED 2026-07-31
 
 **Status: FROZEN AND SHIPPED at 1.28.0.** Everything below is now live in the

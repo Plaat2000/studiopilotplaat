@@ -1,6 +1,6 @@
 # LivePilot — Full Tool Catalog (Generated)
 
-474 tools across 57 domains.
+477 tools across 57 domains.
 
 > Auto-generated from `mcp.list_tools()`. Do not hand-edit.
 > Regenerate: `python3 scripts/generate_tool_catalog.py`
@@ -21,7 +21,7 @@
 | `iterate_toward_goal` | Close the evaluation loop: run experiments until threshold or timeout. |
 | `route_request` | Route a production request to the right engine(s). |
 
-## Analyzer (38)
+## Analyzer (41)
 
 | Tool | Description |
 |------|-------------|
@@ -35,6 +35,8 @@
 | `compressor_set_sidechain` | Configure a Compressor's sidechain INPUT ROUTING (BUG-A3). |
 | `crop_simpler` | Crop a Simpler's sample to the currently active region. |
 | `ensure_analyzer_on_master` | Idempotent pre-flight: load LivePilot_Analyzer on master if missing. |
+| `ensure_analyzer_on_track` | Load LivePilot_Analyzer as the LAST device on a track or return. |
+| `get_analyzer_streams` | List the analyzer streams the bridge currently separates. |
 | `get_automation_state` | Get automation state for all parameters on a device. |
 | `get_chroma` | Get 12 pitch class energies from FluCoMa for real-time chord detection. |
 | `get_clip_file_path` | Get the audio file path of a clip on disk. |
@@ -49,6 +51,7 @@
 | `get_onsets` | Get real-time onset/transient detection from FluCoMa. |
 | `get_simpler_slices` | Get slice point positions from a Simpler device. |
 | `get_spectral_shape` | Get 7 real-time spectral descriptors from FluCoMa. |
+| `get_track_spectrum` | Get the 9-band spectrum from a track-local LivePilot_Analyzer stream. |
 | `get_warp_markers` | Get all warp markers from an audio clip. |
 | `load_sample_to_simpler` | Load an audio file into a NEW Simpler device on a track. |
 | `move_warp_marker` | Move a warp marker from one beat position to another. |
@@ -414,7 +417,7 @@
 
 | Tool | Description |
 |------|-------------|
-| `analyze_mix` | Build full mix state and run all critics. |
+| `analyze_mix` | Build the available mix state and run all critics. |
 | `evaluate_mix_move` | Score a mix change using the evaluation fabric. |
 | `get_masking_report` | Get detailed frequency collision report. |
 | `get_mix_issues` | Run all mix critics and return detected issues only. |
@@ -767,4 +770,4 @@
 | `rank_wonder_variants` | Rank wonder-mode variants by taste + identity + novelty + coherence. |
 
 ---
-*Generated from 474 registered tools.*
+*Generated from 477 registered tools.*

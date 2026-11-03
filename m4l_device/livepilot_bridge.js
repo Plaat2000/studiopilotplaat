@@ -97,6 +97,75 @@ function bang() {
         initialized = true;
         outlet(1, "status", "ready");
         post("LivePilot Bridge: initialized\n");
+        stream_start();
+    }
+}
+
+// ── Analyzer stream identity ───────────────────────────────────────────────
+//
+// Every instance sends perception data through its own [udpsend] socket, so
+// the server tells instances apart by UDP source port. "/stream_hello" goes
+// out of that same socket (outlet 0) and names the host track, letting the
+// server keep track-local spectra separate from the master stream. It is
+// re-sent every STREAM_HELLO_MS so reordered tracks are picked up.
+// Only the master instance keeps OSC command port 9881; other instances
+// move their [udpreceive] to a private port so commands never land on them.
+
+var STREAM_HELLO_MS = 2000;
+var COMMAND_PORT = 9881;
+var stream_kind = "";      // "master" | "track" | "return" | "" (unknown)
+var stream_index = -1;
+var stream_device_id = 0;
+var stream_task = null;
+var stream_bound_kind = "";
+
+function _stream_identity() {
+    var device = new LiveAPI(null, "this_device");
+    var path = String(device.unquotedpath || device.path || "").replace(/"/g, "");
+    var m = /^live_set (master_track|tracks (\d+)|return_tracks (\d+))/.exec(path);
+    if (!m) return null;
+    if (m[1] === "master_track") return {kind: "master", index: -1, id: device.id};
+    if (m[2] !== undefined) return {kind: "track", index: parseInt(m[2], 10), id: device.id};
+    return {kind: "return", index: parseInt(m[3], 10), id: device.id};
+}
+
+function _set_command_port(port) {
+    var obj = this.patcher ? this.patcher.firstobject : null;
+    while (obj) {
+        if (obj.maxclass === "udpreceive") obj.message("port", port);
+        obj = obj.nextobject;
+    }
+}
+
+function stream_hello() {
+    var ident = null;
+    try { ident = _stream_identity(); } catch (e) { ident = null; }
+    if (!ident) return;
+    stream_kind = ident.kind;
+    stream_index = ident.index;
+    stream_device_id = parseInt(ident.id, 10) || 0;
+    if (stream_bound_kind !== stream_kind) {
+        stream_bound_kind = stream_kind;
+        _set_command_port(stream_kind === "master"
+            ? COMMAND_PORT
+            : 20000 + Math.floor(Math.random() * 20000));
+    }
+    outlet(0, "/stream_hello", stream_kind, stream_index, stream_device_id);
+}
+
+function stream_start() {
+    stream_hello();
+    if (stream_task === null) {
+        stream_task = new Task(stream_hello, this);
+        stream_task.interval = STREAM_HELLO_MS;
+        stream_task.repeat();
+    }
+}
+
+function notifydeleted() {
+    if (stream_task !== null) {
+        stream_task.cancel();
+        stream_task = null;
     }
 }
 
@@ -152,6 +221,16 @@ function anything() {
 }
 
 function dispatch(cmd, args) {
+    // Audio-dependent commands must describe the master mix. If one reaches a
+    // track-local instance (command port not yet released), refuse loudly
+    // instead of capturing or reporting that track's audio as the mix.
+    if (stream_kind !== "" && stream_kind !== "master"
+            && (cmd === "capture_audio" || cmd === "capture_stop" || cmd === "get_key")) {
+        var refusal = "Track-local analyzer instance; use the master analyzer for " + cmd;
+        if (cmd === "capture_audio") send_capture_error(refusal);
+        else send_response({"error": refusal});
+        return;
+    }
     switch(cmd) {
         case "ping":
             send_response({"ok": true, "version": VERSION});

@@ -1,12 +1,12 @@
 # Tool Reference
 
-LivePilot gives you 474 tools across direct Ableton control, search, analysis,
+LivePilot gives you 477 tools across direct Ableton control, search, analysis,
 planning, memory, and installation. You describe what you want in plain
 language, and the AI uses a compact default catalog plus tool search to reach
 the right capability. The full catalog remains available without putting every
 schema into the initial context.
 
-This chapter covers the most-used tools, grouped by what it does. Each entry tells you the tool name, what it does in practice, what parameters it accepts, and when you'd want it. The complete list of all 474 tools is auto-generated in the **[Tool Catalog](tool-catalog.md)**.
+This chapter covers the most-used tools, grouped by what it does. Each entry tells you the tool name, what it does in practice, what parameters it accepts, and when you'd want it. The complete list of all 477 tools is auto-generated in the **[Tool Catalog](tool-catalog.md)**.
 
 > **Quick reference for common values:**
 >
@@ -183,6 +183,12 @@ Tools for creating, deleting, naming, coloring, and controlling tracks.
 ### get_track_info
 
 Returns detailed info about a single track: its clips, devices, volume, pan, mute/solo/arm state, and routing.
+
+Group metadata includes `is_foldable` (group bus), `is_grouped`, and
+`group_track_index`: the 0-based index of the immediate parent group, or `null`
+for an ungrouped track, return or master. Nested groups identify their own
+immediate parent; clients should not infer membership from names or track order.
+The `fold_state` field on group buses reports whether the group is folded in Live.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -3516,7 +3522,7 @@ Lightweight health check — parameter_count sanity (≤1 parameter = probably d
 
 ## More tools
 
-This chapter covers the most-used tools. The complete list of all 474 tools across 57 domains — including all intelligence-engine tools, creative-constraints, preview-studio, wonder-mode, memory, song-brain, transition/reference/translation engines — is auto-generated at **[Tool Catalog](tool-catalog.md)** from the running MCP server.
+This chapter covers the most-used tools. The complete list of all 477 tools across 57 domains — including all intelligence-engine tools, creative-constraints, preview-studio, wonder-mode, memory, song-brain, transition/reference/translation engines — is auto-generated at **[Tool Catalog](tool-catalog.md)** from the running MCP server.
 
 See also:
 - **[The Intelligence Layer](intelligence.md)** — how the engines connect

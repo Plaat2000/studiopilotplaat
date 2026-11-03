@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 import shutil
 import subprocess
+from xml.sax.saxutils import quoteattr
 
 import pytest
 
@@ -184,3 +185,66 @@ def test_install_path_traversal_outside_home_is_refused(tmp_path: Path):
     assert result.returncode == 1, result.stdout + result.stderr
     assert "outside permitted directories" in result.stderr
     assert not (outside / "LivePilot").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Library.cfg discovery")
+def test_install_prefers_configured_external_user_library(tmp_path: Path):
+    home, default_scripts = _fake_home(tmp_path)
+    external = tmp_path / "External & Audio"
+    library = external / "Personal Library"
+    library.mkdir(parents=True)
+    preferences = home / "Library" / "Preferences" / "Ableton" / "Live 12.4.16"
+    preferences.mkdir(parents=True)
+    (preferences / "Library.cfg").write_text(
+        f'<Ableton><ContentLibrary><UserLibrary><LibraryProject Id="1">'
+        f'<ProjectLocation /><ProjectName Value="Personal Library" />'
+        f'<ProjectPath Value={quoteattr(str(external))} />'
+        f'</LibraryProject></UserLibrary></ContentLibrary></Ableton>',
+        encoding="utf-8",
+    )
+    env = _env_for_home(home)
+    result = _run_install(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = library / "Remote Scripts" / "LivePilot" / "tracks.py"
+    assert expected.read_bytes() == (_repo_root() / "remote_script" / "LivePilot" / "tracks.py").read_bytes()
+    assert not (default_scripts / "LivePilot").exists()
+
+    env["LIVEPILOT_INSTALL_PATH"] = str(library / "Remote Scripts")
+    explicit = _run_install(env)
+    assert explicit.returncode == 0, explicit.stdout + explicit.stderr
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Library.cfg discovery")
+def test_library_detection_orders_versions_numerically_and_preserves_fallbacks(tmp_path: Path):
+    home, _ = _fake_home(tmp_path)
+    for version in ("12.4.7", "12.4.16"):
+        preferences = home / "Library" / "Preferences" / "Ableton" / f"Live {version}"
+        preferences.mkdir(parents=True)
+        library = tmp_path / version / "Library"
+        library.mkdir(parents=True)
+        (preferences / "Library.cfg").write_text(
+            f'<Ableton><UserLibrary><LibraryProject>'
+            f'<ProjectPath Value={quoteattr(str(library.parent))} /><ProjectName Value="Library" />'
+            f'</LibraryProject></UserLibrary></Ableton>', encoding="utf-8",
+        )
+    result = _run_install(_env_for_home(home))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "12.4.16" / "Library" / "Remote Scripts" / "LivePilot").is_dir()
+    assert not (tmp_path / "12.4.7" / "Library" / "Remote Scripts" / "LivePilot").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Library.cfg discovery")
+@pytest.mark.parametrize("configured_name", ["../outside", "/absolute"])
+def test_invalid_configured_library_does_not_whitelist_external_paths(tmp_path: Path, configured_name: str):
+    home, default_scripts = _fake_home(tmp_path)
+    preferences = home / "Library" / "Preferences" / "Ableton" / "Live 12.4.16"
+    preferences.mkdir(parents=True)
+    (preferences / "Library.cfg").write_text(
+        f'<Ableton><UserLibrary><LibraryProject><ProjectPath Value={quoteattr(str(tmp_path))} />'
+        f'<ProjectName Value={quoteattr(configured_name)} /></LibraryProject></UserLibrary></Ableton>',
+        encoding="utf-8",
+    )
+    result = _run_install(_env_for_home(home))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Cannot read configured Ableton User Library" in result.stderr
+    assert (default_scripts / "LivePilot").is_dir()

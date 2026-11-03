@@ -1,13 +1,13 @@
 # LivePilot Manual
 
 An agentic production system for Ableton Live 12.
-474 tools. 57 domains. Device atlas. Sample intelligence. Auto-composition. Spectral perception. Technique memory. Creative intelligence.
+477 tools. 57 domains. Device atlas. Sample intelligence. Auto-composition. Spectral perception. Technique memory. Creative intelligence.
 
 ---
 
 ## What LivePilot Is
 
-LivePilot is not a tool collection with an AI wrapper. It is a **production system** — three perception layers feed into 474 tools, which are orchestrated by a dozen creative engines that understand song identity, learn your taste, diagnose session problems, and generate real musical options.
+LivePilot is not a tool collection with an AI wrapper. It is a **production system** — three perception layers feed into 477 tools, which are orchestrated by a dozen creative engines that understand song identity, learn your taste, diagnose session problems, and generate real musical options.
 
 The difference: a tool collection executes "set volume to -6dB." LivePilot understands that turning down the drums might kill the groove that defines the track, suggests three genuinely different ways to create space instead, lets you preview each one, and remembers which approach you preferred.
 
@@ -34,7 +34,7 @@ The **user corpus** (v1.23.4+) extends the atlas with whatever's installed on YO
 The **analyzer** feeds back spectral data from the master bus so the AI hears its own changes — **9 frequency bands** (sub_low / sub / low / low_mid / mid / high_mid / high / presence / air); the sub_low band (20-60 Hz) separates kick fundamental from DC rumble. From v1.20.3 the analyzer is auto-loaded via `ensure_analyzer_on_master` when a decision or verification actually needs audio evidence.
 The **memory** persists production decisions across sessions as searchable, replayable data structures.
 
-LivePilot contains 474 tools. Direct Ableton controls execute through the Live Object Model on Ableton's main thread; planning, search, analysis, memory, filesystem, and network tools run in their appropriate layers. Live-session mutations (clips, devices, mixer, arrangement) normally route through Ableton's undo stack. Side effects outside the Live project — Splice downloads, memory/ledger writes, installer actions, atlas scans, and filesystem writes — persist beyond undo.
+LivePilot contains 477 tools. Direct Ableton controls execute through the Live Object Model on Ableton's main thread; planning, search, analysis, memory, filesystem, and network tools run in their appropriate layers. Live-session mutations (clips, devices, mixer, arrangement) normally route through Ableton's undo stack. Side effects outside the Live project — Splice downloads, memory/ledger writes, installer actions, atlas scans, and filesystem writes — persist beyond undo.
 
 To avoid spending context on hundreds of schemas before the first musical
 decision, the default `producer` profile advertises 26 core tools plus
@@ -140,7 +140,7 @@ if this block drifts from the registry.
 
 <!-- DOMAIN_MAP:AUTO-GENERATED START -->
 
-All 474 tools across 57 domains, in source-truth per-domain counts:
+All 477 tools across 57 domains, in source-truth per-domain counts:
 
 ### Core Ableton Control (Layer 1 — 247 tools)
 
@@ -168,11 +168,11 @@ All 474 tools across 57 domains, in source-truth per-domain counts:
 | MIDI I/O | 4 | Export/import .mid, offline analysis, piano roll extraction |
 | MidiTool | 4 | Device install, generator registration, per-clip target mapping |
 
-### Perception (Layer 2 — 51 tools)
+### Perception (Layer 2 — 54 tools)
 
 | Domain | # | Scope |
 |--------|:-:|-------|
-| Analyzer | 38 | 9-band spectrum (v1.17+), RMS, key detection, Simpler ops, warp markers, capture, FluCoMa mel/chroma/onset `[M4L]` |
+| Analyzer | 41 | 9-band spectrum (v1.17+), RMS, key detection, Simpler ops, warp markers, capture, FluCoMa mel/chroma/onset `[M4L]` |
 | Listening | 5 | Offline perceptual analysis of master-bus captures — `listen_capture` full report, `listen_ab` before/after comparison with evaluate_move-ready snapshots (v1.28+) |
 | Perception | 4 | Offline loudness, spectral analysis, reference comparison, metadata |
 | Diagnostics | 3 | Device/session health verification, test-note fire-and-forget |

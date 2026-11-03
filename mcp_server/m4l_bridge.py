@@ -141,6 +141,17 @@ def _normalize_bridge_payload(value: Any) -> Any:
     return value
 
 
+# Stream-aware analyzer builds re-announce /stream_hello every ~2s. An
+# identity not refreshed within this window is treated as unknown.
+STREAM_HELLO_TTL = 10.0
+
+# Analyzer perception messages that belong to a particular device instance.
+_STREAM_DATA_ADDRESSES = frozenset({
+    "/spectrum", "/peak", "/rms", "/pitch", "/key", "/spectral_shape",
+    "/mel_bands", "/chroma", "/onset", "/novelty", "/loudness",
+})
+
+
 class SpectralCache:
     """Thread-safe cache for incoming spectral data from M4L.
 
@@ -155,6 +166,64 @@ class SpectralCache:
         self._max_age = max_age
         self._connected = False
         self._last_seen = 0.0
+        # Per-track analyzer streams ("track:N" / "return:N"). Only the root
+        # (master) cache owns this registry; stream caches leave it empty.
+        self._streams: dict[str, "SpectralCache"] = {}
+        self._stream_info: dict[str, dict] = {}
+        self._stream_capable_at = 0.0
+
+    def stream(self, key: str, create: bool = False) -> Optional["SpectralCache"]:
+        """Return the separate cache for a track-local analyzer stream."""
+        with self._lock:
+            cache = self._streams.get(key)
+            if cache is None and create:
+                cache = SpectralCache(self._max_age)
+                self._streams[key] = cache
+            return cache
+
+    def register_stream(self, key: str, info: dict) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._stream_capable_at = now
+            if key != "master":
+                self._stream_info[key] = {**info, "seen": now}
+
+    def drop_stream(self, key: str) -> None:
+        with self._lock:
+            self._streams.pop(key, None)
+            self._stream_info.pop(key, None)
+
+    @property
+    def streams_supported(self) -> bool:
+        """True when a stream-aware analyzer announced itself recently."""
+        with self._lock:
+            return bool(self._stream_capable_at) and (
+                time.monotonic() - self._stream_capable_at
+            ) < STREAM_HELLO_TTL
+
+    def stream_status(self) -> dict:
+        with self._lock:
+            now = time.monotonic()
+            streams = []
+            for key, info in sorted(self._stream_info.items()):
+                age = now - info["seen"]
+                if age >= STREAM_HELLO_TTL:
+                    continue
+                cache = self._streams.get(key)
+                streams.append({
+                    "stream": key,
+                    "kind": info.get("kind"),
+                    "track_index": info.get("track_index"),
+                    "device_id": info.get("device_id"),
+                    "announced_ms_ago": int(age * 1000),
+                    "has_data": bool(cache and cache.is_connected),
+                })
+            return {
+                "streams_supported": bool(self._stream_capable_at) and (
+                    now - self._stream_capable_at
+                ) < STREAM_HELLO_TTL,
+                "streams": streams,
+            }
 
     def update(self, key: str, value: Any) -> None:
         with self._lock:
@@ -594,6 +663,11 @@ class SpectralReceiver(asyncio.DatagramProtocol):
         # Track which non-loopback senders we've already warned about so a
         # spoofing/collision source doesn't spam stderr once per packet.
         self._warned_sources: set[str] = set()
+        # UDP source port -> {"key": stream key, "seen": monotonic}. Every
+        # analyzer instance owns one udpsend socket, so its source port is a
+        # stable identity once it has announced itself via /stream_hello.
+        self._sources: dict[int, dict] = {}
+        self._current_source: Optional[int] = None
 
     def set_miditool_handler(self, handler: Optional[Callable[[str, dict, list], None]]) -> None:
         """Register a callback invoked on each /miditool/request packet.
@@ -629,10 +703,15 @@ class SpectralReceiver(asyncio.DatagramProtocol):
                 )
             return
         try:
+            # Datagrams are handled one at a time on the event loop, so the
+            # sender port can ride along on the instance for _parse_osc.
+            self._current_source = addr[1] if len(addr) > 1 else None
             self._parse_osc(data)
         except Exception as exc:
             import sys
             print(f"LivePilot: malformed OSC packet from {addr}: {exc}", file=sys.stderr)
+        finally:
+            self._current_source = None
 
     def _parse_osc(self, data: bytes) -> None:
         """Parse a minimal OSC message (address + typed args).
@@ -691,9 +770,77 @@ class SpectralReceiver(asyncio.DatagramProtocol):
                 while offset % 4 != 0:
                     offset += 1
 
-        self._handle_message(address, args)
+        self._handle_message(address, args, source=self._current_source)
 
-    def _handle_message(self, address: str, args: list) -> None:
+    def _register_source(self, source: Optional[int], args: list) -> None:
+        """Handle ``/stream_hello <kind> <index> <device_id>``.
+
+        kind is ``master``, ``track`` or ``return``; index is the 0-based
+        track or return index (-1 for master).
+        """
+        if source is None or len(args) < 2:
+            return
+        kind = str(args[0])
+        try:
+            index = int(args[1])
+        except (TypeError, ValueError):
+            return
+        if kind == "master":
+            key = "master"
+        elif kind == "track" and index >= 0:
+            key = f"track:{index}"
+        elif kind == "return" and index >= 0:
+            key = f"return:{index}"
+        else:
+            return
+        previous = self._sources.get(source)
+        self._sources[source] = {"key": key, "seen": time.monotonic()}
+        if previous and previous["key"] not in (key, "master") and not any(
+            v["key"] == previous["key"] for v in self._sources.values()
+        ):
+            # The device moved (track reordered) — forget the old slot so
+            # its readings are never attributed to whichever track now sits
+            # at that index.
+            self.cache.drop_stream(previous["key"])
+        info = {
+            "kind": kind,
+            "track_index": -1000 if kind == "master" else (
+                index if kind == "track" else -(index + 1)
+            ),
+            "device_id": int(args[2]) if len(args) > 2 and isinstance(args[2], (int, float)) else None,
+        }
+        self.cache.register_stream(key, info)
+
+    def _cache_for_source(self, source: Optional[int]) -> Optional[SpectralCache]:
+        """Pick the cache a perception packet belongs to (None = drop)."""
+        if source is None:
+            return self.cache
+        now = time.monotonic()
+        ident = self._sources.get(source)
+        if ident and now - ident["seen"] < STREAM_HELLO_TTL:
+            if ident["key"] == "master":
+                return self.cache
+            return self.cache.stream(ident["key"], create=True)
+        master_announced = any(
+            v["key"] == "master" and now - v["seen"] < STREAM_HELLO_TTL
+            for v in self._sources.values()
+        )
+        # A stream-aware master owns the master cache; unknown senders are
+        # either not-yet-announced track instances or stale builds whose
+        # readings cannot be attributed safely. Without a stream-aware
+        # master, keep legacy behaviour: unlabelled data is the master.
+        return None if master_announced else self.cache
+
+    def _handle_message(self, address: str, args: list,
+                        source: Optional[int] = None) -> None:
+        if address == "/stream_hello":
+            self._register_source(source, args)
+            return
+        cache = self.cache
+        if address in _STREAM_DATA_ADDRESSES:
+            cache = self._cache_for_source(source)
+            if cache is None:
+                return
         if address == "/spectrum" and len(args) >= 8:
             # Pick the right name set based on how many bands the .amxd emits.
             # 9-band payloads come from v1.16.x+ devices with the sub_low split.
@@ -707,54 +854,54 @@ class SpectralReceiver(asyncio.DatagramProtocol):
             for i, name in enumerate(names):
                 if i < len(args):
                     bands[name] = round(float(args[i]), 4)
-            self.cache.update("spectrum", bands)
+            cache.update("spectrum", bands)
 
         elif address == "/peak" and len(args) >= 1:
-            self.cache.update("peak", round(float(args[0]), 4))
+            cache.update("peak", round(float(args[0]), 4))
 
         elif address == "/rms" and len(args) >= 1:
-            self.cache.update("rms", round(float(args[0]), 4))
+            cache.update("rms", round(float(args[0]), 4))
 
         elif address == "/pitch" and len(args) >= 2:
-            self.cache.update("pitch", {
+            cache.update("pitch", {
                 "midi_note": round(float(args[0]), 2),
                 "amplitude": round(float(args[1]), 4),
             })
 
         elif address == "/key" and len(args) >= 2:
-            self.cache.update("key", {
+            cache.update("key", {
                 "key": str(args[0]),
                 "scale": str(args[1]),
             })
 
         elif address == "/spectral_shape" and len(args) >= 7:
             names = ["centroid", "spread", "skewness", "kurtosis", "rolloff", "flatness", "crest"]
-            self.cache.update("spectral_shape", {
+            cache.update("spectral_shape", {
                 n: round(float(args[i]), 4) for i, n in enumerate(names)
             })
 
         elif address == "/mel_bands" and len(args) >= 1:
-            self.cache.update("mel_bands", [round(float(a), 6) for a in args])
+            cache.update("mel_bands", [round(float(a), 6) for a in args])
 
         elif address == "/chroma" and len(args) >= 12:
-            self.cache.update("chroma", [round(float(a), 4) for a in args[:12]])
+            cache.update("chroma", [round(float(a), 4) for a in args[:12]])
 
         elif address == "/onset" and len(args) >= 1:
             strength = round(float(args[0]), 4)
-            self.cache.update("onset", {
+            cache.update("onset", {
                 "detected": strength > 0.5,
                 "strength": strength,
             })
 
         elif address == "/novelty" and len(args) >= 1:
             score = round(float(args[0]), 4)
-            self.cache.update("novelty", {
+            cache.update("novelty", {
                 "score": score,
                 "boundary": score > 0.5,
             })
 
         elif address == "/loudness" and len(args) >= 2:
-            self.cache.update("loudness", {
+            cache.update("loudness", {
                 "momentary_lufs": round(float(args[0]), 1),
                 "true_peak_dbtp": round(float(args[1]), 1),
             })

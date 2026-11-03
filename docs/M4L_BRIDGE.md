@@ -74,7 +74,27 @@ Sampling rate: 5 Hz (200ms snapshots). CPU impact: ~3-4% total.
 /response  s                  Base64-encoded JSON (single packet)
 /response_chunk  i i s        Chunk index, total chunks, base64 data
 /capture_error   s            Capture failed (busy / invalid filename) — v1.28.0+
+/stream_hello    s i i        Instance identity: kind (master|track|return), index, device id
 ```
+
+### Per-track analyzer streams
+
+Every analyzer instance owns one `[udpsend]`, so all of its packets share a UDP
+source port. On init and every 2 s the JS sends `/stream_hello` from that same
+socket, naming its host track (from the canonical path of `this_device`, so
+racks are fine). `SpectralReceiver` maps source port to stream: `master` feeds
+the existing master cache; `track:N` / `return:N` feed separate
+`SpectralCache.stream()` caches read by `get_track_spectrum`. Identities expire
+after 10 s without a hello. Once a stream-aware master has announced itself,
+unannounced senders are dropped; without one, unlabelled data stays the master
+stream (legacy builds). `ensure_analyzer_on_track` refuses to load
+(`streams_unsupported`) until a stream-aware build has announced itself, so an
+old build can never blend a track into the master readings.
+
+Only the master instance keeps OSC command port 9881. Track/return instances
+move their `[udpreceive]` to a private port, and refuse `capture_audio`,
+`capture_stop` and `get_key` if a command still reaches them, so master-mix
+captures and key history are never taken from a track.
 
 `/capture_error` exists because `send_capture` on the Python side resolves only via the
 capture future. Replying to a failed capture on the generic `/response` address made the
@@ -192,6 +212,7 @@ Thread-safe, time-expiring cache on the MCP server side (`mcp_server/m4l_bridge.
 - `get(key)` — returns `{value, age_ms}` or `None` if stale (>5 seconds)
 - `is_connected` — `True` if any data received within the last 5 seconds
 - `get_all()` — all non-stale cached data
+- `stream(key)` / `stream_status()` / `streams_supported` — per-track analyzer stream caches and their announced identities
 
 When the M4L device is removed from the master track, data stops arriving. After 5 seconds, `is_connected` becomes `False` and all tools return a helpful error message.
 

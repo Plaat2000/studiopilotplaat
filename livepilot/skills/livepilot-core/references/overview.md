@@ -1,9 +1,9 @@
 # LivePilot v1.30.0 — Architecture & Tool Reference
 
-Agentic production system for Ableton Live 12. 474 tools across 57 domains. Device atlas (5264 devices, 120 enriched, 47 with aesthetic-tagged `signature_techniques`), spectral perception (M4L analyzer with 9-band FFT — sub_low / sub / low / low_mid / mid / high_mid / high / presence / air), technique memory, automation intelligence (16 curve types, 15 recipes), music theory (Krumhansl-Schmuckler, species counterpoint), generative algorithms (Euclidean rhythm, tintinnabuli, phase shift, additive process), neo-Riemannian harmony (PRL transforms, Tonnetz), MIDI file I/O, **LIVE Splice describe-a-sound + variations via captured GraphQL endpoints (v1.17)**, drum-rack pad-by-pad construction, live dead-device detection via meter sampling, role-aware Simpler defaults, session-record arrangement-automation workaround.
+Agentic production system for Ableton Live 12. 477 tools across 57 domains. Device atlas (5264 devices, 120 enriched, 47 with aesthetic-tagged `signature_techniques`), spectral perception (M4L analyzer with 9-band FFT — sub_low / sub / low / low_mid / mid / high_mid / high / presence / air), technique memory, automation intelligence (16 curve types, 15 recipes), music theory (Krumhansl-Schmuckler, species counterpoint), generative algorithms (Euclidean rhythm, tintinnabuli, phase shift, additive process), neo-Riemannian harmony (PRL transforms, Tonnetz), MIDI file I/O, **LIVE Splice describe-a-sound + variations via captured GraphQL endpoints (v1.17)**, drum-rack pad-by-pad construction, live dead-device detection via meter sampling, role-aware Simpler defaults, session-record arrangement-automation workaround.
 
 The default MCP catalog is search-first: 26 core production tools plus
-`search_tools` and `call_tool` are advertised, while the full 474-tool registry
+`search_tools` and `call_tool` are advertised, while the full 477-tool registry
 remains searchable and directly callable. Use `LIVEPILOT_TOOL_PROFILE=full`
 only when a client truly benefits from receiving every schema up front.
 
@@ -56,7 +56,7 @@ tool does, when to reach for it). It is intentionally NOT exhaustive — the
 remaining domains (sample_engine, atlas, agent_os, wonder_mode, and the rest
 of the Creative Intelligence layer) are covered by their own domain skills
 and by the auto-generated **[Tool Catalog](../../../../docs/manual/tool-catalog.md)**,
-which lists all 474 tools across all 57 domains.
+which lists all 477 tools across all 57 domains.
 
 ### Transport (showing 12 of 21) — Playback, tempo, global state, diagnostics
 
