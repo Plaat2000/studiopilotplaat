@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="livepilot-token" content="__TOKEN__">
+  <title>Countryside Creative Studio</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/client.js"></script>
+</head>
+<body>
+  <header><span class="eyebrow">ABLETON LIVE 12 / PRODUCTION SYSTEM</span><h1>Countryside<span class="accent"> Creative Studio</span></h1>
+    <p>Know your tools. Hear your session. Remember what works.</p>
+    <div class="theme-settings">
+      <label for="theme-selector">Color theme</label>
+      <select id="theme-selector" disabled><option>Loading installed themes...</option></select>
+      <button id="refresh-themes" type="button">Rescan themes</button>
+    </div>
+    <p id="theme-status" role="status" aria-live="polite">Reading installed Ableton palettes...</p>
+    <div id="status" role="status" aria-live="polite">Connecting to LivePilot...</div>
+  </header>
+  <main>
+    <div class="section-head architecture-heading"><h2>System architecture</h2><span class="muted">Choose a module to begin</span></div>
+    <div class="pillars">
+      <section class="pillar knowledge" aria-labelledby="knowledge-title">
+        <div class="pillar-label">01 / DISCOVER</div><h2 id="knowledge-title">Knowledge</h2>
+        <p>Devices, samples, and the paths between them.</p><div id="knowledge-modules"></div>
+      </section>
+      <section class="pillar perception" aria-labelledby="perception-title">
+        <div class="pillar-label">02 / UNDERSTAND</div><h2 id="perception-title">Perception</h2>
+        <p>Measured audio and structured production knowledge.</p><div id="perception-modules"></div>
+      </section>
+      <section class="pillar memory" aria-labelledby="memory-title">
+        <div class="pillar-label">03 / DEVELOP</div><h2 id="memory-title">Memory</h2>
+        <p>Techniques, taste, and the next composition.</p><div id="memory-modules"></div>
+      </section>
+    </div>
+    <div class="flow" aria-hidden="true"><span></span><b>KNOWLEDGE + PERCEPTION + MEMORY</b><span></span></div>
+    <section aria-labelledby="workspace-title" class="workspace">
+      <div class="section-head"><div><span class="eyebrow">SHARED MCP COMMAND LAYER</span><h2 id="workspace-title">Command workspace</h2></div>
+        <button id="discover">Search all tools</button></div>
+      <p class="muted">Architecture reference: 474 MCP tools / 57 domains. Curated commands below; discovery searches the installed server.</p>
+      <form id="module-form">
+        <label for="module-command">Choose command</label><select id="module-command" disabled><option>Loading modules...</option></select>
+        <p id="command-description" class="muted"></p><div id="command-fields" class="field-grid"></div>
+        <p id="command-warning" class="warning" hidden></p>
+        <label id="confirmation-label" class="confirmation" hidden><input id="command-confirmation" type="checkbox"> I confirm this memory update.</label>
+        <button id="run-module" type="submit" class="primary" disabled>Run command</button>
+      </form>
+      <div class="result-heading"><h3 id="result-title">Command result</h3><span id="result-time" class="muted"></span></div>
+      <div id="result-summary"></div><pre id="module-result" tabindex="0" aria-labelledby="result-title">Select a module and run a command. Results appear here.</pre>
+    </section>
+    <section aria-labelledby="connections-title" class="connections">
+      <div class="section-head"><h2 id="connections-title">Runtime connections</h2><button id="check-capabilities">Check capabilities</button></div>
+      <div class="connection-grid">
+        <div><h3>Remote Script</h3><code>TCP 9878</code><p id="remote-state">Not checked</p></div>
+        <div><h3>M4L Bridge</h3><code>UDP 9880 / OSC 9881</code><p id="bridge-state">Not checked / optional</p></div>
+        <div><h3>Splice local</h3><code>SQLite / downloaded samples</code><p>Checked on sample search; no automatic downloads.</p></div>
+      </div>
+      <p class="muted">All commands reuse the session's LivePilot MCP connection. No additional Ableton TCP client.</p>
+    </section>
+    <div class="flow" aria-hidden="true"><span></span><b>ABLETON LIVE 12</b><span></span></div>
+    <div class="live-controls">
+    <section aria-labelledby="transport-title">
+      <div class="section-head"><h2 id="transport-title">Transport</h2><button id="refresh">Refresh session</button></div>
+      <p id="session-summary">Waiting for Ableton</p>
+      <div class="row"><button class="primary" data-command="start_playback">Play from start</button>
+        <button data-command="stop_playback">Stop</button>
+        <button data-command="undo">Undo</button><button data-command="redo">Redo</button></div>
+      <form id="tempo-form" class="row"><label for="tempo">Tempo / BPM</label>
+        <input id="tempo" type="number" min="20" max="999" step="0.01" required>
+        <button type="submit">Set tempo</button></form>
+    </section>
+    <section aria-labelledby="tracks-title">
+      <h2 id="tracks-title">Tracks &amp; mixer</h2>
+      <label for="track">Choose track</label><select id="track"><option value="">Select a track</option></select>
+      <div id="mixer"></div>
+    </section>
+    <section aria-labelledby="devices-title">
+      <h2 id="devices-title">Device parameters</h2>
+      <label for="device">Choose device</label><select id="device" disabled><option value="">Select a track first</option></select>
+      <label for="filter">Find parameter</label><input id="filter" type="search" placeholder="Filter, threshold, dry/wet...">
+      <div id="parameters"><p class="muted">Select a device to read its actual parameter ranges.</p></div>
+    </section>
+    </div>
+  </main>
+  <footer>Controls send through your existing LivePilot MCP connection. Values are applied on release or with Apply.
+    Session state is read on refresh; no background polling or recording.</footer>
+</body>
+</html>

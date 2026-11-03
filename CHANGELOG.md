@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.31.0 — 2026-11-04
+
+### Added — Creative Studio
+- Integrated the optional Creative Studio v2 Copilot canvas and standalone
+  browser UI, including its existing-track instrument plan and fixed 7666 port.
+- Added a sync script to install the repository-maintained UI into Copilot.
+
 ## v1.30.1 — 2026-11-03
 
 ### Changed — workspace setup

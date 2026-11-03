@@ -17,6 +17,7 @@ Copilot and Codex are separate clients with their own registrations.
 | Ableton Remote Script | Executes Live Object Model commands | `remote_script/LivePilot/` | Installed in Ableton's User Library; TCP port 9878 |
 | M4L Analyzer bridge | Provides analyzer/LiveAPI data | `m4l_device/` | Analyzer loaded in Live; UDP 9880 and OSC 9881 |
 | M4L analysis/chat window | Hosts the local analysis UI | Max `LivePilot_Chat.maxpat` webview | Fixed URL `http://127.0.0.1:7666/`; its web app must be running |
+| Creative Studio UI | Optional Copilot canvas and standalone dashboard | `studio/livepilot-control/` | Studio server on 7666 and the appropriate Copilot or standalone MCP session |
 
 VS Code is the editor, not an AI model. Claude Code, Copilot, and Codex are
 separate clients. Claude Code can run the LivePilot MCP server without the
@@ -26,6 +27,9 @@ themselves. MCP connects a client to the LivePilot server. The Ableton Remote
 Script and M4L bridge are separate runtime connections behind that server.
 The M4L analysis/chat webview on port 7666 is a separate local UI service;
 do not confuse it with LivePilot's optional MCP HTTP transport on port 8109.
+The Copilot Creative Studio UI is maintained separately from the LivePilot MCP
+server and syncs to `~/.copilot/extensions/livepilot-control/` with
+`bash scripts/sync_creative_studio.sh`.
 
 ## Studio Runtime Requirements
 
@@ -125,6 +129,9 @@ and verify the Remote Script connection separately. See
   call `reload_handlers` through MCP. After changing analyzer Max source,
   rebuild in Max and run `bash scripts/sync_amxd_targets.sh --apply` to update
   the configured install targets.
+- After changing Studio source, run `bash scripts/sync_creative_studio.sh` and
+  restart Copilot to reload the canvas extension. Its fixed port 7666 is not
+  LivePilot's optional MCP HTTP transport on port 8109.
 - For releases, follow the version and metadata workflow in `AGENTS.md`,
   `CLAUDE.md`, and `scripts/sync_metadata.py`. Major functional changes get a
   version bump and repository commit; sync the local workspace from the

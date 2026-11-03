@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="livepilot-token" content="__TOKEN__">
+  <title>Countryside Creative Studio</title>
+  <link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/creative.css">
+  <script defer src="/creative-client.js"></script>
+</head>
+<body data-studio-version="2">
+  <header>
+    <span class="eyebrow">CREATIVE STUDIO v2 / <span class="perception-text">PERCEPTION</span> + <span class="memory-text">MEMORY</span></span>
+    <div class="section-head"><div><h1><button id="ableton-launch" class="studio-title" type="button" aria-describedby="ableton-app-status" disabled>Countryside<span class="accent"> Creative Studio</span></button></h1>
+      <p id="scope-label">See every layer. Find the next meaningful change.</p></div>
+      <div class="row"><span id="ableton-app-status" role="status">Checking Ableton...</span>
+        <a href="/">All tracks</a><a href="/classic">Library &amp; detailed controls</a></div></div>
+    <div id="status" role="status" aria-live="polite">Loading creative workspace...</div>
+    <fieldset id="live-transport" class="transport-bar" aria-label="Ableton transport and loop" disabled>
+      <button id="transport-start" class="primary" title="Play from the beginning">Start</button>
+      <button id="transport-stop">Stop</button>
+      <button id="transport-loop" aria-pressed="false">Loop off</button>
+      <label for="loop-start">From bar</label><input id="loop-start" type="number" min="1" step="any" value="1">
+      <label for="loop-end">To bar (exclusive)</label><input id="loop-end" type="number" min="1" step="any" value="5">
+      <button id="loop-apply">Set loop range</button>
+      <span id="transport-state" role="status"></span>
+    </fieldset>
+    <p class="muted transport-hint">Start plays from the beginning. Loop uses the Arrangement loop brace. From bar 1 to bar 5 plays bars 1–4; Session clips can still override Arrangement playback.</p>
+  </header>
+  <div class="studio-content" role="region" aria-label="Creative workspace sections" tabindex="0">
+  <main id="studio-layout">
+    <section aria-labelledby="tracks-title" id="track-section">
+      <details class="section-panel" open>
+      <summary><div><span class="eyebrow">SESSION MAP</span><h2 id="tracks-title">Every track, one creative context</h2></div></summary>
+        <div class="row"><label for="track-layout" class="view-label">Track view</label>
+          <select id="track-layout"><option value="grouped">Grouped</option><option value="flat">All tracks (flat)</option></select>
+          <button id="expand-groups">Expand groups</button><button id="collapse-groups">Collapse groups</button>
+          <button id="ensure-analyzer">Ensure master M4L analyzer</button></div>
+      <p class="muted">One shared analyzer stays LAST on master. A track window can add a separate analyzer to that track; its readings stay apart from master.</p>
+      <p class="muted">Groups follow Ableton's actual membership, including nested groups. Expanding or collapsing a group changes Studio only, not the Live Set.</p>
+      <p id="group-status" class="warning" role="status" hidden></p>
+      <div id="tracks" class="track-grid"></div>
+      </details>
+    </section>
+    <section aria-labelledby="advice-title" id="advice-section">
+      <details class="section-panel" open>
+      <summary><h2 id="advice-title">Where to focus next</h2></summary>
+      <label for="focus-scope">Where should your creative choice develop?</label>
+      <select id="focus-scope"><option value="">Choose a scope first</option>
+        <option value="tracks">Selected tracks</option><option value="song">Whole song</option></select>
+      <div id="focus-track-picker" hidden><p class="muted">Choose one or more tracks, buses, returns or master. A group selects its bus only, not its members.</p>
+        <div id="focus-tracks" class="focus-tracks"></div></div>
+      <p class="muted">Uses the mood, texture and your own suggestion from Creative direction. Suggestions only: nothing is applied to a track or the whole song automatically.</p>
+      <button id="focus-suggest" class="primary">Suggest ideas and read real knobs</button>
+      <p id="advice-notice" class="muted">Set a creative direction and choose a scope to see ideas with adjustable device controls.</p>
+      <div id="advice-list"></div>
+      </details>
+    </section>
+    <section aria-labelledby="intent-title" id="direction-section">
+      <details class="section-panel" open>
+      <summary><h2 id="intent-title">Creative direction</h2><span id="session-state" class="muted">No session read yet</span></summary>
+      <div class="field-grid">
+        <div><label for="mood">Mood</label><select id="mood" aria-describedby="mood-insight"></select>
+          <p id="mood-insight" class="muted direction-insight"></p></div>
+        <div><label for="texture">Texture</label><select id="texture" aria-describedby="texture-insight"></select>
+          <p id="texture-insight" class="muted direction-insight"></p></div>
+        <div class="full-field"><label for="suggestion">Your own suggestion</label><textarea id="suggestion" rows="2" maxlength="2000" placeholder="Optional: describe your own direction, or refine the choices above."></textarea></div>
+        <div><label for="preferences">General taste preferences</label><textarea id="preferences" rows="2" maxlength="2000" placeholder="What should change, and what must stay?"></textarea></div>
+      </div>
+      <p class="muted">Mood and texture choices follow the Markdown reference map. Leave either unselected to use your own suggestion. These are creative intentions, not measured outcomes; selecting a direction does not change tracks.</p>
+      <div id="instrument-plan" hidden>
+        <h3>Existing-track instrument plan</h3>
+        <label for="instrument">Instrument to develop</label><select id="instrument"><option value="all">All instruments and plug-ins on this track</option></select>
+        <p class="muted">Opening this window reads the actual exposed controls, names, current values, and ranges from Ableton. All includes every instrument, rack and VST/AU loaded on this track; choose one to focus on that device. Hidden plug-in controls must first be exposed with Configure in Ableton. Optional native-synth alternatives are separate from these real controls; relative targets are not plug-in parameters. Proposals and drafts change nothing until each parameter change is approved.</p>
+        <div id="timbre-targets" class="field-grid"></div>
+        <button id="track-plan">Refresh actual controls / propose native-synth alternatives</button><div id="branches"></div>
+      </div>
+      <div class="row"><button id="refresh" class="primary">Refresh all tracks</button>
+        <button id="advise">Develop this direction / choose scope above</button><button id="compose">Composer / create step-by-step plan</button></div>
+      </details>
+    </section>
+    <section aria-labelledby="memory-title" id="memory-section">
+      <details class="section-panel" open>
+      <summary><h2 id="memory-title">Creative intelligence <span class="scope-badge" id="intelligence-scope">All tracks</span></h2></summary>
+      <div class="intelligence-grid">
+        <button id="corpus" class="intelligence-card"><strong>Corpus Intelligence</strong><span>Find a method for your mood and texture.</span></button>
+        <button id="techniques" class="intelligence-card"><strong>Technique Memory</strong><span>Recall techniques that fit this direction.</span></button>
+        <button id="taste" class="intelligence-card"><strong>Taste Graph</strong><span>Inspect preferences and device affinities.</span></button>
+      </div>
+      <div id="intelligence-view" hidden><h3 id="intelligence-heading"></h3><p id="intelligence-notice" class="muted"></p>
+        <div id="intelligence-summary"></div>
+        <details><summary>Technical details</summary><pre id="intelligence-result" tabindex="0"></pre></details></div>
+      </details>
+    </section>
+    <section id="track-detail" aria-labelledby="detail-title" hidden>
+      <details class="section-panel" open>
+      <summary><h2 id="detail-title">Track analysis</h2></summary>
+      <button id="inspect-track">Refresh device / clip evidence</button>
+      <div class="row"><button id="track-analyzer">Load analyzer on this track</button>
+        <button id="track-stream">Measure this track's analyzer</button></div>
+      <div class="row"><button id="isolated" class="primary">M4L / isolated audio snapshot</button>
+        <button id="design">Device-state creative suggestions</button></div>
+      <label class="confirmation"><input type="checkbox" id="solo-confirm"> I approve temporary solo changes for this measurement, followed by restoration.</label>
+      <p class="warning">Isolation changes what you hear for about 7 seconds. Playback must already be running. Measurements include group/master processing and potentially returns. Key history remains mix-wide.</p>
+      <div class="row"><label for="clip">Audio source / Session clip slot</label><select id="clip"><option value="">Select a clip</option></select>
+        <button id="offline">Analyze source file without changing playback</button></div>
+      <p id="report-scope" class="muted"></p><div id="spectrum" class="spectrum" aria-label="Measured spectral balance"></div>
+      <div id="report-summary" class="result-summary"></div>
+      <details><summary>Technical measurement details</summary><pre id="report-result" tabindex="0">Choose an analysis mode.</pre></details>
+      </details>
+    </section>
+    <section aria-labelledby="plan-title" id="composer-section">
+      <details class="section-panel" open>
+      <summary><h2 id="plan-title">Composer / executable review queue</h2><span id="plan-progress" class="scope-badge">No plan</span></summary>
+      <p id="plan-notice" class="muted">Plans are proposals, not applied changes. Review what each step will do, then apply one step at a time.</p>
+      <div id="last-outcome" role="status" hidden></div>
+      <div id="applied-changes" aria-label="Applied changes and before/after controls"></div>
+      <div id="plan-steps"></div>
+      <details><summary>Technical plan details</summary><pre id="plan-source">No plan generated.</pre></details>
+      </details>
+    </section>
+    <section id="warnings-section" aria-labelledby="warnings-title" hidden>
+      <details class="section-panel" open>
+      <summary><h2 id="warnings-title">Evidence &amp; recovery warnings</h2></summary>
+      <pre id="warnings"></pre>
+      </details>
+    </section>
+  </main>
+  <footer>
+    <p>All tracks share Corpus, Technique Memory, and Taste Graph. Audio evidence always names its scope.
+      Session analysis and plans stay in memory; theme selection is saved privately. No automatic polling, recording, spending, or plan execution.</p>
+    <div class="theme-settings"><label for="theme-selector">Theme</label>
+      <select id="theme-selector" aria-describedby="theme-status" disabled><option>Loading themes...</option></select></div>
+    <p id="theme-status" class="muted"></p>
+  </footer>
+  </div>
+  <dialog id="outcome-dialog" aria-labelledby="outcome-title" aria-describedby="outcome-body">
+    <h2 id="outcome-title"></h2><p id="outcome-body"></p>
+    <div id="outcome-changes"></div>
+    <button id="outcome-close" class="primary">Close</button>
+  </dialog>
+</body>
+</html>
