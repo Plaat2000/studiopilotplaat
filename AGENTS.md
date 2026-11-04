@@ -1,6 +1,11 @@
 # LivePilot v1.31.0 — Ableton Live 12
 
 ## Project
+For workspace version requests, follow
+[`docs/manual/workspace-version-workflow.md`](docs/manual/workspace-version-workflow.md):
+create a new branch and tag, publish only after release gates pass, then clone
+the published branch into a new local workspace. Keep full chat history local.
+
 - **Repo:** This directory (LivePilot)
 - **Type:** Agentic MCP production system for Ableton Live 12
 - **Workspace setup:** `docs/manual/ai-workspace-baseline.md` maps Claude, Copilot, Codex, MCP, Ableton, and local sync configuration.

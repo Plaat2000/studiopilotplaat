@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## studiopilotplaat 3.0 snapshot — 2026-11-04
+
+### Changed — workspace version workflow
+- Prepare a dedicated version branch and local workspace handoff while
+  preserving existing Git history and historical tags.
+- Document active integration checks and keep full chat history local.
+- Keep the working LivePilot engine and analyzer at 1.31.0. Further analyzer
+  work is deferred to the next project version; this snapshot is not an
+  engine 3.0.0 release.
+
 ## v1.31.0 — 2026-11-04
 
 ### Added — Creative Studio

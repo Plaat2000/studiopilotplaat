@@ -8,6 +8,8 @@ An agentic production system for Ableton Live 12.
 ## What LivePilot Is
 
 For a map of AI clients, workspace configuration, MCP startup, and install/sync destinations, see the [AI Workspace and MCP Baseline](ai-workspace-baseline.md).
+For the planned 3.0 release and a dated local/GitHub/runtime map, see the
+[studiopilotplaat 3.0 overview](studiopilotplaat-3.0-overview.md).
 The optional Creative Studio UI is maintained in `studio/livepilot-control/`; run `bash scripts/sync_creative_studio.sh` to sync it to Copilot.
 
 LivePilot is not a tool collection with an AI wrapper. It is a **production system** — three perception layers feed into 477 tools, which are orchestrated by a dozen creative engines that understand song identity, learn your taste, diagnose session problems, and generate real musical options.
